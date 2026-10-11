@@ -1,0 +1,1655 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * The integer arithmetic of the Ark Staking whitepaper: chapters 4 and 5, and
+ * the relations of chapter 6 that bind parameters jointly.
+ *
+ * The one rule this library exists to enforce: **every product is formed before
+ * any quotient, each ratio divides by BPS exactly once, and every division
+ * truncates toward zero** — so the residual stays with the anchored position
+ * rather than being charged to it (whitepaper §4.1). `effectiveAttachmentBps`
+ * is the single deliberate exception and says why at its own definition; the
+ * two ceilings in `conditionalReleaseQrl` and `discountCapBps` are not
+ * exceptions to it, because each rounds a *bound* in the direction that keeps
+ * the bound safe, and says so.
+ *
+ * This is a port of `../quantum-ark/src/lib/ark-staking.ts`, which is the
+ * checked transcription of the specification and is under test on the site.
+ * The two must agree exactly on every input inside the domain the whitepaper
+ * gives each argument. `test/ArkStakeSpec.test.js` imports that module and
+ * calls it beside this one, so a disagreement is a failing test rather than a
+ * difference of opinion — and it is a bug here, never there.
+ *
+ * WHY THE FUNCTIONS TAKE A BOOK RATHER THAN READING ONE
+ * -----------------------------------------------------
+ * Nothing here reads storage or the clock. A quantity is therefore reproducible
+ * from its inputs alone, which is what lets the same figure be computed on
+ * chain, in the site, and in a test without three implementations drifting.
+ * The run-off gate is the clearest case: whether it is closed is a state of the
+ * book, so the ceiling in force is an argument of `premiumShareBps` and never a
+ * read of anything.
+ *
+ * WHAT MUST NEVER REACH THIS FILE
+ * -------------------------------
+ * The QRL staking rate of whitepaper §3.4. It is the opportunity cost of bond
+ * capital, not compensation for its risk, and §4.5 excludes it from the
+ * coupon-multiple bound deliberately: the guarantee that the instrument
+ * compensates its tail risk rests on the premium alone. No function below takes
+ * it as an argument, and that absence is the enforcement. The reference model
+ * keeps it in `bondTotalReturnBps` alone for the same reason, and that function
+ * is deliberately not ported.
+ *
+ * DOMAIN
+ * ------
+ * Every ratio argument is a basis point in [0, BPS]. Where the reference model
+ * clamps an out-of-range ratio this library clamps it the same way; where the
+ * model would compute a negative intermediate from one — `BPS - covered` with a
+ * cover above one — this library clamps the ratio first, because an unsigned
+ * subtraction cannot go negative and a revert on the pricing path would halt
+ * the sweep. No caller in this tree passes such a value.
+ */
+library ArkStakeMath {
+    /// The fixed-point scale of every ratio.
+    uint256 internal constant BPS = 10000;
+
+    /// Fixed-point scale of the reference price, in QRL per unit of origin asset.
+    uint256 internal constant PRICE_SCALE = 1e18;
+
+    /// The number of stages on the threat ladder of whitepaper §4.4.
+    uint256 internal constant THREAT_STAGES = 4;
+
+    /// The clean ages the run-off queue weighs apart (`ArkCatBondStore.QUEUE_AGES`); every older share weighs the floor.
+    uint256 internal constant QUEUE_EXPOSURE_AGES = 8;
+
+    /**
+     * The top of the range whitepaper §6.3 admits for the buffer share, and
+     * the escrow's `BUFFER_MAX_BPS`: the ceiling on the escalator's cap. The
+     * cap itself is the governable `bufferEscalatorCapBps` since 2026-09-28
+     * (the model reads it from the parameter set, and the timelock's table
+     * names it); this bounds it. `test/ArkStakeSpec.test.js` holds it to
+     * `ARK_STAKING.bufferEscalatorCapBps` and to the escrow's constant.
+     */
+    uint256 internal constant BUFFER_ESCALATOR_CAP_BPS = 1500;
+
+    /**
+     * Utilisation reported for a book requiring capital with nothing standing
+     * behind it, and the cap on every reading: `Number.MAX_SAFE_INTEGER`, the
+     * sentinel of the model's `utilisationBps`.
+     */
+    uint256 internal constant UTILISATION_UNBOUNDED = 9007199254740991;
+
+    /* ------------------------------------------------------------------ */
+    /* Capital. Whitepaper §4.3                                            */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * The probable maximum loss factor: the share of the anchored notional one
+     * event is taken to be capable of impairing.
+     *
+     * Measured from the book and floored, never chosen. A governable value here
+     * would be a governing body setting how much capital its own product needs.
+     * `observedMaxGroupShareBps` is a running maximum over the trailing window
+     * and not a spot reading: an adversary who diluted a failing asset's share
+     * for one epoch would otherwise buy a smaller capital requirement, and so a
+     * larger haircut factor, with capital returned in full afterwards.
+     */
+    function pmlBps(uint256 pmlFloorBps, uint256 observedMaxGroupShareBps)
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 raw = pmlFloorBps > observedMaxGroupShareBps ? pmlFloorBps : observedMaxGroupShareBps;
+        return raw > BPS ? BPS : raw;
+    }
+
+    /**
+     * The indemnity actually promised on this book.
+     *
+     * The bound of whitepaper §4.3 expressed on the promise rather than on the
+     * capital. Capping the capital would lower the requirement, raise the
+     * fraction covered and raise the premium share, so a book that had grown
+     * concentrated would be rewarded with cheaper cover for having done so.
+     * Capping the promise moves the other way and makes a complete indemnity
+     * something a diversified book earns rather than something a parameter
+     * asserts.
+     *
+     *     indemnityEff = min(indemnity, 2 * sigma_t * BPS / (3 * pml))
+     *
+     * The consequence is that `att_eff` can never exceed two thirds of the
+     * target share, which floors the coupon multiple at 1.5x whatever the two
+     * parameters are set to (whitepaper §4.5, invariant I12). At a target share
+     * below one and a half times the loss floor — the lower stages of the
+     * threat ladder — the bound binds, and the yield returned to the staker is
+     * bought with indemnity.
+     */
+    function effectiveIndemnityBps(uint256 sigmaTargetBps, uint256 indemnityBps, uint256 pml)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (pml == 0) return indemnityBps > BPS ? BPS : indemnityBps;
+
+        uint256 ceiling = (2 * sigmaTargetBps * BPS) / (3 * pml);
+        uint256 value = indemnityBps < ceiling ? indemnityBps : ceiling;
+        return value > BPS ? BPS : value;
+    }
+
+    /**
+     * Capital required per unit of anchored notional, in basis points.
+     *
+     * The division rounds **up**, against the convention of every other
+     * function here, and the exception is load-bearing. Understating the
+     * capital requirement overstates the fraction covered, and overstating
+     * cover charges an anchored position for cover it does not have. Every
+     * other rounding leaves the residual with the staker; rounding this one
+     * down would not.
+     */
+    function effectiveAttachmentBps(uint256 indemnityEff, uint256 pml)
+        internal
+        pure
+        returns (uint256)
+    {
+        return (indemnityEff * pml + BPS - 1) / BPS;
+    }
+
+    /**
+     * Capital the book requires, in the origin asset. Truncates, toward the
+     * anchored book; the attachment already rounded up.
+     *
+     * Identically the occurrence limit: the bond is fully collateralised
+     * against the most it can be asked to pay for one event, and is not
+     * collateralised against the sum of what it insures.
+     */
+    function requiredCapital(uint256 anchoredNotional, uint256 attachmentBps)
+        internal
+        pure
+        returns (uint256)
+    {
+        return (anchoredNotional * attachmentBps) / BPS;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The two conversions of bond principal. Whitepaper §4.3              */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Bond principal converted to the origin asset. Zero on an unset price.
+     * Truncates, toward the anchored book.
+     *
+     * The unadjusted conversion, and the one every settlement quantity reads:
+     * the occurrence limit, the capital available to an event, the class draws
+     * and the recovery division. Capacity is `bondCapacityInOrigin`.
+     */
+    function bondNotionalInOrigin(uint256 bondNotional, uint256 refPrice)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (refPrice == 0) return 0;
+        return (bondNotional * PRICE_SCALE) / refPrice;
+    }
+
+    /**
+     * The same conversion at the conversion haircut: the quantity capacity,
+     * utilisation and the fraction covered are measured against.
+     *
+     * Capacity stated at the last print is capacity a settlement may not
+     * obtain, so the book is priced against a conservative quantile of the
+     * conversion and paid on the actual one. The two are one function apart
+     * deliberately: invariant I27 asserts that no settlement quantity moves
+     * when the haircut does, and a single function carrying the adjustment
+     * would make that assertion untestable. Both divisions truncate, so the
+     * capacity reported is never above the principal that supplies it.
+     */
+    function bondCapacityInOrigin(uint256 bondNotional, uint256 refPrice, uint256 fxHaircutBps_)
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 haircut = fxHaircutBps_ > BPS ? BPS : fxHaircutBps_;
+        return (bondNotionalInOrigin(bondNotional, refPrice) * (BPS - haircut)) / BPS;
+    }
+
+    /**
+     * The conversion haircut admitted on a measured drawdown, clamped at the cap
+     * of whitepaper §6.3.
+     *
+     * A drawdown larger than any in the window is not bounded by the window:
+     * the cap is a reference value and not an estimate of the tail.
+     */
+    function fxHaircutBps(uint256 observedDrawdownBps, uint256 fxHaircutMaxBps)
+        internal
+        pure
+        returns (uint256)
+    {
+        return observedDrawdownBps > fxHaircutMaxBps ? fxHaircutMaxBps : observedDrawdownBps;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Cover and price. Whitepaper §4.3 and §4.4                           */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Cover sold against the capital the book requires, uncapped.
+     *
+     *     covered = ((N_B * PRICE_SCALE / P) * (BPS - h_fx) / BPS + buffer_orig)
+     *               * BPS / required
+     *
+     * `refPrice` is the settlement series of whitepaper §5.5 — the thirty-day
+     * average bounded per epoch — and never an epoch average (I38), and the
+     * origin-asset buffer stands beside the capacity conversion of bond
+     * principal (whitepaper §4.3, yellow paper §3.1). Expanded so the
+     * conversion, the haircut, the buffer and the ratio share one division:
+     * converting first and scaling afterwards truncates twice and would move
+     * every figure the document signs at a haircut and a buffer of zero.
+     * Truncates, so cover is never overstated — the direction that would charge
+     * a position for cover it does not hold.
+     *
+     * Three limits are decisions rather than arithmetic:
+     *
+     *  - `required == 0` returns **zero**, not BPS. A book requiring no capital
+     *    must not read as "cover complete".
+     *  - `bondNotional == 0` returns zero whatever the buffer: a position on a
+     *    book with no bond pays no premium and holds no cover (whitepaper
+     *    §4.7), so the buffer stands beside bond principal and never in its
+     *    place.
+     *  - An unset price returns zero.
+     */
+    function coverageRatioBps(
+        uint256 bondNotional,
+        uint256 refPrice,
+        uint256 required,
+        uint256 fxHaircutBps_,
+        uint256 bufferOrig
+    ) internal pure returns (uint256) {
+        if (required == 0 || refPrice == 0 || bondNotional == 0) return 0;
+        uint256 haircut = fxHaircutBps_ > BPS ? BPS : fxHaircutBps_;
+        return (bondNotional * PRICE_SCALE * (BPS - haircut) + bufferOrig * BPS * refPrice) / (refPrice * required);
+    }
+
+    /// The same ratio capped at one: the fraction of the requirement actually met.
+    function coveredBps(
+        uint256 bondNotional,
+        uint256 refPrice,
+        uint256 required,
+        uint256 fxHaircutBps_,
+        uint256 bufferOrig
+    ) internal pure returns (uint256) {
+        uint256 raw = coverageRatioBps(bondNotional, refPrice, required, fxHaircutBps_, bufferOrig);
+        return raw > BPS ? BPS : raw;
+    }
+
+    /**
+     * Anchored notional the outstanding bond can carry, in the origin asset:
+     * `C_B = (N^cap_30 + buffer_orig) / att_eff` (whitepaper §4.3). Truncates.
+     * Takes the capacity conversion, so a book whose two assets have moved
+     * against each other carries less than its principal alone suggests, and
+     * the origin-asset buffer beside it. A book with no bond carries nothing,
+     * whatever its buffer (whitepaper §4.7).
+     */
+    function capacity(uint256 bondNotional, uint256 bondCapacity, uint256 bufferOrig, uint256 attachmentBps)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (attachmentBps == 0 || bondNotional == 0) return 0;
+        return ((bondCapacity + bufferOrig) * BPS) / attachmentBps;
+    }
+
+    /**
+     * The premium share actually charged. Whitepaper §4.4.
+     *
+     * Two regimes. Where cover is complete the target share is charged as it
+     * stands. Where it is partial the target rises with the scarcity of capital
+     * before the cover received scales it:
+     *
+     *     u          = BPS / covered
+     *     alpha_t    = floor(sigma_t * rho / BPS)          (scarcitySlopeBps)
+     *     target(u)  = min(sigma_t + alpha_t * (u - 1), ceiling)
+     *     sigma      = target(u) * covered / BPS
+     *
+     * Substituting `u` and multiplying through by `covered` clears the
+     * reciprocal, which is what keeps this to one division:
+     *
+     *     sigma = min(sigma_t * covered + alpha_t * (BPS - covered),
+     *                 ceiling * covered) / BPS
+     *
+     * Truncates, toward the anchored position. At `covered == BPS` the slope
+     * term vanishes and the target is returned unchanged. `slopeRatioBps` is
+     * rho, the governable ratio of whitepaper §4.4 since 2026-09-30 (EC-07):
+     * the slope in force is that fraction of the stage's own target share, so
+     * the fourth stage keeps the 1,850 bps it had as an absolute parameter and
+     * a lower stage prices scarcity in proportion to its target.
+     *
+     * While `sigma_t >= alpha_t` (invariant I13, which a ratio at or below BPS
+     * holds at every stage) the first line is non-decreasing in `covered`, so the share
+     * charged is largest at complete cover under either ceiling (I30): a
+     * contraction of bond principal thins the cover a position receives and
+     * never raises the share of its yield it pays.
+     *
+     * `ceilingBps` is an argument rather than a parameter read because it takes
+     * the surge value while the run-off gate of §5.3 is closed, and the gate is
+     * a state of the book rather than of the parameter set.
+     */
+    function premiumShareBps(
+        uint256 sigmaTargetBps,
+        uint256 slopeRatioBps,
+        uint256 ceilingBps,
+        uint256 covered
+    ) internal pure returns (uint256) {
+        if (covered == 0) return 0;
+        if (covered > BPS) covered = BPS;
+
+        uint256 scaled = sigmaTargetBps * covered + scarcitySlopeBps(sigmaTargetBps, slopeRatioBps) * (BPS - covered);
+        uint256 ceiling = ceilingBps * covered;
+        return (scaled < ceiling ? scaled : ceiling) / BPS;
+    }
+
+    /**
+     * The target share at a given cover, before cover scales it. Truncates.
+     *
+     * A surface quoting the price of cover quotes this rather than the charged
+     * share: the charged share falls with cover and the target does not, and
+     * showing the two as one number reads as a discount on a shortage. With no
+     * cover the utilisation is unbounded and the target sits at its ceiling.
+     */
+    function premiumTargetBps(
+        uint256 sigmaTargetBps,
+        uint256 slopeRatioBps,
+        uint256 ceilingBps,
+        uint256 covered
+    ) internal pure returns (uint256) {
+        if (covered == 0) return ceilingBps;
+        if (covered > BPS) covered = BPS;
+
+        uint256 target =
+            (sigmaTargetBps * covered + scarcitySlopeBps(sigmaTargetBps, slopeRatioBps) * (BPS - covered)) / covered;
+        return target > ceilingBps ? ceilingBps : target;
+    }
+
+    /**
+     * The scarcity slope in force, alpha_t = floor(sigma_t * rho / BPS), in bps
+     * of target share per unit of utilisation above one (whitepaper §4.4,
+     * EC-07; the model's `scarcitySlopeBps`). Truncates, toward the anchored
+     * position that pays it.
+     */
+    function scarcitySlopeBps(uint256 sigmaTargetBps, uint256 slopeRatioBps) internal pure returns (uint256) {
+        return (sigmaTargetBps * slopeRatioBps) / BPS;
+    }
+
+    /**
+     * The staker share of gross yield: the residual, not a parameter.
+     *
+     * Returning the residual is what makes the four streams sum to BPS by
+     * construction rather than by a table somebody has to keep adding up. The
+     * clamp guards a parameter set that violates the bounds of whitepaper
+     * §6.3; it is not an expected path, since invariant I22 holds the ceiling —
+     * and so every premium share — within the yield the two fixed shares leave.
+     */
+    function stakerShareBps(uint256 bufferBps, uint256 operationsBps, uint256 premiumBps)
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 fixedShare = bufferBps + operationsBps + premiumBps;
+        return fixedShare >= BPS ? 0 : BPS - fixedShare;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The buffer escalator and the stabilization levy. Whitepaper §4.2    */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * The buffer share in force under the escalator of whitepaper §4.2: the
+     * base at a haircut of zero, rising linearly to the cap at the haircut cap.
+     *
+     *     r_buffer(h_fx) = base + floor((cap - base) * h_fx / h_max)
+     *
+     * `250 + floor(1,250 * h_fx / h_max)` at the reference values. Truncates,
+     * toward the staker whose residual the buffer is taken from. A rise in the
+     * haircut says the two assets have varied against each other, the one risk
+     * QRL-denominated capital cannot stand behind, and what the escalator buys
+     * is first-loss capital in the origin asset. A cap of zero, or a base at or
+     * above the cap, leaves the base; the haircut is clamped into `[0, h_max]`.
+     */
+    function bufferShareInForceBps(uint256 baseBps, uint256 capBps, uint256 fxHaircutMaxBps, uint256 haircutBps)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (fxHaircutMaxBps == 0 || baseBps >= capBps) return baseBps;
+        uint256 h = haircutBps > fxHaircutMaxBps ? fxHaircutMaxBps : haircutBps;
+        return baseBps + ((capBps - baseBps) * h) / fxHaircutMaxBps;
+    }
+
+    /**
+     * The stabilization levy in force at a threat stage (whitepaper §4.2): the
+     * levy while the stage is below its fourth value, nothing at the fourth.
+     */
+    function stabilizationLevyInForceBps(uint256 levyBps, uint256 stage) internal pure returns (uint256) {
+        return stage < THREAT_STAGES ? levyBps : 0;
+    }
+
+    /**
+     * The cap on the premium stabilization reserve, in the origin asset
+     * (whitepaper §4.4): `psrCapEpochs` epochs of the worst-case gap,
+     * `psrCapEpochs * (sigma_4 - sigma_1) * Y_A,epoch / BPS`. Truncates, so the
+     * reserve is never allowed above what the gap can demand.
+     */
+    function psrCapUnits(uint256 psrCapEpochs, uint256 stage1Bps, uint256 stage4Bps, uint256 epochGrossYield)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (epochGrossYield == 0 || psrCapEpochs == 0 || stage4Bps <= stage1Bps) return 0;
+        return (psrCapEpochs * (stage4Bps - stage1Bps) * epochGrossYield) / BPS;
+    }
+
+    /**
+     * The cap factor the allocation leaf carries to the escrow, in basis
+     * points of one epoch's gross yield: `psrCapEpochs * (sigma_4 - sigma_1)`,
+     * so `psrCapUnits` is `factor * Y / BPS` on the origin chain, which knows
+     * neither the ladder nor the epochs. Zero where the ladder is flat.
+     */
+    function psrCapFactorBps(uint256 psrCapEpochs, uint256 stage1Bps, uint256 stage4Bps)
+        internal
+        pure
+        returns (uint256)
+    {
+        return stage4Bps <= stage1Bps ? 0 : psrCapEpochs * (stage4Bps - stage1Bps);
+    }
+
+    /**
+     * What the reserve must pay in one epoch to top a term-committed premium
+     * up to the spot share (whitepaper §4.4, I39): `(spot - commit) * covered`
+     * of the committed gross yield, over BPS twice, truncating so the demand
+     * is never overstated. Zero where the stage has not stepped above the
+     * committed target. `psrTopUpUnits` of the model.
+     */
+    function psrTopUpUnits(uint256 sigmaSpotBps, uint256 sigmaCommitBps, uint256 covered, uint256 committedGrossYield)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (sigmaSpotBps <= sigmaCommitBps || covered == 0 || committedGrossYield == 0) return 0;
+        uint256 c = covered > BPS ? BPS : covered;
+        return ((sigmaSpotBps - sigmaCommitBps) * c * committedGrossYield) / (BPS * BPS);
+    }
+
+    /**
+     * The commitment bond of a premium lot, in basis points of its QRL, at the
+     * admitted discount of its offering (whitepaper §4.7, yellow paper §3.5,
+     * I33): the ceiling `B_0` at the first offering, whose discount is the
+     * per-epoch bound `m_epoch`, falling linearly to `B_MIN` at the reserve
+     * floor. The step truncates, so the bond is never above the line; the
+     * floor binds below it. `solverBondBps` of the model.
+     */
+    function solverBondBps(
+        uint256 ceilingBps,
+        uint256 floorBps,
+        uint256 maxEpochMoveBps,
+        uint256 reserveFloorBps,
+        uint256 discountBps
+    ) internal pure returns (uint256) {
+        uint256 f = floorBps > ceilingBps ? ceilingBps : floorBps;
+        if (reserveFloorBps <= maxEpochMoveBps) return ceilingBps;
+        uint256 span = reserveFloorBps - maxEpochMoveBps;
+        uint256 excess = discountBps > maxEpochMoveBps ? discountBps - maxEpochMoveBps : 0;
+        if (excess > span) excess = span;
+        uint256 stepped = ceilingBps - ((ceilingBps - f) * excess) / span;
+        return stepped < f ? f : stepped;
+    }
+
+    /// The bond itself, in QRL: `lot * bps / BPS`, truncating, the bps clamped at BPS. `solverBondQrl`.
+    function solverBondQrl(uint256 lotQrl, uint256 bondBps) internal pure returns (uint256) {
+        return (lotQrl * (bondBps > BPS ? BPS : bondBps)) / BPS;
+    }
+
+    /**
+     * The shortfall carry a retired quantity records, in QRL (I34): the
+     * retained quantity, in units of the origin asset, valued at the reference
+     * price less the reserve floor — the lowest price the swap asked for it.
+     * Two truncating divisions in the model's order, so the carry is a
+     * ceiling on its repayment and never above the floor-priced value.
+     */
+    function shortfallCarryQrl(uint256 retainedUnits, uint256 refPrice, uint256 reserveFloorBps)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (retainedUnits == 0 || refPrice == 0) return 0;
+        uint256 f = reserveFloorBps > BPS ? BPS : reserveFloorBps;
+        return (((retainedUnits * refPrice) / PRICE_SCALE) * (BPS - f)) / BPS;
+    }
+
+    /**
+     * Coupon rate on bond principal, in origin-asset terms. Whitepaper §4.5.
+     * Truncates, toward the anchored position that funds it.
+     *
+     * Above unit utilisation this reduces to `target(u) * y_A / att_eff` with
+     * both notionals cancelling, so the rate rises with the shortage; below it
+     * the rate dilutes by the cover ratio. It is received in QRL at whatever
+     * each epoch's auction obtains, so the realised return floats against it.
+     * The coupon is distributed over bond principal outstanding rather than
+     * over the capacity conversion, so the premium a higher utilisation
+     * produces reaches the capital that bears the variation.
+     */
+    function couponRateBps(
+        uint256 anchoredNotional,
+        uint256 bondInOrigin,
+        uint256 premiumBps,
+        uint256 grossYieldBps
+    ) internal pure returns (uint256) {
+        if (bondInOrigin == 0 || anchoredNotional == 0) return 0;
+        return (premiumBps * grossYieldBps * anchoredNotional) / (BPS * bondInOrigin);
+    }
+
+    /**
+     * The coupon rate at exact cover: `sigma_t * y_A / att_eff`. Truncates.
+     *
+     * The floor of the rising branch above unit utilisation, and the ceiling of
+     * the diluting branch below it. It is the figure the admission condition of
+     * whitepaper §3.2 and the issuance suspension of §4.7 compare against the
+     * floor under the tail-risk premium, and the figure the reserve of the
+     * premium auction is bound by.
+     */
+    function maxCouponRateBps(
+        uint256 sigmaTargetBps,
+        uint256 attachmentBps,
+        uint256 grossYieldBps
+    ) internal pure returns (uint256) {
+        if (attachmentBps == 0) return 0;
+        return (sigmaTargetBps * grossYieldBps) / attachmentBps;
+    }
+
+    /// How many times the origin yield the coupon at exact cover is, for this book.
+    function couponMultipleBps(uint256 sigmaTargetBps, uint256 attachmentBps)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (attachmentBps == 0) return 0;
+        return (sigmaTargetBps * BPS) / attachmentBps;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Vesting and settlement. Whitepaper §5.2 and §5.3                    */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Cover vesting linearly over the window from anchoring. Truncates, toward
+     * the bond: a settlement is multiplied by this factor.
+     *
+     * The barrier against anchoring into a loss already known: a position
+     * anchored thirty days before a determination settles at one third of what
+     * a fully vested position of the same size settles at.
+     */
+    function vestingBps(uint256 anchoredAt, uint256 nowTs, uint256 windowSeconds)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (windowSeconds == 0) return BPS;
+        if (nowTs <= anchoredAt) return 0;
+
+        uint256 elapsed = nowTs - anchoredAt;
+        if (elapsed >= windowSeconds) return BPS;
+        return (elapsed * BPS) / windowSeconds;
+    }
+
+    /**
+     * The single factor applied to every settlement in one window (invariant
+     * I14). Truncates, so the window never pays out more than it holds.
+     *
+     * `vestedObligation` is summed **after** each position's vesting factor and
+     * never before it. Summing gross understates the factor and leaves capital
+     * undistributed on a book whose positions are mostly part-vested, which at
+     * launch is every book.
+     */
+    function settlementHaircutBps(uint256 available, uint256 vestedObligation)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (vestedObligation == 0) return BPS;
+        uint256 raw = (available * BPS) / vestedObligation;
+        return raw > BPS ? BPS : raw;
+    }
+
+    /**
+     * Capital available to a settlement, in the origin asset (invariant I11).
+     *
+     * The cap belongs to the bond alone, and an expression that capped the sum
+     * would silently discard the buffer on any event large enough to reach the
+     * limit — which is every event the haircut exists for. `bondInOrigin` is
+     * the unadjusted conversion: the haircut of §4.3 enters no settlement.
+     */
+    function availableCapital(uint256 buffer, uint256 bondInOrigin, uint256 occurrenceLimit)
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 fromBond = bondInOrigin < occurrenceLimit ? bondInOrigin : occurrenceLimit;
+        return buffer + fromBond;
+    }
+
+    /// What one position is paid: three ratios, three truncating divisions by BPS.
+    function settlementFor(
+        uint256 realisedLoss,
+        uint256 indemnityEff,
+        uint256 vesting,
+        uint256 haircut
+    ) internal pure returns (uint256) {
+        uint256 value = (realisedLoss * indemnityEff) / BPS;
+        value = (value * vesting) / BPS;
+        return (value * haircut) / BPS;
+    }
+
+    /**
+     * What a settlement paid in QRL realises in the origin asset once sold, at
+     * a market impact the beneficiary bears. Whitepaper §5.2. Truncates.
+     *
+     * The protocol strikes the obligation at the reference price and delivers
+     * QRL; it neither sells that QRL nor quotes the price a sale obtains, so
+     * the impact is an argument and never a parameter.
+     */
+    function realisedAfterConversion(uint256 paid, uint256 impactBps) internal pure returns (uint256) {
+        if (impactBps >= BPS || paid == 0) return 0;
+        return (paid * (BPS - impactBps)) / BPS;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The settlement price. Whitepaper §5.5, yellow paper §4.2            */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * The lowest emergency valuation a settlement may strike at, `epochs` after
+     * the breaker fired: the carried price reduced by the per-epoch bound once
+     * per elapsed epoch, compounded and truncated at each step.
+     *
+     * A decline the market sustains reaches settlement at that pace; a print
+     * below this floor is one no epoch of trading could have produced, and a
+     * settlement struck on it would transfer the difference from the claimant
+     * to bond principal. The loop stops at zero, so a long count costs nothing.
+     */
+    function emergencyPriceFloor(uint256 carried, uint256 maxEpochMoveBps, uint256 epochs)
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 retained = maxEpochMoveBps >= BPS ? 0 : BPS - maxEpochMoveBps;
+        uint256 floor = carried;
+        for (uint256 i = 0; i < epochs && floor != 0; i++) {
+            floor = (floor * retained) / BPS;
+        }
+        return floor;
+    }
+
+    /**
+     * The reference price a settlement strikes at, by the state of the breaker.
+     *
+     * Where the breaker clears within the grace period the thirty-day average
+     * applies; where it is still active the emergency valuation is clamped
+     * between `floor` and `carried`. The minimum with `carried` protects bond
+     * principal from a manipulated print raising a settlement, and the floor
+     * protects the claimant from one lowering it faster than the bound admits.
+     * Every branch is bounded above by `carried`, so a rise in the reference
+     * price cannot inflate an obligation struck during it.
+     */
+    function settlementPrice(
+        bool breakerCleared,
+        uint256 carried,
+        uint256 twap30d,
+        uint256 emergency,
+        uint256 floor
+    ) internal pure returns (uint256) {
+        uint256 bounded = emergency > floor ? emergency : floor;
+        uint256 struck = breakerCleared ? twap30d : bounded;
+        return struck < carried ? struck : carried;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Maturity, exit parity and run-off. Whitepaper §5.3                  */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Utilisation, in basis points: `ceil(K * BPS / (N^cap_30 + buffer_orig))`
+     * (whitepaper §4.3, yellow paper §3.1). Whitepaper §5.3 gates the
+     * conditional release on this falling below 2,500 bps.
+     *
+     * `bondCapacity` is `bondCapacityInOrigin` on the settlement series — the
+     * haircut conversion, never the epoch average (I38) — and the origin-asset
+     * buffer stands beside it, never in place of it: `bondNotional == 0`
+     * stands nothing behind the book whatever its buffer (whitepaper §4.7).
+     *
+     * Rounds **UP**, against the truncation convention of whitepaper §4.1 and
+     * for `effectiveAttachmentBps`'s reason: understating utilisation overstates
+     * cover and releases principal the book still needs, so a book sitting
+     * exactly on the threshold is not released on a rounding wei.
+     *
+     * A book requiring nothing reads zero. A book requiring capital with
+     * nothing standing behind it reads `UTILISATION_UNBOUNDED`, and every
+     * reading is capped there — the model's `Number.MAX_SAFE_INTEGER`, kept
+     * so the two agree exactly; no threshold is anywhere near it.
+     */
+    function utilisationBps(uint256 required, uint256 bondNotional, uint256 bondCapacity, uint256 bufferOrig)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (required == 0) return 0;
+        uint256 standing = bondNotional == 0 ? 0 : bondCapacity + bufferOrig;
+        if (standing == 0) return UTILISATION_UNBOUNDED;
+        uint256 raw = (required * BPS + standing - 1) / standing;
+        return raw > UTILISATION_UNBOUNDED ? UTILISATION_UNBOUNDED : raw;
+    }
+
+    /**
+     * Bond principal released at par under the conditional release, in QRL:
+     * the principal above the capital requirement and nothing below it,
+     * measured on the capacity conversion of whitepaper §4.3 — the reference
+     * price and the conversion haircut (SP-05 of 2026-09-30; the model's
+     * `conditionalReleaseQrl`):
+     *
+     *     required_QRL = ceil(K * P * BPS / (PRICE_SCALE * (BPS - h_fx)))
+     *
+     * so the principal that remains still meets the requirement at the
+     * conversion cover is measured on, and the release moves no cover; before
+     * it the quantity was taken at the unadjusted conversion, which at a
+     * haircut of 2,500 bps left the book at three quarters of its cover.
+     * Rounds **up**, so the principal retained always meets it (the invariant
+     * of part 9 of the scenario report). A haircut of BPS or more releases
+     * nothing. The caller owns the two-epoch count and the suspensions.
+     */
+    function conditionalReleaseQrl(uint256 bondNotional, uint256 refPrice, uint256 required, uint256 fxHaircutBps_)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (refPrice == 0 || fxHaircutBps_ >= BPS) return 0;
+        uint256 den = PRICE_SCALE * (BPS - fxHaircutBps_);
+        uint256 requiredQrl = (required * refPrice * BPS + den - 1) / den;
+        return bondNotional > requiredQrl ? bondNotional - requiredQrl : 0;
+    }
+
+    /**
+     * Epochs in which the whole anchored book can be settled: the unbonding
+     * period rounded up to whole epochs, plus the epochs the per-epoch release
+     * bound requires to satisfy the queue. Both round up, because a release
+     * settling part-way through an epoch settles in that epoch.
+     */
+    function settlementHorizonEpochs(uint256 unbondingSeconds, uint256 epochSeconds, uint256 releaseBoundBps)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (epochSeconds == 0 || releaseBoundBps == 0) return 0;
+        uint256 unbonding = (unbondingSeconds + epochSeconds - 1) / epochSeconds;
+        return unbonding + (BPS + releaseBoundBps - 1) / releaseBoundBps;
+    }
+
+    /**
+     * The per-epoch release bound in units of the origin asset (whitepaper
+     * §3.3). Truncates, so no epoch releases more than the stated share.
+     *
+     * `queueBase` is the escrow's holding when its exit queue last opened, held
+     * until the queue empties. Taken on the holding that remains instead, the
+     * bound would shrink with every epoch it settles and a queue of the whole
+     * book would approach empty geometrically without reaching it — so the
+     * horizon of `settlementHorizonEpochs`, and I25 with it, would describe a
+     * queue the escrow never clears.
+     */
+    function releaseBoundUnits(uint256 queueBase, uint256 releaseBoundBps) internal pure returns (uint256) {
+        return (queueBase * releaseBoundBps) / BPS;
+    }
+
+    /**
+     * The largest maturity ladder fraction exit parity admits (invariant I25):
+     * BPS over the settlement horizon, truncated, because the admissible value
+     * is the one that satisfies the relation. A ladder above it lets bond
+     * principal run off in fewer epochs than the anchored book needs to leave.
+     */
+    function maturityLadderMaxBps(uint256 horizonEpochs) internal pure returns (uint256) {
+        if (horizonEpochs == 0) return 0;
+        return BPS / horizonEpochs;
+    }
+
+    /// Epochs in which the whole of bond principal can mature, at the ladder in force.
+    function runoffHorizonEpochs(uint256 maturityLadderBps) internal pure returns (uint256) {
+        if (maturityLadderBps == 0) return 0;
+        return (BPS + maturityLadderBps - 1) / maturityLadderBps;
+    }
+
+    /**
+     * The contraction of bond principal outstanding across two epochs, in bps.
+     * Truncates, so a contraction at the trigger reads at or below it. A book
+     * that has grown contracts by nothing.
+     */
+    function runoffContractionBps(uint256 current, uint256 twoEpochsEarlier) internal pure returns (uint256) {
+        if (twoEpochsEarlier == 0 || current >= twoEpochsEarlier) return 0;
+        return ((twoEpochsEarlier - current) * BPS) / twoEpochsEarlier;
+    }
+
+    /**
+     * Whether either ground of the run-off gate holds at an epoch boundary: the
+     * threat stage at its fourth value, or a contraction beyond the trigger.
+     * Both are states the protocol records — a vote and a measurement — and
+     * neither is an estimate of the timing of the systemic event. The caller
+     * owns the suspensions that hold a closed gate closed.
+     */
+    function runoffGateGround(
+        uint256 threatStage,
+        uint256 bondNotional,
+        uint256 bondNotionalTwoEpochsEarlier,
+        uint256 runoffTriggerBps
+    ) internal pure returns (bool) {
+        if (threatStage >= THREAT_STAGES) return true;
+        return runoffContractionBps(bondNotional, bondNotionalTwoEpochsEarlier) > runoffTriggerBps;
+    }
+
+    /// The ceiling on the target share in force, given the state of the gate.
+    function premiumCeilingInForceBps(bool gateClosed, uint256 premiumCeilingBps, uint256 surgeCeilingBps)
+        internal
+        pure
+        returns (uint256)
+    {
+        return gateClosed ? surgeCeilingBps : premiumCeilingBps;
+    }
+
+    /// Epochs the run-off queue takes to drain at the bound in force. Rounds up.
+    function runoffDrainEpochs(uint256 runoffBoundBps) internal pure returns (uint256) {
+        if (runoffBoundBps == 0) return 0;
+        return (BPS + runoffBoundBps - 1) / runoffBoundBps;
+    }
+
+    /**
+     * Principal the run-off queue satisfies in one epoch: the bound applied to
+     * the principal outstanding when the gate closed, truncated, and never more
+     * than the queue holds.
+     */
+    function runoffReleaseQrl(uint256 runoffBoundBps, uint256 atGateClose, uint256 queued)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (queued == 0 || atGateClose == 0 || runoffBoundBps == 0) return 0;
+        uint256 slice = (atGateClose * runoffBoundBps) / BPS;
+        return slice < queued ? slice : queued;
+    }
+
+    /**
+     * The largest exposure floor relation 9 of whitepaper §6.3 admits:
+     * `BPS - (n_d - 1) * Delta_X`, `n_d = runoffDrainEpochs(runoffBound)`.
+     *
+     * The last principal of a clean queue leaves at a clean age of `n_d - 1`,
+     * so a floor at or below this is never above the decayed weight of
+     * principal still in a clean queue. Signed because the model's is: negative
+     * where the decay is too steep for the drain, which no floor satisfies. No
+     * division beyond the drain's own (which rounds up, toward the longer
+     * drain and so the tighter bound). A zero bound drains nothing and admits
+     * any floor up to BPS, as the model's does.
+     */
+    function queueExposureFloorMaxBps(uint256 runoffBoundBps, uint256 queueDecayBps) internal pure returns (int256) {
+        uint256 drain = runoffDrainEpochs(runoffBoundBps);
+        if (drain == 0) return int256(BPS);
+        return int256(BPS) - int256(drain - 1) * int256(queueDecayBps);
+    }
+
+    /// Whether the run-off bound, the queue decay and the exposure floor satisfy relation 9 of whitepaper §6.3.
+    function queueFloorRelationHolds(uint256 queueExposureFloorBps, uint256 runoffBoundBps, uint256 queueDecayBps)
+        internal
+        pure
+        returns (bool)
+    {
+        return int256(queueExposureFloorBps) <= queueExposureFloorMaxBps(runoffBoundBps, queueDecayBps);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Delivery of the premium. Whitepaper §4.7                            */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * The coupon an epoch actually pays once the premium share has been
+     * auctioned: the rate less the discount of the clearing price, times the
+     * share of the quantity that cleared. One truncating division; nothing
+     * cleared pays nothing rather than a negative coupon.
+     */
+    function deliveredCouponBps(uint256 couponRate, uint256 executionCostBps, uint256 clearedBps)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (executionCostBps >= BPS || clearedBps == 0) return 0;
+        uint256 cleared = clearedBps > BPS ? BPS : clearedBps;
+        return (couponRate * (BPS - executionCostBps) * cleared) / (BPS * BPS);
+    }
+
+    /**
+     * The largest discount to the reference price the delivered coupon admits:
+     * the price at which the coupon delivered at exact cover would equal the
+     * floor under the tail-risk premium.
+     *
+     * The inadmissible part rounds **up**, so the admissible discount rounds
+     * down: a discount a wei past the line would deliver a coupon below the
+     * floor the bound exists to hold. Below the floor no discount is
+     * admissible at all, and delivery cannot be bought with price.
+     */
+    function discountCapBps(uint256 tailPremiumFloorBps, uint256 couponAtExactCoverBps)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (couponAtExactCoverBps == 0) return 0;
+        uint256 inadmissible = (tailPremiumFloorBps * BPS + couponAtExactCoverBps - 1) / couponAtExactCoverBps;
+        return inadmissible >= BPS ? 0 : BPS - inadmissible;
+    }
+
+    /**
+     * The discount the reserve of an offering admits after `failedAuctions`
+     * offerings of the same quantity that did not clear (invariant I28;
+     * whitepaper §4.7 as revised 2026-09-30, EC-03): the first offering at
+     * `firstDiscountBps`, d_first; after k >= 1 failures the per-epoch price
+     * bound stepped k - 1 times,
+     *
+     *     d_0 = d_first,   d_k = m_epoch + (k - 1) * step
+     *
+     * each rung bounded by the lower of the reserve floor and `discountCapBps`.
+     * Monotone in the failure count while d_first is not above m_epoch, which
+     * the ranges of §6.3 hold (300 - 500 against 1,500 - 3,000).
+     */
+    function admittedDiscountBps(
+        uint256 maxEpochMoveBps,
+        uint256 firstDiscountBps,
+        uint256 reserveStepBps,
+        uint256 reserveFloorBps,
+        uint256 tailPremiumFloorBps,
+        uint256 couponAtExactCoverBps,
+        uint256 failedAuctions
+    ) internal pure returns (uint256) {
+        uint256 stepped =
+            failedAuctions == 0 ? firstDiscountBps : maxEpochMoveBps + (failedAuctions - 1) * reserveStepBps;
+        uint256 cap = discountCapBps(tailPremiumFloorBps, couponAtExactCoverBps);
+        if (reserveFloorBps < cap) cap = reserveFloorBps;
+        return stepped < cap ? stepped : cap;
+    }
+
+    /**
+     * Offerings the reserve requires to reach its floor: the lower bound on the
+     * retention period (invariant I28). The first offering, the offering at the
+     * epoch bound, and one per reserve step from there to the floor,
+     * `2 + ceil((floor - m_epoch) / step)`, seven at the reference values
+     * (EC-03). Rounds up, so a quantity is offered at the floor before it is
+     * retired; two where the step is zero or the floor is not below the bound.
+     */
+    function reserveLadderEpochs(uint256 reserveFloorBps, uint256 maxEpochMoveBps, uint256 reserveStepBps)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (reserveStepBps == 0 || reserveFloorBps <= maxEpochMoveBps) return 2;
+        return 2 + (reserveFloorBps - maxEpochMoveBps + reserveStepBps - 1) / reserveStepBps;
+    }
+
+    /**
+     * The quantity below which no offering opens, in base units of the origin
+     * asset (whitepaper §4.7, EC-03, PV-13; the model's
+     * `offeringBatchThresholdUnits`): `multiple` times the claim cost,
+     * `claimCostGwei` in 1e-9 of a whole unit, at `unitScale` base units per
+     * whole unit (10^decimals). Truncates, toward opening. Zero, which disables
+     * batching, where either parameter is zero.
+     */
+    function offeringBatchThresholdUnits(uint256 multiple, uint256 claimCostGwei, uint256 unitScale)
+        internal
+        pure
+        returns (uint256)
+    {
+        return (multiple * claimCostGwei * unitScale) / 1e9;
+    }
+
+    /**
+     * Premium share the auction has failed to clear, and what becomes of it:
+     * retained whole as buffer once offered `unsoldEpochs` times, and offered
+     * again whole before that. All-or-nothing, because a partial retention
+     * would leave a residue too small to auction and still not a coupon.
+     */
+    function unsoldRetention(uint256 unsold, uint256 epochsOffered, uint256 unsoldEpochs)
+        internal
+        pure
+        returns (uint256 retained, uint256 offered)
+    {
+        uint256 threshold = unsoldEpochs == 0 ? 1 : unsoldEpochs;
+        if (epochsOffered >= threshold) return (unsold, 0);
+        return (0, unsold);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The two classes. Whitepaper §4.6, yellow paper §3.4                 */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * The coupon each class draws where bond principal is divided by seniority.
+     *
+     * Senior is paid a stated rate and junior takes what the pot has left, so
+     * seniority redistributes the pool rate and creates none of it (I19):
+     *
+     *     junior = (pool * BPS - senior * (BPS - thickness)) / thickness
+     *
+     * Both divisions truncate, which leaves the residual in the delivered
+     * proceeds for the following epoch rather than paying a rate the pot cannot
+     * fund. Where the pot cannot meet the stated senior rate, senior is reduced
+     * to what it pays and junior earns nothing; a shortfall is never carried
+     * forward or drawn from principal.
+     *
+     * At either end of the thickness range the pool is undivided — §6.3 admits
+     * neither, but the expression has to be total.
+     */
+    function trancheCoupons(uint256 poolCouponBps, uint256 juniorThicknessBps, uint256 statedSeniorCouponBps)
+        internal
+        pure
+        returns (uint256 juniorCoupon, uint256 seniorCoupon, bool seniorShortfall)
+    {
+        if (juniorThicknessBps >= BPS) return (poolCouponBps, 0, false);
+        if (juniorThicknessBps == 0) {
+            bool short_ = statedSeniorCouponBps > poolCouponBps;
+            return (0, short_ ? poolCouponBps : statedSeniorCouponBps, short_);
+        }
+
+        uint256 pot = poolCouponBps * BPS;
+        uint256 seniorWeight = BPS - juniorThicknessBps;
+        uint256 seniorDraw = statedSeniorCouponBps * seniorWeight;
+
+        if (seniorDraw > pot) return (0, pot / seniorWeight, true);
+        return ((pot - seniorDraw) / juniorThicknessBps, statedSeniorCouponBps, false);
+    }
+
+    /**
+     * The draw on each class of bond principal, junior first under BOTH
+     * triggers (whitepaper §4.6, §5.2; I23′): junior to the whole of its
+     * thickness before senior is reached, the two summing to the draw exactly.
+     * Junior capital truncates, so the rounding wei falls on senior's side of
+     * the line and junior never pays beyond its thickness.
+     *
+     * Under trigger 1 `bondDraw` is the bond contribution of the window,
+     * `min(N_B,orig, K)`. Under trigger 2 the settlement is progressive, not
+     * total: the caller passes `pool * trigger2DrawTotalBps / BPS` — the floor
+     * D_0 at the ratification, the severity-adjusted total after the
+     * assessment window — and what is not drawn is released back to its class.
+     * These draws, not the whole pool, are what the recovery of §5.4 ranks
+     * against (`classRecovery`). A draw above the pool is clamped to it.
+     */
+    function classDraws(uint256 bondDraw, uint256 bondInOrigin, uint256 juniorThicknessBps)
+        internal
+        pure
+        returns (uint256 junior, uint256 senior)
+    {
+        uint256 draw = bondDraw > bondInOrigin ? bondInOrigin : bondDraw;
+        uint256 juniorCapital = juniorThicknessBps >= BPS
+            ? bondInOrigin
+            : (bondInOrigin * juniorThicknessBps) / BPS;
+        junior = draw < juniorCapital ? draw : juniorCapital;
+        senior = draw - junior;
+    }
+
+    /**
+     * The same junior-first order on the class principals a book records,
+     * rather than on the thickness parameter: a live pool rarely sits exactly
+     * at `w`, and the draw reaches senior only once the junior principal
+     * actually outstanding is exhausted. The senior draw is clamped to the
+     * senior principal, so the two never exceed the pool.
+     */
+    function classDrawsOnPrincipal(uint256 draw, uint256 juniorPrincipal, uint256 seniorPrincipal)
+        internal
+        pure
+        returns (uint256 junior, uint256 senior)
+    {
+        junior = draw < juniorPrincipal ? draw : juniorPrincipal;
+        uint256 rest = draw - junior;
+        senior = rest < seniorPrincipal ? rest : seniorPrincipal;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The progressive trigger-2 settlement. Whitepaper §4.6, I37          */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * The severity S a trigger-2 settlement is adjusted by: the measured loss
+     * on the valuation oracle's thirty-day series, clamped at `ceilingBps` —
+     * `measuredSeverityCeilingBps` on every measured path (PV-03), BPS for a
+     * severity the court fixes — and floored at the severity floor. `measured` false — the oracle silent or the breaker active
+     * — measures nothing and returns `(false, 0)`: the reading is absent, not
+     * zero, and the model's `null` is this flag (item 25a, HOLD).
+     */
+    function trigger2SeverityBps(uint256 severityFloorBps, bool measured, uint256 measuredLossBps, uint256 ceilingBps)
+        internal
+        pure
+        returns (bool, uint256)
+    {
+        if (!measured) return (false, 0);
+        uint256 floor = severityFloorBps > BPS ? BPS : severityFloorBps;
+        uint256 loss = measuredLossBps > BPS ? BPS : measuredLossBps;
+        if (loss > ceilingBps) loss = ceilingBps;
+        return (true, loss > floor ? loss : floor);
+    }
+
+    /**
+     * The largest m_loss the measured path can reach, `BPS - floor(BPS * (1 -
+     * m_epoch)^epochs)` on PRICE_SCALE with the truncations of
+     * `emergencyPriceFloor` (the model's `measuredSeverityCeilingBps`): 6,835
+     * bps at m_epoch 2,500 over four epochs. Since PV-03 of 2026-09-30 it clamps
+     * every measured loss, whatever the epochs its readings span; only the
+     * court fixes a severity above it, and `trigger2SeverityBps` is then
+     * given BPS as its ceiling.
+     */
+    function measuredSeverityCeilingBps(uint256 maxEpochMoveBps, uint256 epochs) internal pure returns (uint256) {
+        (, uint256 loss) = measuredLossBps(PRICE_SCALE, emergencyPriceFloor(PRICE_SCALE, maxEpochMoveBps, epochs));
+        return loss;
+    }
+
+    /**
+     * The whole draw of a trigger-2 settlement in bps of the pool:
+     * `max(D_0, S)`, where D_0 is the immediate draw paid at the ratification.
+     * `max` rather than a sum, because the immediate leg is an advance against
+     * the severity leg. An unmeasured severity draws D_0 and no more: the
+     * balance is neither drawn nor released but HELD (`trigger2HeldBps`).
+     */
+    function trigger2DrawTotalBps(uint256 trigger2FloorBps, bool measured, uint256 severityBps)
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 floor = trigger2FloorBps > BPS ? BPS : trigger2FloorBps;
+        if (!measured) return floor;
+        uint256 s = severityBps > BPS ? BPS : severityBps;
+        return s > floor ? s : floor;
+    }
+
+    /**
+     * The balance of a trigger-2 settlement held while the severity cannot be
+     * measured, in bps of the pool: `BPS - D_0`, neither paid at BPS nor
+     * released — a default of total loss would give the anchored book a reason
+     * to impair the feed, a default at the floor would give the bond the same
+     * reason (whitepaper §4.6, §5.5; I37). Zero wherever the severity is
+     * measured, so paid, held and released always sum to the pool.
+     */
+    function trigger2HeldBps(uint256 trigger2FloorBps, bool measured) internal pure returns (uint256) {
+        if (measured) return 0;
+        return BPS - (trigger2FloorBps > BPS ? BPS : trigger2FloorBps);
+    }
+
+    /**
+     * m_loss: the decline of the origin chain's value on the valuation
+     * oracle's thirty-day series, from the reading fixed at the ratification
+     * to the one at the close of the assessment window (whitepaper §4.6,
+     * yellow paper §3.4), in bps of the first. The series is QRL per unit of
+     * the origin asset, so a fall in it is a fall in the origin chain's value.
+     * Truncates, toward bond principal; `trigger2SeverityBps` then floors it
+     * at S_floor, so the truncation never moves a draw below the floor. A rise
+     * is no loss. A zero first reading measures nothing (`measured` false).
+     *
+     * NOT IN THE MODEL: `ark-staking.ts` takes m_loss as an input. This is the
+     * one reading of "the thirty-day pre- and post-declaration series" the
+     * oracle's interface admits (phase C3; reported to the papers).
+     */
+    function measuredLossBps(uint256 pricePre, uint256 pricePost) internal pure returns (bool measured, uint256 lossBps) {
+        if (pricePre == 0) return (false, 0);
+        if (pricePost >= pricePre) return (true, 0);
+        return (true, ((pricePre - pricePost) * BPS) / pricePre);
+    }
+
+    /**
+     * The model's `holdDeterminationOpensAfterEpochs`: 2 x W_a epochs after the
+     * assessment window closed, a determination of m_loss may be opened on a
+     * held balance — never where the series has resumed, since the resumed
+     * series settles the balance itself, and with no later bound: the hold has
+     * no other limit in time (the model's `holdDeterminationOpen`).
+     */
+    function holdDeterminationOpen(uint256 assessmentWindowEpochs, uint256 epochsSinceClose, bool seriesResumed)
+        internal
+        pure
+        returns (bool)
+    {
+        if (seriesResumed) return false;
+        return epochsSinceClose >= 2 * assessmentWindowEpochs;
+    }
+
+    /**
+     * The exposure weight of queued principal (whitepaper §5.3, I26′): the
+     * greater of the floor and BPS less the decay per epoch of clean queue
+     * age — the model's `queueExposureBps`. It is the weight of the trigger-2
+     * draw on the principal and of the coupon it earns, both.
+     *
+     * From a clean age of `QUEUE_EXPOSURE_AGES` every weight is the floor
+     * (OC-ECON-09): the bond keeps the queue in that many age buckets and
+     * weighs every older share at the floor in the coupon base, so the coupon
+     * paid on a queued holding, the queue draw and the relief must read the
+     * same weight there. Over the admissible ranges (decay ≥ 1,000, floor ≥
+     * 2,000 bps) the decayed figure has already reached the floor at that age,
+     * so this states the relation instead of relying on it.
+     */
+    function queueExposureBps(uint256 queueDecayBps, uint256 queueExposureFloorBps, uint256 cleanAge)
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 floor = queueExposureFloorBps > BPS ? BPS : queueExposureFloorBps;
+        uint256 decayed = queueDecayBps * cleanAge;
+        if (decayed >= BPS || cleanAge >= QUEUE_EXPOSURE_AGES) return floor;
+        decayed = BPS - decayed;
+        return decayed > floor ? decayed : floor;
+    }
+
+    /// Queued principal at its exposure weight — the model's `queuedAtExposure`. Truncates, toward the book.
+    function queuedAtExposure(uint256 principal, uint256 exposureBps) internal pure returns (uint256) {
+        if (exposureBps > BPS) exposureBps = BPS;
+        return (principal * exposureBps) / BPS;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Recovery by subrogation. Whitepaper §5.4                            */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Division of a recovered escrow after a declaration.
+     *
+     * The bond paid the anchored positions its progressive trigger-2 draw —
+     * D_0, then the severity-adjusted balance, never more than the pool — so
+     * it stands in their place against the escrow up to the amount it paid, and the positions keep the claim on everything above it.
+     * A waterfall over one measured quantity, not an apportionment: no share is
+     * computed, no vote moves it, and there is no band to bound that vote.
+     * Coupons received are not deducted — a coupon is the price of the cover
+     * and not a partial recovery.
+     */
+    function recoveryAllocation(uint256 recovered, uint256 paidUnderTrigger2)
+        internal
+        pure
+        returns (uint256 toBond, uint256 toAnchored)
+    {
+        toBond = recovered < paidUnderTrigger2 ? recovered : paidUnderTrigger2;
+        toAnchored = recovered - toBond;
+    }
+
+    /**
+     * The bond's share of a recovery between its two classes (invariant I23′):
+     * senior to the whole of its ACTUAL draw — `classDraws` at the progressive
+     * trigger-2 draw taken, possibly nothing — before junior receives any, and
+     * neither beyond its draw. The mirror of the junior-first draw.
+     */
+    function classRecovery(uint256 bondRecovery, uint256 drawJunior, uint256 drawSenior)
+        internal
+        pure
+        returns (uint256 senior, uint256 junior)
+    {
+        senior = bondRecovery < drawSenior ? bondRecovery : drawSenior;
+        uint256 rest = bondRecovery - senior;
+        junior = rest < drawJunior ? rest : drawJunior;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Trigger 2 and the censorship ground. Whitepaper §3.6 and §5.1       */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * The factor by which the censorship settlement dilutes every position
+     * against the ordinary terms of trigger 2: `N_A / (N_A + N_T)`, one factor
+     * for every position, anchored or in transit. Truncates, toward bond
+     * principal. BPS at a transit of zero; zero with nothing on either side.
+     * It dilutes the D_0 draw of `censorshipDrawBps`, never the whole pool.
+     */
+    function censorshipDilutionBps(uint256 anchored, uint256 transitElapsed) internal pure returns (uint256) {
+        uint256 base = anchored + transitElapsed;
+        if (base == 0) return 0;
+        return (anchored * BPS) / base;
+    }
+
+    /**
+     * A position's share of a trigger-2 draw, pro rata by recorded principal on
+     * the stated base: the anchored notional under a declaration, widened by
+     * the qualifying transit under the censorship ground. `pool` is the QUANTITY
+     * DRAWN — `pool * trigger2DrawTotalBps / BPS` under a declaration,
+     * `pool * censorshipDrawBps / BPS` on the censorship ground — not the whole
+     * pool. Truncates, so the sum over every position never exceeds the draw
+     * and no position is met ahead of another.
+     */
+    function trigger2Share(uint256 pool, uint256 base, uint256 principal) internal pure returns (uint256) {
+        if (pool == 0 || base == 0 || principal == 0) return 0;
+        uint256 share = principal > base ? base : principal;
+        return (pool * share) / base;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Trigger 2 on the vested obligation, D after the haircut.            */
+    /* Whitepaper §5.2, yellow paper §3.4, I37 (papers sync 5, phase C3b)  */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * One claimant's vested weight `N_p * vesting_p`, in origin base units
+     * times bps, exact: the term of `W = Sum_p N_p * vesting_p` before any
+     * division, so the sum is exact and kept as an aggregate. The vesting
+     * factor is clamped into [0, BPS] (the model's `trigger2VestedWeight`).
+     */
+    function trigger2VestedWeight(uint256 notional, uint256 vestingBps_) internal pure returns (uint256) {
+        return notional * (vestingBps_ > BPS ? BPS : vestingBps_);
+    }
+
+    /// The trigger-2 obligation `floor(W / BPS)`: the vested notional, in origin units. Truncates, toward bond principal.
+    function trigger2Obligation(uint256 vestedWeight) internal pure returns (uint256) {
+        return vestedWeight / BPS;
+    }
+
+    /**
+     * The cap K_T of a trigger-2 settlement, in units of the origin asset
+     * (whitepaper §5.2, EC-02 of 2026-09-30; the model's `trigger2CapUnits`):
+     * the capital requirement of §4.3 on the claimants' recorded principal N_T
+     * — the anchored positions and, on the censorship ground, the qualifying
+     * releases — at the effective attachment standing at the ratification,
+     * `floor(N_T * att_eff / BPS)`. Truncates, toward bond principal.
+     */
+    function trigger2CapUnits(uint256 claimantPrincipal, uint256 attachmentBps) internal pure returns (uint256) {
+        return (claimantPrincipal * (attachmentBps > BPS ? BPS : attachmentBps)) / BPS;
+    }
+
+    /**
+     * The full settlement `S_full = min(pool, floor(W * price / (BPS *
+     * PRICE_SCALE)), floor(K_T * price / PRICE_SCALE))`, in QRL: the vested
+     * notional at the settlement price, bounded by outstanding bond principal
+     * and, since 2026-09-30 (EC-02), by the cap K_T at the same price — one
+     * haircut for every claimant where the lesser of the pool and the cap falls
+     * short. Truncates, toward bond principal; zero on a zero weight, pool,
+     * price or cap. All four are fixed at the opening; the cap never raises
+     * S_full.
+     */
+    function trigger2FullSettlement(uint256 vestedWeight, uint256 poolQrl, uint256 price, uint256 capUnits)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (vestedWeight == 0 || poolQrl == 0 || price == 0 || capUnits == 0) return 0;
+        uint256 value = (vestedWeight * price) / (BPS * PRICE_SCALE);
+        uint256 cap = (capUnits * price) / PRICE_SCALE;
+        if (cap < poolQrl) poolQrl = cap;
+        return value < poolQrl ? value : poolQrl;
+    }
+
+    /**
+     * What a trigger-2 draw of `drawBps` takes from the pool, in QRL:
+     * `floor(D * S_full / BPS)`, D clamped into [0, BPS] — D_0 at the opening,
+     * D_total after the assessment window. D is applied AFTER the haircut: the
+     * severity scales the settlement, not the notional. Non-decreasing in D,
+     * so the balance above the floor draw is never negative. Truncates,
+     * toward bond principal. Takes S_full as the settlement fixed it at the
+     * opening (`trigger2FullSettlement`), not its four inputs: the model's
+     * `trigger2PoolDraw(W, D, pool, price, K_T)` is this of that figure.
+     */
+    function trigger2PoolDraw(uint256 fullSettlement, uint256 drawBps) internal pure returns (uint256) {
+        uint256 d = drawBps > BPS ? BPS : drawBps;
+        return (d * fullSettlement) / BPS;
+    }
+
+    /**
+     * The principal an unmeasurable severity holds: `S_full - floor(D_0 *
+     * S_full / BPS)`, so the floor draw and the held principal sum to S_full
+     * exactly (I37).
+     */
+    function trigger2HeldPrincipal(uint256 fullSettlement, uint256 floorBps) internal pure returns (uint256) {
+        return fullSettlement - trigger2PoolDraw(fullSettlement, floorBps);
+    }
+
+    /**
+     * The part of one holding frozen while a severity balance is held (whitepaper
+     * §5.2, PV-11 of 2026-09-30; the model's `heldFreezeOfHolding`): its pro-rata
+     * part of the principal its class holds, `ceil(holding * held /
+     * classPrincipal)`, rounded up toward the hold; the rest leaves on the terms
+     * of its class. Both inputs clamped at the class principal.
+     */
+    function heldFreezeOfHolding(uint256 holding, uint256 classPrincipal, uint256 heldInClass)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (holding == 0 || classPrincipal == 0 || heldInClass == 0) return 0;
+        if (heldInClass > classPrincipal) heldInClass = classPrincipal;
+        if (holding > classPrincipal) holding = classPrincipal;
+        return (holding * heldInClass + classPrincipal - 1) / classPrincipal;
+    }
+
+    /**
+     * One claimant's entitlement to a draw, `floor(draw * min(w_p, W) / W)`,
+     * in QRL: its obligation at the one haircut, times D. The entitlements of
+     * every claimant sum to at most the draw. Truncates, toward the other
+     * claimants. Zero on a zero draw, weight or total weight.
+     */
+    function trigger2Entitlement(uint256 poolDraw, uint256 vestedWeight, uint256 weight)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (poolDraw == 0 || vestedWeight == 0 || weight == 0) return 0;
+        uint256 share = weight > vestedWeight ? vestedWeight : weight;
+        return (poolDraw * share) / vestedWeight;
+    }
+
+    /**
+     * A claimant's part of the severity balance: its entitlement at the whole
+     * draw less its entitlement at the floor draw, both on the same W, never
+     * negative — so its two parts together are its entitlement at D_total.
+     */
+    function trigger2BalanceEntitlement(uint256 floorDraw, uint256 totalDraw, uint256 vestedWeight, uint256 weight)
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 whole = trigger2Entitlement(totalDraw, vestedWeight, weight);
+        uint256 floor = trigger2Entitlement(floorDraw, vestedWeight, weight);
+        return whole > floor ? whole - floor : 0;
+    }
+
+    /**
+     * The part of one draw the bond paid to one escrow's positions, by class:
+     * each class draw times the escrow's vested weight over W, truncated —
+     * the increment the draw adds to that escrow's P, `drawJ_rem` and
+     * `drawS_rem` (whitepaper §5.4, I36; the model's `trigger2EscrowDraws`).
+     * Over the escrows of a settlement the parts never exceed the draw.
+     */
+    function trigger2EscrowDraws(uint256 drawJunior, uint256 drawSenior, uint256 escrowWeight, uint256 vestedWeight)
+        internal
+        pure
+        returns (uint256 junior, uint256 senior)
+    {
+        if (vestedWeight == 0 || escrowWeight == 0) return (0, 0);
+        uint256 w = escrowWeight > vestedWeight ? vestedWeight : escrowWeight;
+        junior = (drawJunior * w) / vestedWeight;
+        senior = (drawSenior * w) / vestedWeight;
+    }
+
+    /**
+     * The draw on the censorship ground of whitepaper §3.6, in bps of the pool:
+     * D_0 and no more. The escrow is unimpaired, so no severity is measured and
+     * no further draw follows; what an arranged censorship can force is an
+     * advance of the floor against an escrow the bond recovers first under
+     * §5.4 — 16.00 per cent per unit on the modelled book, where the whole
+     * pool on the widened base paid 26.66 (the 2026-09-27 triage, item 25b).
+     */
+    function censorshipDrawBps(uint256 trigger2FloorBps) internal pure returns (uint256) {
+        return trigger2FloorBps > BPS ? BPS : trigger2FloorBps;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The court's bound. Whitepaper §6.2, yellow paper Eq. 4.1′/4.2′      */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * What one determination may move from bond principal (invariant I24′): κ
+     * of the stake the deciding majority forfeits where the verdict is
+     * overturned, `floor(kappa * majorityStake * slash / BPS²)`, where
+     * `majorityStake` is `ceil(n / 2) * s_min`. κ is in bps, not the integer
+     * multiple it replaced: at κ = 6,666 one determination moves two thirds of
+     * the forfeitable stake and a purchased verdict costs one and a half times
+     * what it moves. Truncates, against the claimant and never against the
+     * stake the bound is a fraction of.
+     */
+    function verdictBound(uint256 majorityStake, uint256 slashBps, uint256 coverBps)
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 slash = slashBps > BPS ? BPS : slashBps;
+        return (coverBps * majorityStake * slash) / (BPS * BPS);
+    }
+
+    /**
+     * The floor Equation 4.1′ places on the cost of a purchased verdict, over
+     * every piece of a claim: `ceil(claim * BPS / kappa)`, at least
+     * `ceil(3 * claim / 2)` at the reference κ. Rounds up, against the buyer:
+     * a floor that truncated would price the last unit of a claim at nothing.
+     */
+    function bribeCostFloor(uint256 claim, uint256 coverBps) internal pure returns (uint256) {
+        if (claim == 0 || coverBps == 0) return 0;
+        return (claim * BPS + coverBps - 1) / coverBps;
+    }
+
+    /// How many determinations a claim is heard as: the fewest pieces each inside the bound.
+    function determinationsFor(uint256 claim, uint256 bound) internal pure returns (uint256) {
+        if (claim == 0 || bound == 0) return 0;
+        return (claim + bound - 1) / bound;
+    }
+
+    /*
+     * The value slices of an indivisible finding and the indexed seat
+     * (whitepaper §6.2, §6.4 as revised 2026-09-30: EC-04, PV-01, PV-07).
+     * Each is the model function of the same name.
+     */
+
+    /**
+     * The slices an indivisible finding of `value` is heard in: the fewest
+     * whose parts each lie inside the bound on a first-round panel at the
+     * minimum seat, `determinationsFor(value, verdictBound(4 * seat, slash,
+     * kappa))` (the model's `findingSlices`). Each slice is a case of its own
+     * at the seat; no seat is raised.
+     */
+    function findingSlices(uint256 value, uint256 minSeat, uint256 slashBps, uint256 coverBps)
+        internal
+        pure
+        returns (uint256)
+    {
+        return determinationsFor(value, verdictBound(4 * minSeat, slashBps, coverBps));
+    }
+
+    /// The unit a fraction of a sliced finding's object is carried in (the model's `SLICE_SCALE`).
+    uint256 internal constant SLICE_SCALE = 1e18;
+
+    /**
+     * The fraction slice `index` of `slices` settles, in SLICE_SCALE units
+     * (whitepaper §6.2; the model's `sliceFraction`): `floor(Φ (i + 1) / n) -
+     * floor(Φ i / n)`, so the fractions of a group sum to Φ exactly and each is
+     * the floor or the ceiling of Φ / n. Zero outside `[0, n)`.
+     */
+    function sliceFraction(uint256 groupFraction, uint256 slices, uint256 index) internal pure returns (uint256) {
+        if (slices == 0 || index >= slices) return 0;
+        return (groupFraction * (index + 1)) / slices - (groupFraction * index) / slices;
+    }
+
+    /**
+     * The cumulative trigger-2 draw of a sliced settlement, `floor(S_full * z /
+     * (BPS * SLICE_SCALE))`, the draw numerator z in bps times SLICE_SCALE and
+     * clamped at the whole (the model's `slicedDrawTarget`). z only rises, so
+     * each draw is the target less what is drawn and the settlement carries
+     * one truncation, toward bond principal, whatever the order slices close
+     * in. At z = D * SLICE_SCALE it is `trigger2PoolDraw(S_full, D)`.
+     */
+    function slicedDrawTarget(uint256 fullSettlement, uint256 drawNumerator) internal pure returns (uint256) {
+        uint256 cap = BPS * SLICE_SCALE;
+        uint256 z = drawNumerator < cap ? drawNumerator : cap;
+        return (fullSettlement * z) / cap;
+    }
+
+    /**
+     * The principal a sliced settlement holds for what is still open (the
+     * model's `slicedHeldPrincipal`): the most any later closing can still
+     * draw, `slicedDrawTarget(S, z + φ_open * Δ) - slicedDrawTarget(S, z)`, Δ
+     * being D_0 on the censorship ground and BPS - D_0 on a severity balance.
+     * With nothing settled on a balance it is `trigger2HeldPrincipal`.
+     */
+    function slicedHeldPrincipal(uint256 fullSettlement, uint256 drawNumerator, uint256 openFraction, uint256 reachBps)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (openFraction == 0 || reachBps == 0) return 0;
+        uint256 reach = reachBps > BPS ? BPS : reachBps;
+        return slicedDrawTarget(fullSettlement, drawNumerator + openFraction * reach)
+            - slicedDrawTarget(fullSettlement, drawNumerator);
+    }
+
+    /// First-round slices a pool admits open at once, `floor(S_pool / (7 * s_min))`; zero on a zero seat.
+    function courtCaseCapacity(uint256 poolStake, uint256 minSeat) internal pure returns (uint256) {
+        if (minSeat == 0) return 0;
+        return poolStake / (7 * minSeat);
+    }
+
+    /// The value of a trigger-1 loss finding: the losses asserted, capped at the occurrence limit K (PV-07).
+    function lossFindingValue(uint256 assertedLoss, uint256 occurrenceLimit) internal pure returns (uint256) {
+        return assertedLoss < occurrenceLimit ? assertedLoss : occurrenceLimit;
+    }
+
+    /**
+     * V_max, the largest value one finding can move (PV-07): the greater of the
+     * occurrence limit K and the floor draw D_0 of the capital requirement on
+     * the widest claimant base of the censorship ground,
+     * `max(K, floor(D_0 * censorshipRequirement / BPS))`.
+     */
+    function findingValueMax(uint256 trigger2FloorBps, uint256 occurrenceLimit, uint256 censorshipRequirement)
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 d0 = trigger2FloorBps > BPS ? BPS : trigger2FloorBps;
+        uint256 c = (d0 * censorshipRequirement) / BPS;
+        return c > occurrenceLimit ? c : occurrenceLimit;
+    }
+
+    /**
+     * The minimum juror stake in force (EC-04, PV-07; the model's
+     * `indexedMinimumJurorStakeArk`): the greater of the constructor floor, one
+     * eighth of V_max rounded up, and the seat fixed at the case's opening, so
+     * the bound a case's slices were cut to never loosens under it.
+     */
+    function indexedMinimumJurorStake(uint256 constructorFloor, uint256 vMax, uint256 openedSeat)
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 eighth = (vMax + 7) / 8;
+        uint256 seat = eighth > constructorFloor ? eighth : constructorFloor;
+        return seat > openedSeat ? seat : openedSeat;
+    }
+
+    /**
+     * Whether a book's capital stands below the buffer ramp threshold of
+     * whitepaper §4.2 (EC-05; the model's `bufferBelowRampThreshold`):
+     * `buffer * BPS < threshold * K`. A book requiring no capital never is.
+     */
+    function bufferBelowRampThreshold(uint256 thresholdBps, uint256 bufferUnits, uint256 requiredCapitalUnits)
+        internal
+        pure
+        returns (bool)
+    {
+        return requiredCapitalUnits != 0 && bufferUnits * BPS < thresholdBps * requiredCapitalUnits;
+    }
+
+    /**
+     * The destination split of the operations share (whitepaper §4.2): the
+     * juror-fee fraction sold in the auction for the fee pool of §6.2, and the
+     * rest spent on the origin chain. The auctioned part truncates, so the
+     * remainder stays in the origin asset where the cost it funds is incurred.
+     */
+    function operationsSplit(uint256 operationsBps, uint256 jurorFeeShareBps)
+        internal
+        pure
+        returns (uint256 originBps, uint256 auctionedBps)
+    {
+        uint256 fraction = jurorFeeShareBps > BPS ? BPS : jurorFeeShareBps;
+        auctionedBps = (operationsBps * fraction) / BPS;
+        originBps = operationsBps - auctionedBps;
+    }
+}

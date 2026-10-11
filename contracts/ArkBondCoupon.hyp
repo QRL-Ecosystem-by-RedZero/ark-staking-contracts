@@ -1,0 +1,483 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/security/ReentrancyGuard.hyp";
+
+import "./interfaces/IArkCatBond.hyp";
+import "./interfaces/IArkStakeParams.hyp";
+import "./interfaces/IProceedsLedger.hyp";
+import "./utils/ArkEpoch.hyp";
+import "./utils/ArkStakeMath.hyp";
+import "./utils/QuantumErrors.hyp";
+
+/**
+ * The coupon account of the catastrophe bond.
+ *
+ * See IArkBondCoupon for the rule this contract exists to enforce, and for why it
+ * is not part of `ArkCatBond`.
+ *
+ * A CURSOR AGAINST A DENSE SERIES, NOT A REWARD DEBT
+ * --------------------------------------------------
+ * The coupon has a cliff, so the base an epoch's coupon is divided over is the
+ * shares ELIGIBLE at that epoch's boundary and not the shares outstanding. A
+ * single running per-share index cannot express "from epoch k onward" without
+ * knowing what it stood at when k arrived, and it arrives thirty days after an
+ * issuance nobody will call back to. So the series is cumulative BY EPOCH, a
+ * holding carries the epoch it was last paid for, and a claim is the difference of
+ * two entries — two lookups and no loop, whatever the gap.
+ *
+ * That only works if the series is dense, which is why `distribute` advances one
+ * epoch at a time and refuses to skip. An epoch that delivered nothing records the
+ * previous total and moves on, so a book earning no premium does not block the
+ * epochs after it and leaves no hole for a later subtraction to fall into.
+ *
+ * WHAT "NEVER FAILS" MEANS
+ * -----------------------
+ * Yellow paper §1.4 says coupon distribution never fails, and it is talking about
+ * the shortfall: proceeds below the stated senior rate reduce senior, pay junior
+ * nothing, and are not carried forward. The two reverts in `distribute` are a
+ * re-entry guard and a clock check — neither is a distribution that failed.
+ */
+contract ArkBondCoupon is IArkBondCoupon, ReentrancyGuard {
+    uint256 private constant BPS = 10000;
+
+    /// The per-share scale, as `VeArk` and `StakingVault` carry it.
+    uint256 private constant ACC = 1e18;
+
+    /**
+     * The year the stated senior coupon of whitepaper §6.3 is quoted against, so
+     * one epoch pays its share of it. Only ever read as the ratio
+     * `EPOCH_LENGTH / YEAR`, which a time-compressed build profile scales in both
+     * terms and therefore preserves exactly.
+     */
+    uint256 private constant YEAR = 365 days;
+
+    uint8 private constant JUNIOR = 0;
+    uint8 private constant SENIOR = 1;
+
+    IArkStakeParams public immutable PARAMS;
+    IProceedsLedger public immutable LEDGER;
+    IArkStakeBook public immutable REGISTRY;
+
+    address private immutable _deployer;
+
+    /// The bond whose holdings this account pays. One-shot; see `setBond`.
+    address public bond;
+
+    /// Cumulative QRL per share, by epoch and class, scaled by ACC. Dense; see the header.
+    mapping(uint256 => uint256[2]) private _cum;
+
+    /// Shares eligible at each epoch's boundary: the base that epoch's coupon divides over.
+    mapping(uint256 => uint128[2]) private _base;
+
+    /// Principal behind those shares: what the stated senior rate is a rate on.
+    mapping(uint256 => uint128[2]) private _basePrincipal;
+
+    /**
+     * The stated senior coupon in force when each epoch closed (G8): the rate
+     * the epoch is paid at, fixed when its base is. Read at distribution, at
+     * least two epochs later, a vote in between would have repriced an epoch
+     * whose holders had already carried its risk.
+     */
+    mapping(uint256 => uint16) private _seniorCouponAt;
+
+    /**
+     * The run-off queue's clean-age clock during each epoch, and the decay
+     * and exposure floor in force in it, packed as the bond records them
+     * (phase C3, whitepaper §5.3, I26′): a queued holding is paid each epoch
+     * at the weight its cohort's clean age gave it then.
+     */
+    mapping(uint256 => uint256) private _queueWeights;
+
+    uint64 private _lastDistributed;
+    uint64 private _lastOperating;
+
+    /// Coupon drawn from the ledger and not yet taken by a holding.
+    uint256 public pool;
+
+    /**
+     * What a settlement credited to a holder without sending it.
+     *
+     * A transfer of a holding has to settle the seller before the shares move, and
+     * it must not call out to the seller while doing so. The amount is credited
+     * here and taken by `withdraw`, which is the pull-payment pattern
+     * `ArkBondDelegation.claimRefund` uses for the same reason.
+     */
+    mapping(address => uint256) private _withheld;
+    uint256 private _withheldTotal;
+
+    constructor(address params_, address ledger_, address registry_) {
+        if (params_ == address(0) || ledger_ == address(0) || registry_ == address(0)) revert ZeroAddress();
+        PARAMS = IArkStakeParams(params_);
+        LEDGER = IProceedsLedger(ledger_);
+        REGISTRY = IArkStakeBook(registry_);
+        _deployer = msg.sender;
+        // The deployment epoch is the first one due, as it is the first one the
+        // bond closes (`ArkCatBond`'s `_lastClosed` starts one epoch back too).
+        // Starting at the current epoch would leave proceeds credited for it in
+        // the ledger with no distribution ever able to draw them.
+        uint256 nowEpoch = ArkEpoch.current();
+        _lastDistributed = uint64(nowEpoch == 0 ? 0 : nowEpoch - 1);
+    }
+
+    modifier onlyBond() {
+        if (msg.sender != bond) revert OnlyBond(msg.sender);
+        _;
+    }
+
+    /**
+     * Name the bond whose holdings this account pays. One-shot.
+     *
+     * Not an admin setter, deliberately, and for `ProceedsLedger.setBond`'s reason:
+     * whoever can re-point the account that instructs payment from here can direct
+     * every coupon this product pays. A deployment naming the wrong address is
+     * repaired by redeploying, not by calling again.
+     */
+    function setBond(address bond_) external {
+        if (msg.sender != _deployer) revert OnlyDeployer(msg.sender);
+        if (bond != address(0)) revert AlreadySet(bond);
+        if (bond_ == address(0)) revert ZeroAddress();
+
+        bond = bond_;
+        emit BondSet(bond_);
+    }
+
+    /**
+     * Accept value from the ledger, and from no other account.
+     *
+     * `ProceedsLedger.draw` pays with a raw call, so the ledger is the one sender
+     * that has to be let through. Every wei it sends was delivered for one epoch.
+     * Value from anywhere else would sit in this balance with no epoch's series
+     * accounting for it, and a coupon paid out of it would be a coupon from an
+     * account whitepaper §4.7 does not name — so it is refused.
+     */
+    receive() external payable {
+        if (msg.sender != address(LEDGER)) revert OnlyLedger(msg.sender);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The epoch boundary                                                  */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Fix the base epoch `epoch`'s coupon will be divided over.
+     *
+     * Written when the epoch closes and read when it is distributed, which are a
+     * day apart: whitepaper §3.4 pays the coupon of an epoch to the holder of
+     * record at that epoch's boundary, and the proceeds are only creditable early
+     * in the epoch after it. The divisor therefore cannot be whatever the book
+     * happens to hold when the distribution is called.
+     *
+     * Bond only, because the bond is the only account that knows the book.
+     */
+    function recordBoundary(
+        uint256 epoch,
+        uint128 eligibleJunior,
+        uint128 eligibleSenior,
+        uint128 principalJunior,
+        uint128 principalSenior,
+        uint16 seniorCouponBps,
+        uint256 queueWeights
+    ) external onlyBond {
+        _base[epoch][JUNIOR] = eligibleJunior;
+        _base[epoch][SENIOR] = eligibleSenior;
+        _basePrincipal[epoch][JUNIOR] = principalJunior;
+        _basePrincipal[epoch][SENIOR] = principalSenior;
+        _seniorCouponAt[epoch] = seniorCouponBps;
+        _queueWeights[epoch] = queueWeights;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Distribution. Whitepaper §4.6, §4.7                                 */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Pay the coupon of one epoch to the holders of record at its boundary.
+     *
+     * Permissionless, and one epoch at a time in order, for the reason in the
+     * header. SENIOR IS PAID ITS STATED RATE AND JUNIOR TAKES THE REMAINDER, on
+     * the principal each class actually holds — whitepaper §4.6 read as money
+     * rather than as rates.
+     *
+     * The difference is load-bearing. Yellow paper §3.4 writes the junior rate as
+     * `(couponRate - c_S(1 - w)) / w`, which assumes the pool is divided exactly
+     * in the thickness `w`; in this implementation the thickness binds only from
+     * below, so a junior class may be thicker than `w`. Applying that rate to it
+     * would draw more than the premium share delivered, which is exactly what
+     * invariant I19 forbids. Taken as a subtraction, I19 holds by construction and
+     * no composition of the book can break it.
+     */
+    function distribute(uint256 epoch) external nonReentrant {
+        if (epoch != uint256(_lastDistributed) + 1) revert EpochAlreadyDistributed(epoch);
+        uint256 payableAt = ArkEpoch.settlementCloses(epoch);
+        if (block.timestamp < payableAt) revert NotYetPayable(epoch, payableAt);
+
+        // The base this epoch divides over is written by the bond when the epoch
+        // closes, and nothing guarantees anybody has asked it to yet. Read before
+        // then, the base would be zero and the whole coupon would be carried
+        // forward as though nobody had held. Closing is permissionless and
+        // idempotent, so asking costs nothing when it has already happened.
+        IArkCatBondClock(bond).closeEpoch();
+        // The commitment bonds forfeited against this epoch's offering are part
+        // of its proceeds (whitepaper §4.7, I33); they are determined at the
+        // instant its window closed, so they are pulled in before the balance
+        // is read rather than left to whoever calls the swap first.
+        LEDGER.collectForfeits(epoch);
+
+        // Carry the running totals forward whatever happens, so the series stays
+        // dense and an undelivered epoch reads as a zero rather than as a hole.
+        _cum[epoch][JUNIOR] = _cum[epoch - 1][JUNIOR];
+        _cum[epoch][SENIOR] = _cum[epoch - 1][SENIOR];
+        _lastDistributed = uint64(epoch);
+
+        uint256 available = LEDGER.remainingIn(epoch);
+        if (available == 0) {
+            emit CouponDistributed(epoch, 0, 0, 0, false);
+            return;
+        }
+
+        (uint256 paidJ, uint256 paidS, bool shortfall) = _divide(epoch, available);
+        uint256 drawn = paidJ + paidS;
+
+        if (drawn != 0) {
+            LEDGER.draw(epoch, address(this), drawn);
+            pool += drawn;
+        }
+
+        // What the two index divisions truncated away — or a class's whole share
+        // where its base is empty — is the residue of whitepaper §4.6, and it is
+        // distributed with the following epoch. The ledger carries it, so this
+        // contract never holds an undistributed wei of a coupon and needs no dust
+        // term of its own. Carried however late this distribution runs: `epoch
+        // + 1` is by construction the next epoch this contract will distribute,
+        // so the residue always lands ahead of the index it joins (R26).
+        if (drawn < available) LEDGER.carryResidue(epoch);
+
+        // Whitepaper §5.3 suspends the conditional release until "the book has
+        // closed an epoch in its operating range" and states no arithmetic for it.
+        // The definition adopted here, and recorded as R27: an epoch whose coupon
+        // was paid without a shortfall, priced outside the circuit breaker.
+        //
+        // The breaker is read through a try (audit 2026-09-27, D5): it reads the
+        // valuation oracle, and a dead oracle reverting HERE stopped every
+        // distribution, after which `_requireCouponCurrent` refused every exit
+        // from the bond. Unreadable counts as not operating — an epoch nobody
+        // could price is not evidence the book was in its range — and the
+        // coupon itself, which needs no price, is distributed regardless.
+        if (!shortfall && drawn != 0 && !_breakerOrUnknown()) _lastOperating = uint64(epoch);
+
+        emit CouponDistributed(epoch, _poolCouponBps(epoch, available), paidJ, paidS, shortfall);
+    }
+
+    /// The shortfall carry outstanding (I34), as the bond reads it through this account.
+    function shortfallCarry() external view returns (uint256) {
+        return LEDGER.shortfallCarry();
+    }
+
+    /// The stated senior coupon fixed when `epoch` closed (G8).
+    function seniorCouponAt(uint256 epoch) external view returns (uint16) {
+        return _seniorCouponAt[epoch];
+    }
+
+    /// The circuit breaker, with an unreadable oracle counted as holding it. See `distribute`.
+    function _breakerOrUnknown() private view returns (bool) {
+        try REGISTRY.breakerActive() returns (bool active) {
+            return active;
+        } catch {
+            return true;
+        }
+    }
+
+    /// Divide one epoch's proceeds between the classes and credit both series.
+    function _divide(uint256 epoch, uint256 available)
+        private
+        returns (uint256 paidJ, uint256 paidS, bool shortfall)
+    {
+        // The rate in force when the epoch closed, never when it is paid (G8).
+        uint16 cS = _seniorCouponAt[epoch];
+
+        // The stated senior coupon is an annual rate, so one epoch pays its share
+        // of a year. Truncates, and the residual stays in the pot, which means it
+        // reaches junior in this same epoch.
+        uint256 seniorDue = (uint256(_basePrincipal[epoch][SENIOR]) * uint256(cS) * uint256(ArkEpoch.EPOCH_LENGTH))
+            / (BPS * YEAR);
+
+        shortfall = seniorDue > available;
+        uint256 seniorMoney = shortfall ? available : seniorDue;
+
+        paidS = _credit(epoch, SENIOR, seniorMoney);
+        // Where the premium cannot meet the stated senior rate, senior is reduced
+        // to what the premium pays and junior earns nothing for that epoch
+        // (whitepaper §4.6). A shortfall is never carried forward and never drawn
+        // from principal.
+        paidJ = shortfall ? 0 : _credit(epoch, JUNIOR, available - seniorMoney);
+    }
+
+    /**
+     * Credit one class's share of an epoch to its series.
+     *
+     * The step truncates, and the draw is what that step can reach a holding
+     * with, ROUNDED UP. A holding claiming k epochs at once is paid
+     * `floor(s * Σstep)`, which can exceed the sum of the per-epoch floors by up
+     * to k - 1 wei; a pool funded by the floors would underflow for the last
+     * claimant, and every path that settles that holding — its redemption
+     * included — would revert. The ceiling is never more than `money`, since
+     * `step * shares_ <= money * ACC`, so I19 is untouched; what is not drawn
+     * stays in the ledger for the epoch after.
+     */
+    function _credit(uint256 epoch, uint8 c, uint256 money) private returns (uint256 paid) {
+        uint256 shares_ = uint256(_base[epoch][c]);
+        if (money == 0 || shares_ == 0) return 0;
+        uint256 step = (money * ACC) / shares_;
+        if (step == 0) return 0;
+        paid = (step * shares_ + ACC - 1) / ACC;
+        _cum[epoch][c] += step;
+    }
+
+    /// The pool coupon of an epoch, in bps of the eligible principal it was paid on.
+    function _poolCouponBps(uint256 epoch, uint256 available) private view returns (uint256) {
+        uint256 base = uint256(_basePrincipal[epoch][JUNIOR]) + uint256(_basePrincipal[epoch][SENIOR]);
+        return base == 0 ? 0 : (available * BPS) / base;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Payment                                                             */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Pay a holding what the epochs after `fromEpoch` owe it, and report the epoch
+     * it has now been paid up to.
+     *
+     * `send` is false where the caller must not move value — a transfer settling
+     * its seller — and the amount is then withheld for `withdraw`. Bond only: this
+     * contract holds no holdings and cannot check who owns what.
+     */
+    function payTo(uint8 class_, uint256 fromEpoch, uint256 shares, address to, bool send, uint256 queuedAfter, uint256 clock)
+        external
+        onlyBond
+        nonReentrant
+        returns (uint256 amount, uint64 through)
+    {
+        // The cursor never moves back. A holding inside its cliff carries a
+        // `fromEpoch` ahead of the last distribution; reporting that
+        // distribution as `through` would rewind it to epochs whose base it was
+        // never in.
+        through = _lastDistributed;
+        if (uint256(through) <= fromEpoch) return (0, uint64(fromEpoch));
+        amount = _owed(class_, fromEpoch, uint256(through), shares, queuedAfter, clock);
+        // Never more than the pool, and never a cursor moved past a coupon not
+        // paid (OC-ECON-08): the draws round up (`_credit`), so the pool covers
+        // what is owed, and where it did not the shortfall used to fall
+        // silently on the last claimant while this one's cursor advanced. The
+        // holding is paid nothing and keeps its cursor; nothing is lost.
+        if (amount > pool) return (0, uint64(fromEpoch));
+        if (amount == 0) return (0, through);
+
+        pool -= amount;
+        emit CouponPaid(to, class_, fromEpoch, uint256(through), amount);
+
+        if (!send) {
+            _withheld[to] += amount;
+            _withheldTotal += amount;
+            return (amount, through);
+        }
+
+        (bool ok,) = to.call{value: amount}("");
+        if (!ok) revert TransferFailed(to, amount);
+    }
+
+    /// @inheritdoc IArkBondCoupon
+    function payThrough(
+        uint8 class_,
+        uint256 fromEpoch,
+        uint256 throughEpoch,
+        uint256 shares,
+        address to,
+        uint256 queuedAfter,
+        uint256 clock
+    ) external onlyBond nonReentrant returns (uint256 amount, uint64 reached) {
+        uint256 last = uint256(_lastDistributed);
+        uint256 upTo = last < throughEpoch ? last : throughEpoch;
+        if (upTo <= fromEpoch) return (0, uint64(fromEpoch));
+        reached = uint64(upTo);
+        // Truncates, toward the pool, as `owed` does.
+        amount = _owed(class_, fromEpoch, upTo, shares, queuedAfter, clock);
+        // As in `payTo` (OC-ECON-08): not paid, not advanced.
+        if (amount > pool) return (0, uint64(fromEpoch));
+        if (amount == 0) return (0, reached);
+
+        pool -= amount;
+        emit CouponPaid(to, class_, fromEpoch, upTo, amount);
+        (bool ok,) = to.call{value: amount}("");
+        if (!ok) revert TransferFailed(to, amount);
+    }
+
+    /// Take what a settlement credited without sending.
+    function withdraw() external nonReentrant returns (uint256 amount) {
+        amount = _withheld[msg.sender];
+        if (amount == 0) revert NothingDue();
+        _withheld[msg.sender] = 0;
+        _withheldTotal -= amount;
+
+        (bool ok,) = msg.sender.call{value: amount}("");
+        if (!ok) revert TransferFailed(msg.sender, amount);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Views                                                               */
+    /* ------------------------------------------------------------------ */
+
+    /// @inheritdoc IArkBondCoupon
+    function owed(uint8 class_, uint256 fromEpoch, uint256 shares) public view returns (uint256) {
+        return _owed(class_, fromEpoch, uint256(_lastDistributed), shares, 0, 0);
+    }
+
+    /**
+     * What `shares` of `class_` earned in the epochs after `fromEpoch` through
+     * `to`: at face through `queuedAfter` (every epoch where it is zero), and
+     * for each later epoch at the exposure weight its cohort's clean age gave
+     * it in that epoch (whitepaper §5.3, I26′: the coupon at the weight of the
+     * draw), which the base of that epoch counted it at. One lookup per queued
+     * epoch — the one place the series is walked, and only over a holding's
+     * own time in the queue. Each term truncates, toward the pool.
+     */
+    function _owed(uint8 class_, uint256 fromEpoch, uint256 to, uint256 shares, uint256 queuedAfter, uint256 clock)
+        private
+        view
+        returns (uint256 amount)
+    {
+        if (shares == 0 || to <= fromEpoch) return 0;
+        uint256 split = to;
+        if (queuedAfter != 0 && queuedAfter < to) split = queuedAfter > fromEpoch ? queuedAfter : fromEpoch;
+        amount = (shares * (_cum[split][class_] - _cum[fromEpoch][class_])) / ACC;
+        for (uint256 e = split + 1; e <= to; e++) {
+            uint256 w = _queueWeights[e];
+            uint256 x = ArkStakeMath.queueExposureBps(uint256(uint16(w >> 16)), uint256(uint16(w)), (w >> 32) - clock);
+            amount += (shares * (_cum[e][class_] - _cum[e - 1][class_]) * x) / (ACC * BPS);
+        }
+    }
+
+    /// @inheritdoc IArkBondCoupon
+    function lastDistributed() external view returns (uint64) {
+        return _lastDistributed;
+    }
+
+    /// @inheritdoc IArkBondCoupon
+    function lastOperatingEpoch() external view returns (uint64) {
+        return _lastOperating;
+    }
+
+    function withheldOf(address account) external view returns (uint256) {
+        return _withheld[account];
+    }
+
+    /// Cumulative QRL per share at an epoch, for a reader reproducing a claim.
+    function cumulativeAt(uint256 epoch, uint8 class_) external view returns (uint256) {
+        return _cum[epoch][class_];
+    }
+
+    /// The base an epoch's coupon was divided over: eligible shares, and their principal.
+    function baseAt(uint256 epoch) external view returns (uint128 shares, uint128 principal, uint8) {
+        return (_base[epoch][JUNIOR] + _base[epoch][SENIOR], _basePrincipal[epoch][JUNIOR] + _basePrincipal[epoch][SENIOR], 0);
+    }
+}

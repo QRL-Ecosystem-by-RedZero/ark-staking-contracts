@@ -1,0 +1,1431 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./interfaces/IArkStakeRegistry.hyp";
+import "./interfaces/IArkStakeExternal.hyp";
+import "./lib/EvmWords.hyp";
+import "./utils/ArkStakeMath.hyp";
+import "./utils/ArkStakeLeaves.hyp";
+import "./utils/ArkEpoch.hyp";
+import "./utils/QuantumErrors.hyp";
+
+/**
+ * The QRL-side record of every anchored position, and the price of cover the
+ * book of them produces.
+ *
+ * The one rule this contract exists to enforce: **the QRL address entitled to
+ * release a position is part of that position's identifier**, so there is no
+ * field an adversary holding recovered origin-chain keys could change. See
+ * IArkStakeRegistry.
+ *
+ * WHY THE PRICE IS COMPUTED HERE AND NOT VOTED
+ * --------------------------------------------
+ * The premium share is the target share, raised with the scarcity of capital
+ * and scaled by the fraction of the book's capital requirement the outstanding
+ * bond actually supplies (whitepaper §4.4). Every input moves without any
+ * parameter changing — the requirement with the measured concentration of the
+ * book, the supply with issuance, the reference price and the conversion
+ * haircut, the ceiling with the run-off gate — so a value fixed at a vote would
+ * be correct at the moment it passed and wrong afterwards. The coupon bound of
+ * §4.5 is evaluated the same way: where the premium is computed, on the book in
+ * front of it, and never at the vote.
+ *
+ * UTILISATION ABOVE ONE IS PRICED, NOT REFUSED
+ * --------------------------------------------
+ * An anchor that carries the book past complete cover is admitted. Whitepaper
+ * §4.3 makes utilisation above one an operating regime rather than a refusal:
+ * the scarcity slope prices the shortage, so cover already sold is diluted at a
+ * price rather than defended by turning an anchor away.
+ *
+ * NOTHING THE ESCROW HAS TAKEN IS REFUSED HERE
+ * --------------------------------------------
+ * A proven anchor is a deposit the one-way escrow already holds, and it can
+ * leave only through a release, which needs this record. So neither a
+ * de-listing nor the admission cap per correlation group refuses one: both
+ * control the inflow, which the escrow stops on a de-listing leaf, and a
+ * deposit that reached the escrow first is recorded, counted in the book —
+ * it is real exposure, so counting it is the conservative side for capital —
+ * and flagged by `AnchoredOutsideControls`. Only an asset never admitted is
+ * refused, because it has no correlation group to be measured in.
+ *
+ * THE CONCENTRATION WINDOW IS A RING OF EPOCH HIGH-WATER MARKS
+ * -----------------------------------------------------------
+ * `pml` is a running maximum over a trailing window, not a spot reading, and
+ * the difference is a defence rather than a refinement. An adversary expecting
+ * an asset to fail would otherwise anchor into the others, dilute the failing
+ * asset's share for one epoch, lower the capital the book is held to require
+ * and so enlarge the haircut factor collected on the claim — with the diluting
+ * capital returned in full afterwards. Whitepaper §4.3.
+ *
+ * The window is held in one word as thirteen sixteen-bit lanes, lane zero being
+ * the epoch in progress. It is a ring rather than an array because the read
+ * happens on the anchoring path, where thirteen cold storage reads would be
+ * paid by every depositor for a quantity that changes at most once per epoch.
+ *
+ * Each lane is the largest share ANY group held in its epoch, not the share of
+ * the group that happened to move: an anchor into one group lowers the others,
+ * and a release anywhere raises every group left (whitepaper §3.3, §4.3). So
+ * every change to the book — an anchor or a release — re-measures all listed
+ * groups, and an epoch in which nothing changed carries the share the book
+ * stood at, rather than reading as an epoch of no concentration at all.
+ */
+contract ArkStakeRegistry is IArkStakeRegistry {
+    /// The domain tag that separates this product's leaves from every other product's.
+    bytes32 public constant STAKE_DOMAIN = keccak256("ARK_STAKE_V1");
+
+    /**
+     * The allocation leaf's own tag, `ArkStakeLeaves.ALLOCATION_DOMAIN`. V3
+     * since 2026-09-28: the leaf carries the levy, the target rung, the cover,
+     * the reserve's cap factor and the commitment term (gap item 19).
+     */
+    bytes32 public constant ALLOCATION_DOMAIN = ArkStakeLeaves.ALLOCATION_DOMAIN;
+
+    /// The forward-path leaf recording that the origin chain paid a release out.
+    bytes32 public constant RELEASED_DOMAIN = ArkStakeLeaves.RELEASED_DOMAIN;
+
+    /// The forward-path leaf carrying an escrow's buffer to QRL. See `recordBuffer`.
+    bytes32 public constant BUFFER_DOMAIN = ArkStakeLeaves.BUFFER_DOMAIN;
+
+    /// Cover vests linearly over this window from anchoring. Whitepaper §5.3.
+    uint64 public constant VESTING_WINDOW = 90 days;
+
+    /**
+     * Twice the unbonding period, in epochs. Whitepaper §6.4. A constant,
+     * because a window a vote could lengthen could hold principal unreleasable
+     * indefinitely, and one it could shorten would let congestion satisfy the
+     * censorship ground of §3.6. The court reads the window through
+     * `censorshipNotionalMax`. Private since 2026-10-05: its getter had no
+     * reader and the v3 room paid for the silence rule of `premiumShareBps`.
+     */
+    uint256 private constant CENSORSHIP_WINDOW_EPOCHS = 6;
+
+    /**
+     * Epochs after the censorship ground's draw a claimant is held in the
+     * book while no recovery of its escrow has been applied (OC-LEGA-01): long
+     * enough for the court's recovery finding, short enough that a recovery
+     * nobody brings cannot hold a position for good.
+     */
+    // 24, as the relayer withholds the claimant's sealed release leaves
+    // (RECOVERY_HOLD_EPOCHS): one lapse on both legs, so QRL never marks a
+    // position in transit whose release the relayer still holds.
+    uint256 private constant CLAIMANT_HOLD_EPOCHS = 24;
+
+    /// The least gas a failed premium mark may leave behind (OC-LEGB-11): 63 times it covers a mark.
+    uint256 private constant MARK_GAS_FLOOR = 8000;
+
+    /**
+     * Epochs of trailing window over which the concentration maximum is taken.
+     *
+     * Thirteen, being ninety days at the seven-day epoch of `ArkEpoch`, so the
+     * window matches the vesting window a diluting anchor would itself be
+     * subject to. The two defences expire together rather than leaving a gap
+     * between them.
+     */
+    uint256 public constant CONCENTRATION_EPOCHS = 13;
+
+    /**
+     * The most correlation groups admission may list. Every change to the book
+     * re-measures each listed group, so the list is bounded where it grows —
+     * at admission, a governance act — rather than left to price an anchor or
+     * a release out of a block. Sixteen is more than three times the five
+     * groups the reference cap needs before it can bind.
+     */
+    uint256 public constant MAX_CORRELATION_GROUPS = 16;
+
+    /// Consecutive failing epochs after which an asset closes to new anchoring. Whitepaper §3.2. Private since 2026-10-05 (no reader).
+    uint8 private constant YIELD_FAILURE_EPOCHS = 4;
+
+    // BREAKER_BPS left with the breaker for the oracle (ArkReferenceOracle.BREAKER_BPS); its getter here was unread (2026-10-05).
+
+    /// From a release instruction to the earliest settlement. The shared clock's constant.
+    uint64 public constant UNBONDING_PERIOD = ArkEpoch.UNBONDING_PERIOD;
+
+    uint256 private constant BPS = 10000;
+
+    /// The seeding value of the buffer share while the ramp runs, 1,000 bps (whitepaper §4.2; ArkStakeParams.SEED_BUFFER_BPS).
+    uint256 private constant SEED_BUFFER_BPS = 1000;
+
+    /// Storage, not immutable, since 2026-09-27: see `IGovernanceHandover` (whitepaper §6.3).
+    address public governance;
+    address public pendingGovernance;
+    address private immutable _deployer;
+
+    IAttestationVerifier public attestation;
+    IQDayOracle public qday;
+    IReferencePriceOracle public priceOracle;
+    IArkCatBondView public bond;
+
+    /// The governable parameter set, and the threat stage. Fixed at construction.
+    IArkStakeParams public immutable PARAMS;
+
+    mapping(bytes32 => AssetProfile) private _assets;
+    mapping(bytes32 => Anchor) private _anchors;
+    mapping(bytes32 => bool) private _spent;
+
+    /// Anchored notional across the whole book, in the origin asset. Transit is outside it.
+    uint256 public totalAnchored;
+
+    /// Notional between a release instruction and its settlement. Whitepaper §3.3.
+    uint256 public totalInTransit;
+
+    mapping(bytes32 => uint256) private _groupAnchored;
+
+    /// Correlation groups currently holding notional. See `_admitToBook`.
+    uint256 public activeGroups;
+
+    /// Every group any admission has named, in order of first admission. Never shrinks. See the header.
+    bytes32[] private _groups;
+    mapping(bytes32 => bool) private _groupListed;
+
+    /// Thirteen 16-bit lanes; lane 0 is `_windowEpoch`. See the header.
+    uint256 private _shareWindow;
+    uint256 private _windowEpoch;
+
+    /// The largest group share of the book as it stands, written at every change to it.
+    uint16 private _spotShareBps;
+
+    /// The widest exit bound any admitted asset published. A high-water mark.
+    uint16 private _maxAssetExitBps;
+
+    /// The last premium share priced outside the breaker, and the epoch it was priced in.
+    uint64 private _markEpoch;
+    uint16 private _markBps;
+
+    /**
+     * buffer_orig: the origin-asset buffer of every escrow, as last proven on
+     * the forward path, summed across assets as `totalAnchored` sums their
+     * notional (the book is priced as one origin-asset book at the oracle's
+     * book-wide key). Whitepaper §4.3. See `recordBuffer`.
+     */
+    uint256 public bufferOrig;
+
+    /**
+     * Per escrow, at `keccak256(abi.encode(assetKey, escrow))`: the buffer last
+     * recorded and one more than the epoch it was proven in. Per asset key:
+     * the sum over its escrows and one more than the latest epoch (OC-LEGB-08).
+     */
+    mapping(bytes32 => uint256) private _bufferUnits;
+    mapping(bytes32 => uint256) private _bufferEpochPlusOne;
+
+    /**
+     * What the settlement price under the breaker reads (whitepaper §5.5,
+     * yellow paper §4.2; phase C3b): `carried`, the thirty-day average as the
+     * last mark taken outside the breaker read it, and the epoch that mark was
+     * taken in; and one more than the epoch a mark first found the breaker
+     * active (zero: not since the last mark outside it). Written by
+     * `_markPremium`, which every change to the book and `markPremium` run.
+     */
+    uint256 private _carried;
+    uint64 private _carriedEpoch;
+    uint64 private _firedPlusOne;
+
+    /**
+     * The boundary readings of the settlement series (whitepaper §4.6, §5.2;
+     * yellow paper §1.4; EC-01, PV-03 of 2026-09-30): `_readings[e]` is the
+     * reference price the first touch of epoch `e` read — the close of epoch
+     * `e - 1`, which any account may send (`markPremium`) and every change to
+     * the book makes — zero where that touch found the breaker active or the
+     * series silent. `_readEpoch` is the last epoch whose boundary was
+     * touched, so each boundary is read once, at its first touch, and never
+     * rewritten by a later caller's moment.
+     */
+    mapping(uint256 => uint256) private _readings;
+    uint64 private _readEpoch;
+
+    /**
+     * The highest anchored notional each epoch saw, before a release and
+     * after an anchor (whitepaper §6.2; PV-07 of 2026-09-30): the book stands
+     * between two changes where the last one left it, so the largest anchored
+     * notional over the censorship window is the greatest of these lanes
+     * inside it and the book now (`censorshipNotionalMax`), N_A + N_T,max.
+     */
+    mapping(uint256 => uint256) private _notionalHigh;
+
+    /// Seed-return requests per escrow, keyed as `assetKey` keys an asset (re-audit 2026-09-30, ORIGIN-01).
+    mapping(bytes32 => uint256) private _seedReturns;
+
+    /// `deployer_` holds the one-shot wiring calls. It is an argument, not
+    /// `msg.sender`, for the same reason as ArkCatBond's: on the QRVM line the
+    /// registry exceeds the direct-deploy limit and is created by
+    /// ChunkedDeployer, which would otherwise own the wiring for ever.
+    constructor(address governance_, address params_, address deployer_) {
+        if (governance_ == address(0) || params_ == address(0) || deployer_ == address(0)) revert ZeroAddress();
+        governance = governance_;
+        PARAMS = IArkStakeParams(params_);
+        _deployer = deployer_;
+
+        _windowEpoch = ArkEpoch.current();
+        _carriedEpoch = uint64(_windowEpoch);
+    }
+
+    modifier onlyGovernance() {
+        if (msg.sender != governance) revert OnlyGovernance(msg.sender);
+        _;
+    }
+
+    /// @inheritdoc IGovernanceHandover
+    function proposeGovernance(address next) external onlyGovernance {
+        pendingGovernance = next;
+        emit GovernanceProposed(governance, next);
+    }
+
+    /// @inheritdoc IGovernanceHandover
+    function acceptGovernance() external {
+        address next = pendingGovernance;
+        if (msg.sender != next) revert NotPendingGovernance(msg.sender);
+        emit GovernanceTransferred(governance, next);
+        governance = next;
+        pendingGovernance = address(0);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Wiring                                                              */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Name the four contracts this one reads. One-shot, all together.
+     *
+     * Not an admin setter. A registry whose attestation verifier or Q-Day
+     * oracle can be re-pointed is a registry whose anchor records and release
+     * closure are held by whoever holds that key, which is the authority the
+     * escrow was built to have nowhere. The cost is that a deployment naming a
+     * wrong address has to be redeployed; treat the call as irreversible.
+     */
+    function setDependencies(address attestation_, address qday_, address priceOracle_, address bond_)
+        external
+    {
+        if (msg.sender != _deployer) revert OnlyDeployer(msg.sender);
+        if (address(attestation) != address(0)) revert AlreadySet(address(attestation));
+        if (attestation_ == address(0) || qday_ == address(0)) revert ZeroAddress();
+        if (priceOracle_ == address(0) || bond_ == address(0)) revert ZeroAddress();
+
+        attestation = IAttestationVerifier(attestation_);
+        qday = IQDayOracle(qday_);
+        priceOracle = IReferencePriceOracle(priceOracle_);
+        bond = IArkCatBondView(bond_);
+    }
+
+    /// The target share in force: the threat ladder at its current stage. Whitepaper §4.4.
+    function sigmaTargetBps() public view returns (uint256) {
+        return PARAMS.sigmaTargetBps();
+    }
+
+    /**
+     * The fields of the parameter set this contract reads, in force now
+     * (2026-09-30): the narrow view, never `params()`, whose decoder of every
+     * field cost more than this contract's v3 room and grew with each field
+     * the set gained.
+     */
+    function _p() private view returns (IArkStakeParams.RegistryParams memory) {
+        return PARAMS.registryParams();
+    }
+
+    /// @inheritdoc IArkStakeAdmissions
+    function maxAssetExitBps() external view returns (uint16) {
+        return _maxAssetExitBps;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Asset admission and review                                          */
+    /* ------------------------------------------------------------------ */
+
+    /// The key an asset is recorded under. Carries the chain id; see `stakeAssetId`.
+    function assetKey(uint256 chainId, address asset) public pure returns (bytes32) {
+        return keccak256(abi.encodePacked(EvmWords.word(chainId), EvmWords.evmWord(asset)));
+    }
+
+    /**
+     * Admit an asset, recording what the audit of whitepaper §3.2 established.
+     *
+     * The audit refuses an asset whose implementation an externally owned
+     * account or multisig can replace, whose upgrade timelock is shorter than
+     * the unbonding period, whose supply or transfers an outside authority
+     * controls, or whose exit has no published bound; this function records
+     * what the audit established and does not re-derive it. Two of the
+     * findings are conditions the arithmetic can check, and both refuse here:
+     * `transferVerified` false means the escrow has no transfer path it can
+     * call, and the yield condition below.
+     *
+     * The yield condition is re-evaluated every epoch by `reviewAsset`, not
+     * evaluated once: an asset failing it for four consecutive epochs closes
+     * to new anchoring.
+     */
+    function admitAsset(AssetInput calldata a) external onlyGovernance {
+        if (a.asset == address(0)) revert ZeroAddress();
+        if (a.correlationGroup == bytes32(0)) revert ZeroValue();
+        if (!a.transferVerified) revert TransferNotVerified(a.asset);
+        uint16 releaseBound = _p().releaseBoundBps;
+        if (a.exitBoundBps > releaseBound) {
+            revert ReleaseBoundBelowAssetExit(releaseBound, a.exitBoundBps);
+        }
+
+        bytes32 key = assetKey(a.chainId, a.asset);
+        if (_assets[key].admitted) revert AssetAlreadyAdmitted(key);
+
+        if (!_groupListed[a.correlationGroup]) {
+            if (_groups.length >= MAX_CORRELATION_GROUPS) revert TooManyCorrelationGroups(MAX_CORRELATION_GROUPS);
+            _groupListed[a.correlationGroup] = true;
+            _groups.push(a.correlationGroup);
+        }
+
+        uint256 attachment = effectiveAttachmentBps();
+        if (!_clearsYieldFloor(a.yieldBps, attachment)) {
+            revert YieldBelowAdmissionFloor(key, a.yieldBps, _admissionYieldFloorBps(attachment));
+        }
+
+        _assets[key] = AssetProfile({
+            admitted: true,
+            transferVerified: true,
+            rebasing: a.rebasing,
+            permissionlessYieldPath: a.permissionlessYieldPath,
+            upgradeAuthority: a.upgradeAuthority,
+            correlationGroup: a.correlationGroup,
+            exitBoundBps: a.exitBoundBps,
+            yieldFloorBps: a.yieldBps,
+            asset: a.asset,
+            chainId: a.chainId,
+            failingEpochs: 0,
+            lastReviewEpoch: 0
+        });
+        if (a.exitBoundBps > _maxAssetExitBps) _maxAssetExitBps = a.exitBoundBps;
+
+        emit AssetAdmitted(
+            key, a.asset, a.chainId, a.correlationGroup, a.yieldBps, uint16(_admissionYieldFloorBps(attachment))
+        );
+    }
+
+    /**
+     * The condition of whitepaper §3.2 and §4.5, cross-multiplied.
+     *
+     * `sigma_t * y_A / att_eff >= Delta_min` and `y_A * sigma_t >= Delta_min *
+     * att_eff` admit exactly the same assets; the second introduces no
+     * rounding, so there is no rounding direction here to justify or to get
+     * backwards. The coupon compared is the one at exact cover, which is where
+     * the whitepaper reads it in all three places it is applied.
+     */
+    function _clearsYieldFloor(uint256 yieldBps, uint256 attachment) private view returns (bool) {
+        return yieldBps * sigmaTargetBps() >= uint256(_p().tailPremiumFloorBps) * attachment;
+    }
+
+    /**
+     * The least origin yield the condition admits: `ceil(Delta_min * att_eff /
+     * sigma_t)`. Rounds up, because the condition is `>=` and the least integer
+     * satisfying it is the ceiling of the quotient.
+     */
+    function _admissionYieldFloorBps(uint256 attachment) private view returns (uint256) {
+        uint256 sigma = sigmaTargetBps();
+        return (uint256(_p().tailPremiumFloorBps) * attachment + sigma - 1) / sigma;
+    }
+
+    /**
+     * @notice The yield an asset must reach to be admitted, or to pass a review, now.
+     *
+     * 1.09 per cent at the fourth stage on a book at the loss floor, the figure
+     * whitepaper §4.5 signs. It moves with the stage and with the measured
+     * concentration, because both move the coupon an asset would fund.
+     */
+    function admissionYieldFloorBps() external view returns (uint256) {
+        return _admissionYieldFloorBps(effectiveAttachmentBps());
+    }
+
+    /// @notice The coupon an asset of this yield pays at exact cover. Whitepaper §4.5.
+    function couponAtExactCoverBps(uint256 grossYieldBps) external view returns (uint256) {
+        return ArkStakeMath.maxCouponRateBps(sigmaTargetBps(), effectiveAttachmentBps(), grossYieldBps);
+    }
+
+    /**
+     * Re-evaluate the yield condition for an asset, once per epoch.
+     * Whitepaper §3.2.
+     *
+     * Permissionless, because the verdict is a function of the epoch alone and
+     * of nothing the caller supplies or chooses (audit 2026-09-22, G9): the
+     * condition is taken as it stood at the opening of the epoch — the yield
+     * the oracle reports over the trailing window closed at the last epoch
+     * boundary, which stands for the whole epoch (whitepaper §2's assumption
+     * on the oracle), the stage and the parameters in force for the epoch,
+     * which move only at a boundary, and the concentration of the epochs that
+     * have closed (`_maxShareBps(true)`), never the epoch in progress, whose
+     * lane only rises as the book changes. Read on the book as it stands, the
+     * first caller of each epoch chose the moment and so the verdict: an
+     * anchor into one group raised the attachment, and with it the floor, for
+     * as long as the caller waited. A run counts only consecutive reviewed
+     * epochs, so an unreviewed epoch starts it again rather than being assumed
+     * failed — de-listing is the consequential direction, and it is taken on
+     * evidence.
+     *
+     * An asset failing for four consecutive epochs is closed to new anchoring.
+     * Its positions are not touched: de-listing releases, it does not
+     * confiscate. The whitepaper has them enter the release queue; a release
+     * needs a destination only the bound beneficiary can name, so here each
+     * beneficiary instructs its own, and nothing prevents it.
+     */
+    function reviewAsset(bytes32 key) external {
+        AssetProfile storage a = _assets[key];
+        if (!a.admitted) revert AssetNotAdmitted(key);
+
+        uint256 epoch = ArkEpoch.current();
+        if (a.lastReviewEpoch == epoch) revert AlreadyReviewed(key, epoch);
+
+        uint256 yieldBps = priceOracle.realisedYieldBps(a.chainId, a.asset);
+        uint256 attachment;
+        {
+            // The attachment at the epoch's opening: `effectiveAttachmentBps`
+            // on the closed epochs' concentration. Both round as it does.
+            IArkStakeParams.RegistryParams memory p = _p();
+            uint256 pml = ArkStakeMath.pmlBps(p.pmlFloorBps, _maxShareBps(true));
+            attachment = ArkStakeMath.effectiveAttachmentBps(
+                ArkStakeMath.effectiveIndemnityBps(sigmaTargetBps(), p.indemnityBps, pml), pml
+            );
+        }
+
+        if (_clearsYieldFloor(yieldBps, attachment)) {
+            a.failingEpochs = 0;
+        } else {
+            bool consecutive = a.failingEpochs != 0 && a.lastReviewEpoch + 1 == epoch;
+            a.failingEpochs = consecutive ? a.failingEpochs + 1 : 1;
+        }
+        a.lastReviewEpoch = uint64(epoch);
+
+        emit AssetReviewed(key, epoch, yieldBps, _admissionYieldFloorBps(attachment), a.failingEpochs);
+
+        if (a.failingEpochs >= YIELD_FAILURE_EPOCHS) {
+            a.admitted = false;
+            emit AssetDelisted(key, DelistReason.YieldBelowFloor);
+        }
+    }
+
+    /**
+     * Close an asset to new anchoring by the four-stage procedure of whitepaper
+     * §6.3.
+     *
+     * De-listing closes the inflow and touches nothing already anchored. The
+     * escrow is one-way and the positions in it are still owed to their bound
+     * beneficiaries; a de-listing that repudiated them would be the protocol
+     * voting itself out of an obligation it has already taken. The origin-chain
+     * escrow learns of it from a de-listing leaf sealed into an epoch root.
+     */
+    function delistAsset(bytes32 key) external onlyGovernance {
+        if (!_assets[key].admitted) revert AssetNotAdmitted(key);
+        _assets[key].admitted = false;
+        emit AssetDelisted(key, DelistReason.Governance);
+    }
+
+    function assetProfile(bytes32 key) external view returns (AssetProfile memory) {
+        return _assets[key];
+    }
+
+    /**
+     * Ask for the seeding deposit of `escrow` on origin chain `chainId` to be
+     * returned (whitepaper §4.2; re-audit 2026-09-30, ORIGIN-01, BOND-06).
+     * Governance only. The relayer seals one seed-return leaf per request,
+     * and only while the bond's `seedReturnSealable()` holds; the escrow
+     * accepts it once, and only with its anchoring closed. Before this a leaf
+     * was sealed in every root for every escrow with no stake, and anyone
+     * could return a seed the treasury had just made.
+     */
+    function requestSeedReturn(uint256 chainId, address escrow) external onlyGovernance {
+        _canonical(escrow);
+        uint256 n = ++_seedReturns[assetKey(chainId, escrow)];
+        emit SeedReturnRequested(chainId, escrow, n);
+    }
+
+    /// Seed returns requested for `escrow` so far: the relayer seals the leaf of each once.
+    function seedReturnRequests(uint256 chainId, address escrow) external view returns (uint256) {
+        return _seedReturns[assetKey(chainId, escrow)];
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Identifiers. Whitepaper §3.2 and §3.5, yellow paper §2.2            */
+    /*                                                                     */
+    /* Every preimage below is laid out in 32-byte words through EvmWords, */
+    /* never through this compiler's abi.encode: since QIP-55 the native   */
+    /* slot is 64 bytes and a natively encoded leaf stops matching the     */
+    /* origin-chain escrow's recomputation. See the EvmWords header.       */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * The identifier of a position, committing to its beneficiary.
+     *
+     * The chain id is inside the preimage. The insurance product's asset key
+     * omits it and consequently collides for one contract address deployed on
+     * two chains; a product that admits assets on several origin chains cannot
+     * inherit the omission.
+     *
+     * The beneficiary is this chain's account and enters as the two words of
+     * `EvmWords.ownerWords`, since QIP-55 made it 64 bytes; the asset and the
+     * depositor are origin-chain accounts and stay one word each.
+     */
+    function stakeAssetId(
+        uint256 chainId,
+        address asset,
+        address depositor,
+        address boundQrlOwner,
+        uint64 depositNonce
+    ) public pure returns (bytes32) {
+        (bytes32 ownerHi, bytes32 ownerLo) = EvmWords.ownerWords(boundQrlOwner);
+        return keccak256(
+            abi.encodePacked(
+                EvmWords.word(chainId),
+                EvmWords.evmWord(asset),
+                EvmWords.evmWord(depositor),
+                ownerHi,
+                ownerLo,
+                EvmWords.word(uint256(depositNonce))
+            )
+        );
+    }
+
+    /*
+     * The anchor leaf, the spend key, the release payload and the release leaf
+     * are built by `ArkStakeLeaves` since 2026-09-29 (audit 2026-09-22 C5
+     * items G6 and G9 needed the registry's v3 bytes): nothing on chain called
+     * their external builders, and the suite and the three-way agreement
+     * tests reach them through `StakeMathHarness`, byte for byte the code the
+     * registry runs.
+     */
+
+    /*
+     * The released and buffer leaves are built by `ArkStakeLeaves` since phase
+     * C3b (`releasedLeaf`, `bufferLeaf`): the registry needed their external
+     * builders' bytes for the settlement price, and nothing on chain called
+     * them; the suite reaches them through `StakeMathHarness`.
+     */
+
+    /* ------------------------------------------------------------------ */
+    /* Anchoring                                                           */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Record an anchor proven against an accepted epoch root.
+     *
+     * Permissionless, because the proof is the authority and the caller gains
+     * nothing: the record it creates names a beneficiary fixed inside the
+     * identifier, so a relayer submitting someone else's anchor can only put it
+     * where it was always going.
+     *
+     * The beneficiary is refused before anything else because a deposit that
+     * names none must be rejected rather than defaulted — deriving one from the
+     * depositing account would make the entitlement a function of an
+     * elliptic-curve key, which is the failure the product exists to remove.
+     *
+     * Past that, a proven deposit is never refused: see the header. A profile
+     * with no group is an asset never admitted, and nothing the quorum attests
+     * can name one.
+     *
+     * Only the canonical encoding of the origin-chain accounts is recorded
+     * (whitepaper §5.2; audit 2026-09-29 R2 M-3, QL-27, and PV-02): the escrow,
+     * the asset and the depositor are twenty-byte values, and the leaf hashes
+     * the low word of each alone, so a copy of the relayer's call carrying a
+     * nonzero high word still proved, took the identifier first
+     * (`AnchorExists` then refused the true record) and put the position's
+     * weight in a ledger no escrow has. Refused by name (`AnchorNotCanonical`).
+     */
+    function recordAnchor(AnchorInput calldata input, uint256 epoch, bytes32[] calldata proof)
+        external
+        returns (bytes32 id)
+    {
+        if (input.boundQrlOwner == address(0)) revert NoBeneficiary();
+        if (input.anchoredNotional == 0) revert ZeroValue();
+        _canonical(input.escrow);
+        _canonical(input.asset);
+        _canonical(input.depositor);
+
+        bytes32 key = assetKey(input.chainId, input.asset);
+        bytes32 group = _assets[key].correlationGroup;
+        if (group == bytes32(0)) revert AssetNotAdmitted(key);
+
+        id = stakeAssetId(
+            input.chainId, input.asset, input.depositor, input.boundQrlOwner, input.depositNonce
+        );
+        if (_anchors[id].status != 0) revert AnchorExists(id);
+
+        _consumeProof(epoch, ArkStakeLeaves.stakeLeafKey(input.escrow, id, input.anchoredNotional), proof);
+        (uint256 shareBps, uint256 cap) = _admitToBook(group, input.anchoredNotional);
+        bool delisted = !_assets[key].admitted;
+        if (delisted || shareBps > cap) emit AnchoredOutsideControls(id, key, delisted, shareBps, cap);
+
+        _anchors[id] = Anchor({
+            asset: input.asset,
+            boundQrlOwner: input.boundQrlOwner,
+            chainId: input.chainId,
+            anchoredNotional: input.anchoredNotional,
+            // Anchored when the escrow took the deposit, as near as QRL can
+            // tell (whitepaper §5.2, §5.3; audit 2026-09-22, G6): the close of
+            // the origin epoch the proving root is labelled with — the epoch
+            // the escrow emitted the deposit in — where that is earlier than
+            // this record, so a deposit made before a declaration is a
+            // claimant of it however late its proof reached QRL. Never earlier
+            // than the deposit: its epoch closes after every deposit it labels.
+            anchoredAt: uint64(ArkEpoch.startOf(epoch + 1) < block.timestamp ? ArkEpoch.startOf(epoch + 1) : block.timestamp),
+            depositNonce: input.depositNonce,
+            status: 1,
+            releasableAt: 0,
+            claimNonce: 0,
+            correlationGroup: group,
+            escrow: input.escrow
+        });
+
+        _tryMarkPremium();
+        emit Anchored(id, input.boundQrlOwner, key, input.anchoredNotional, epoch);
+    }
+
+    /// An origin-chain account in its one encoding: the low twenty bytes of a zero-extended word (QL-27).
+    function _canonical(address a) private pure {
+        if (!EvmWords.isEvmAddress(a)) revert AnchorNotCanonical(a);
+    }
+
+    /// Verify membership against the accepted root and burn the proof.
+    function _consumeProof(uint256 epoch, bytes32 leaf, bytes32[] calldata proof) private {
+        bytes32 spend = ArkStakeLeaves.spendKey(epoch, leaf);
+        if (_spent[spend]) revert ProofSpent(spend);
+        if (!attestation.verify(epoch, leaf, proof)) revert BadProof(epoch, leaf);
+        _spent[spend] = true;
+    }
+
+    /**
+     * Admit a notional into the book, and return the group's share of the
+     * book it produced against the admission cap in force.
+     *
+     * The cap is evaluated on the book this anchor produces rather than the
+     * one before it, so a deposit cannot pass by being measured against a book
+     * it is about to change. It is reported, never enforced here: see the
+     * header. It bounds the inflow and nothing else — the escrow is one-way,
+     * so releases elsewhere raise a group's share with no anchoring event
+     * passing any cap — which is why the capital is sized from the measured
+     * share and not from this check.
+     */
+    function _admitToBook(bytes32 group, uint256 amount) private returns (uint256 shareBps, uint256 cap) {
+        uint256 newTotal = totalAnchored + amount;
+        uint256 held = _groupAnchored[group];
+        uint256 newGroup = held + amount;
+        shareBps = _shareBps(newGroup, newTotal);
+
+        uint256 groups = held == 0 ? activeGroups + 1 : activeGroups;
+
+        // The cap binds only once it is satisfiable, and the threshold is
+        // derived rather than chosen: a cap of one fifth cannot be met by a
+        // book of fewer than five correlation groups, so flagging every anchor
+        // there would say nothing. Below it the cap reads as BPS, which no
+        // share passes.
+        cap = _p().maxAssetShareBps;
+        if (groups * cap < BPS) cap = BPS;
+
+        totalAnchored = newTotal;
+        _groupAnchored[group] = newGroup;
+        if (held == 0) activeGroups = groups;
+        _observe();
+        _noteHigh(newTotal);
+    }
+
+    /// Raise this epoch's lane of the anchored notional to `notional` (see `_notionalHigh`).
+    function _noteHigh(uint256 notional) private {
+        uint256 e = ArkEpoch.current();
+        if (notional > _notionalHigh[e]) _notionalHigh[e] = notional;
+    }
+
+    /**
+     * N_A + N_T,max (whitepaper §6.2, PV-07): the largest anchored notional
+     * the book recorded over the censorship window, the epoch in progress and
+     * the `CENSORSHIP_WINDOW_EPOCHS` - 1 before it. A release in transit left
+     * the anchored book when it entered transit, so this is the widest base
+     * the censorship ground can draw on; the court sizes V_max and the seat
+     * on it. Walks the window's lanes: six reads.
+     */
+    function censorshipNotionalMax() external view returns (uint256 best) {
+        best = totalAnchored;
+        uint256 e = ArkEpoch.current();
+        for (uint256 i = 0; i < CENSORSHIP_WINDOW_EPOCHS && i <= e; i++) {
+            uint256 lane = _notionalHigh[e - i];
+            if (lane > best) best = lane;
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Release. Whitepaper §3.3                                            */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Instruct a release, signed on QRL by the bound beneficiary.
+     *
+     * The notional moves into transit in this block: it leaves the anchored
+     * notional the capital requirement is measured against, it is charged no
+     * premium share and it carries no cover (invariant I18). Pricing the
+     * contraction when it is announced rather than when it settles means no
+     * part of the coupon rests on notional that has declared its departure.
+     *
+     * The recipient is committed here, before any origin-chain transaction
+     * carrying it exists, and the leaf this emits is what the attester seals.
+     * The escrow derives the twenty-one day unbonding from the epoch the leaf
+     * is sealed into, independently, so the period is checked where the asset
+     * moves rather than trusted across the relay.
+     *
+     * Recorded during the protective freeze, because the whitepaper lets an
+     * instruction be recorded then and holds only its settlement; refused after
+     * a declaration, which closes the path permanently (I15).
+     */
+    function instructRelease(bytes32 id, address recipient) external returns (bytes32 leaf) {
+        if (recipient == address(0)) revert ZeroAddress();
+        // The recipient is an origin-chain account; one wider than twenty bytes
+        // would seal a leaf the escrow never pays (EvmWords.isEvmAddress, D14).
+        if (!EvmWords.isEvmAddress(recipient)) revert RecipientNotOriginAddress(recipient);
+        if (address(qday) != address(0) && qday.declared()) revert ReleaseClosed();
+
+        Anchor storage a = _anchors[id];
+        if (a.status == 0) revert UnknownAnchor(id);
+        if (a.status != 1) revert WrongStatus(id, a.status);
+        if (msg.sender != a.boundQrlOwner) revert NotBoundOwner(id, msg.sender);
+        // A claimant of the censorship ground — anchored at T, the ground's
+        // moment (claimant record: ground 2, then T) — stays in the book until
+        // its escrow's recovery is applied on the bond (the ledger's cursor,
+        // its seventh word, past slot 0) or the hold lapses,
+        // `CLAIMANT_HOLD_EPOCHS` after T (OC-LEGA-01): the recovery is drawn
+        // on the positions still in the escrow, so one that left first would
+        // leave its part to the rest. The relayer withholds release leaves
+        // sealed before the hold.
+        {
+            IArkBondClaimants b = IArkBondClaimants(address(bond));
+            (uint256 ground, uint256 at) = b.claimants();
+            if (
+                ground == 2 && a.anchoredAt <= at && block.timestamp < at + CLAIMANT_HOLD_EPOCHS * ArkEpoch.EPOCH_LENGTH
+                    && b.escrowLedger(a.chainId, a.escrow)[6] == 0
+            ) revert ClaimantHeld();
+        }
+
+        a.claimNonce += 1;
+        a.status = 2;
+        a.releasableAt = uint64(block.timestamp) + UNBONDING_PERIOD;
+
+        uint256 amount = a.anchoredNotional;
+        bytes32 group = a.correlationGroup;
+        // The level the book stood at until now (see `_notionalHigh`).
+        _noteHigh(totalAnchored);
+        totalAnchored -= amount;
+        totalInTransit += amount;
+        _groupAnchored[group] -= amount;
+        if (_groupAnchored[group] == 0) activeGroups -= 1;
+
+        // Observed on the way out as well: a release raises the share of every
+        // group left. It cannot lower the measurement, because the window is a
+        // running maximum and the lane only ever rises within its epoch.
+        _observe();
+
+        // The exit must not depend on a price: whitepaper §5.5 has the breaker
+        // suspend pricing and nothing else. See `_tryMarkPremium`.
+        _tryMarkPremium();
+        leaf = ArkStakeLeaves.releaseLeaf(a.escrow, ArkStakeLeaves.releasePayload(id, recipient, a.claimNonce, a.chainId));
+        emit ReleaseInstructed(id, recipient, a.claimNonce, leaf, a.releasableAt, amount);
+    }
+
+    /**
+     * Record that the origin chain has paid a release out in full, proven
+     * against an epoch root.
+     *
+     * Permissionless: the proof is the fact. It moves nothing — the notional
+     * left the priced book at the instruction — and closes the transit record,
+     * which is what the censorship ground of whitepaper §3.6 is measured from:
+     * a release past unbonding that no admitted root has let settle stays in
+     * transit here, and that is the evidence the court reads.
+     */
+    function recordReleaseSettled(bytes32 id, uint256 epoch, bytes32[] calldata proof) external {
+        Anchor storage a = _anchors[id];
+        if (a.status == 0) revert UnknownAnchor(id);
+        if (a.status != 2) revert WrongStatus(id, a.status);
+
+        _consumeProof(epoch, ArkStakeLeaves.releasedLeaf(a.escrow, id, a.claimNonce), proof);
+
+        a.status = 3;
+        totalInTransit -= a.anchoredNotional;
+        emit ReleaseSettled(id, a.anchoredNotional, epoch);
+    }
+
+    /**
+     * Record an escrow's buffer, proven against the forward root of `epoch`.
+     *
+     * HOW THE QRL LEG LEARNS buffer_orig. The buffer is held on the origin
+     * chain (whitepaper §4.2: the seeding deposit, the accrued buffer share
+     * and the retained premium) and enters the denominator of utilisation
+     * here (§4.3). No fact about an escrow's balances crossed the relay before
+     * this, so it takes the channel the premium offer already takes: the
+     * escrow's `reportBuffer` settles, values `bufferShares` in units and
+     * emits `ArkStakeIds.bufferLeaf` once per epoch; the forward path seals it
+     * into the root of that epoch; anyone presents it here. Permissionless for
+     * `recordAnchor`'s reason: the proof is the authority.
+     *
+     * Only a strictly newer epoch replaces an asset's figure. An older report
+     * — a root admitted late, or one withheld and replayed after a loss
+     * settlement drew the buffer down — would restore a buffer the escrow no
+     * longer holds and overstate cover. An asset never admitted is refused:
+     * no escrow of this product holds it. Between reports the figure is the
+     * last proven one, which the origin chain can only have lowered through a
+     * loss settlement; the next report corrects it within an epoch.
+     */
+    function recordBuffer(
+        uint256 chainId,
+        address escrow,
+        address asset,
+        uint256 epoch,
+        uint256 units,
+        bytes32[] calldata proof
+    ) external {
+        bytes32 key = assetKey(chainId, asset);
+        if (_assets[key].correlationGroup == bytes32(0)) revert AssetNotAdmitted(key);
+        // Per escrow: two escrows of one asset sum, and neither's report
+        // replaces the other's (OC-LEGB-08).
+        bytes32 ek = assetKey(chainId, escrow) ^ key;
+        uint256 seen = _bufferEpochPlusOne[ek];
+        if (epoch < seen) revert BufferReportNotNewer(key, seen - 1, epoch);
+
+        _consumeProof(epoch, ArkStakeLeaves.bufferLeaf(chainId, escrow, asset, epoch, units), proof);
+
+        uint256 old = _bufferUnits[ek];
+        uint256 total = bufferOrig - old + units;
+        bufferOrig = total;
+        _bufferUnits[ek] = units;
+        _bufferUnits[key] = _bufferUnits[key] - old + units;
+        _bufferEpochPlusOne[ek] = epoch + 1;
+        _bufferEpochPlusOne[key] = epoch + 1;
+        emit BufferRecorded(key, epoch, units, total);
+        _tryMarkPremium();
+    }
+
+    /// An asset's buffer as last recorded, summed over its escrows, in units, and the latest epoch proven (zero units: none yet).
+    function bufferOf(bytes32 key) external view returns (uint256 units, uint256 epoch) {
+        uint256 seen = _bufferEpochPlusOne[key];
+        return (_bufferUnits[key], seen == 0 ? 0 : seen - 1);
+    }
+
+    function anchorOf(bytes32 id) external view returns (Anchor memory) {
+        return _anchors[id];
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The concentration window                                            */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * A group's share of the book, rounded UP. The share sizes the capital
+     * requirement, and understating it understates required capital, which
+     * overstates cover — the direction `effectiveAttachmentBps` rounds against
+     * for the same reason. An empty book has no share.
+     */
+    function _shareBps(uint256 held, uint256 total) private pure returns (uint256) {
+        if (total == 0) return 0;
+        return (held * BPS + total - 1) / total;
+    }
+
+    /**
+     * Re-measure the book after a change to it and record the epoch's
+     * high-water mark, rolling the ring forward first.
+     *
+     * The lanes a roll opens are the epochs since the last change, in which
+     * the book stood where the last change left it, so they are seeded with
+     * `_spotShareBps` as it still reads — the share before this change — and
+     * only then is the book as it now stands measured into lane zero.
+     */
+    function _observe() private {
+        uint256 nowEpoch = ArkEpoch.current();
+        uint256 window = _shareWindow;
+        uint256 prior = _spotShareBps;
+
+        if (nowEpoch > _windowEpoch) {
+            uint256 elapsed = nowEpoch - _windowEpoch;
+            if (elapsed > CONCENTRATION_EPOCHS) elapsed = CONCENTRATION_EPOCHS;
+            for (uint256 i = 0; i < elapsed; i++) window = (window << 16) | prior;
+            _windowEpoch = nowEpoch;
+        }
+
+        uint256 total = totalAnchored;
+        uint256 spot = 0;
+        uint256 n = _groups.length;
+        for (uint256 i = 0; i < n; i++) {
+            uint256 s = _shareBps(_groupAnchored[_groups[i]], total);
+            if (s > spot) spot = s;
+        }
+        _spotShareBps = uint16(spot);
+
+        if (spot > (window & 0xffff)) window = (window & ~uint256(0xffff)) | spot;
+        // Lanes past the thirteenth are never read; masking them keeps the word
+        // equal to the window it describes.
+        _shareWindow = window & ((uint256(1) << (16 * CONCENTRATION_EPOCHS)) - 1);
+    }
+
+    /**
+     * @notice The measured concentration the capital requirement is sized from:
+     * the largest share any group held in the trailing window.
+     *
+     * Lanes the ring would open on its next roll are epochs in which the book
+     * has not changed since `_spotShareBps` was written, so the spot share
+     * stands in for all of them; only the lanes still inside the window
+     * survive the shift.
+     */
+    function observedMaxGroupShareBps() public view returns (uint256) {
+        return _maxShareBps(false);
+    }
+
+    /**
+     * The window's maximum; with `closed`, over the epochs that have closed
+     * and the book as it stood at the opening of this one, which is what the
+     * yield review reads (audit 2026-09-22, G9). Where the book has changed in this epoch, lane
+     * zero is this epoch's and is skipped, and each lane above it is a closed
+     * epoch at least as high as the book it closed on; where it has not, the
+     * spot share is the book at the opening, and the reading is the plain one.
+     */
+    function _maxShareBps(bool closed) private view returns (uint256 best) {
+        uint256 elapsed = ArkEpoch.current() - _windowEpoch;
+        uint256 window = _shareWindow;
+        uint256 i;
+        if (closed && elapsed == 0) i = 1;
+        else best = _spotShareBps;
+        for (; i + elapsed < CONCENTRATION_EPOCHS; i++) {
+            uint256 lane = (window >> (16 * i)) & 0xffff;
+            if (lane > best) best = lane;
+        }
+    }
+
+    /// The number of correlation groups admission has listed, each measured at every change.
+    function correlationGroupCount() external view returns (uint256) {
+        return _groups.length;
+    }
+
+    function groupAnchored(bytes32 correlationGroup) external view returns (uint256) {
+        return _groupAnchored[correlationGroup];
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The price of cover                                                  */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * The settlement series: the price capacity, utilisation and the fraction
+     * covered convert bond principal at, and the price a settlement strikes at
+     * — the thirty-day average, bounded per epoch by m_epoch. Whitepaper §4.3,
+     * §5.5, yellow paper §3.1, invariant I38.
+     *
+     * Never the epoch average. Cover measured at a better price than its
+     * settlement obtains overstates what a claimant is paid, and two windows
+     * feeding cover and settlement would leave their divergence to arbitrage;
+     * read from one series, measured cover declines no faster than the
+     * per-epoch bound at which the settlement behind it can reprice. The bond
+     * reads this for its utilisation and its conditional release.
+     *
+     * The per-epoch bound is the oracle's: `IReferencePriceOracle` reports the
+     * thirty-day average bounded per epoch (whitepaper §2's assumption on the
+     * valuation oracle; `observe`'s `twap30d`), and the model takes the bounded
+     * series as its input rather than bounding it. The breaker's emergency
+     * floor, which compounds m_epoch, belongs to settlement
+     * (`ArkStakeMath.emergencyPriceFloor`).
+     */
+    function referencePrice() public view returns (uint256) {
+        if (address(priceOracle) == address(0)) return 0;
+        (, uint256 twap30d,) = priceOracle.observe(0, address(0));
+        return twap30d;
+    }
+
+    /**
+     * The bounded thirty-day series and its value 24 hours earlier, read
+     * through `try`: zero while the series is silent (yellow paper §6.1, I40:
+     * a revert, a zero, a pause, the warm-up, a lapsed heartbeat) or no
+     * oracle is set. `referencePrice` still reverts then, so the bond's
+     * conditional release leaves a silent epoch unobserved (§5.4).
+     */
+    function _series() private view returns (uint256 twap30d, uint256 ago) {
+        if (address(priceOracle) == address(0)) return (0, 0);
+        try priceOracle.observe(0, address(0)) returns (uint256, uint256 t, uint256 g) {
+            (twap30d, ago) = (t, g);
+        } catch {}
+    }
+
+    /**
+     * The epoch average: the interval the premium is swept and exchanged over.
+     * Read by the reserve of the premium swap alone (whitepaper §4.7, §5.5):
+     * a price wrong there moves the proceeds of one offering and no settlement.
+     * Since 2026-10-05 it is P_t of the epoch last closed, from the oracle's
+     * cumulative sums at its boundaries (yellow paper §4.6, §6.1; OC-ORC-08):
+     * during the quote window of epoch t's offering that is t itself, so the
+     * reserve no longer depends on when the first quote reads it. Reverts
+     * `OracleSilent` while the series is silent.
+     */
+    function epochPrice() external view returns (uint256) {
+        if (address(priceOracle) == address(0)) return 0;
+        return priceOracle.epochAverage(0, address(0), uint64(ArkEpoch.current() - 1));
+    }
+
+    /**
+     * Whether the circuit breaker of the valuation oracle holds: the 24-hour
+     * average of accepted observations has fallen by 5,000 bps or more
+     * against the same average 24 hours earlier, computed by the oracle from
+     * its cumulative sums, with no setter and no posted input (yellow paper
+     * §5.2, §6.1; technical reference §3.4). Read here since 2026-10-05: the
+     * thirty-day series this compared before is bounded at m_epoch per epoch
+     * and cannot fall 5,000 bps in a day.
+     *
+     * One-sided, and the direction watched is the one that overstates cover: a
+     * fall in the reference price converts bond principal into more of the
+     * origin asset, so a position would be charged for cover the auction can no
+     * longer obtain at that price. A rise contracts the covered fraction, which
+     * issuance repairs and the scarcity slope prices. It suspends premium
+     * pricing and nothing else here; release, determination and settlement
+     * continue through it.
+     */
+    function breakerActive() public view returns (bool active) {
+        if (address(priceOracle) == address(0)) return false;
+        (active,) = priceOracle.breakerActive(0, address(0));
+    }
+
+    /**
+     * The settlement price (whitepaper §5.5, yellow paper §4.2; the model's
+     * `settlementPrice`): the price a trigger-1 determination and the floor
+     * draw of a declaration are converted at, which the bond reads here.
+     *
+     * Outside the breaker it is the bounded thirty-day series, as
+     * `referencePrice` reads it: with no breaker in force the carried price
+     * IS that series (the definition phase C3b adopts), so a registry whose
+     * breaker never fired strikes every settlement at `twap30d`, and the
+     * model's `min(carried, twap30d)` is `twap30d`.
+     *
+     * While the breaker holds, `min(carried, max(twap_e, floor_k))`: `carried`
+     * is the thirty-day average the last mark outside the breaker read (the
+     * last reference price accepted before it fired; a registry never marked
+     * carries the series as of 24 hours ago, the reading before the decline
+     * that fired it), `twap_e` the oracle's emergency valuation, and `floor_k`
+     * the carried price compounded down by m_epoch once per epoch elapsed
+     * since the breaker fired (`emergencyPriceFloor`, truncating at each
+     * step, toward bond principal). The firing epoch is the one a mark first
+     * found the breaker active in; where no mark has seen it yet, the epoch
+     * of the last mark outside it — the most epochs the decline can have run
+     * — so an unobserved firing never holds the strike at the pre-decline
+     * price. No grace deferral is applied here: the grace period is bounded
+     * by the dispute cycle (§6.3), and a settlement that arrives inside it
+     * strikes at the formula for the epochs elapsed (reported).
+     *
+     * The severity balance of a declaration is never struck at this price: it
+     * is measured on `referencePrice`, and held while the breaker is active.
+     *
+     * Never reverts while the series is silent (technical reference §1.4;
+     * I40, OC-ORC-05): a read that reverts or reports zero strikes at the
+     * carried price, or min(carried, floor_k) after a firing
+     * (`deadOracleOpeningPrice`). The carried price is the last mark's: the
+     * papers' "bounded series at the last accepted round" (`lastAccepted`)
+     * is one more oracle call, which the registry's byte room does not hold.
+     */
+    function settlementPrice() external view returns (uint256) {
+        // Silent (I40): a revert or a zero is no price, and the carried one is
+        // struck. With no oracle set nothing was ever marked, so that is zero.
+        (uint256 twap30d, uint256 ago) = _series();
+        if (twap30d == 0) return deadOracleOpeningPrice();
+        if (!breakerActive()) return twap30d;
+        uint256 carried = _carried == 0 ? ago : _carried;
+        uint256 fired = _firedPlusOne != 0 ? uint256(_firedPlusOne) - 1 : uint256(_carriedEpoch);
+        uint256 floor = ArkStakeMath.emergencyPriceFloor(
+            carried, _p().maxEpochMoveBps, ArkEpoch.current() - fired
+        );
+        return ArkStakeMath.settlementPrice(false, carried, twap30d, priceOracle.emergencyValuation(0, address(0)), floor);
+    }
+
+    /// The carried price, the epoch it was read in, and one more than the epoch the breaker was first seen active in (zero: not since).
+    function carriedPrice() external view returns (uint256 carried, uint64 epoch, uint64 firedPlusOne) {
+        return (_carried, _carriedEpoch, _firedPlusOne);
+    }
+
+    /**
+     * The price a trigger-2 settlement opens at where the oracle gives none
+     * (whitepaper §5.2, §5.5; QL-07; re-audit 2026-09-30, BOND-05; the
+     * model's `deadOracleOpeningPrice`): the carried price, or, once a mark
+     * has seen the breaker fire, the lesser of it and `floor_k`, the carried
+     * price compounded down by m_epoch for each epoch since — the live rule
+     * with no emergency valuation. The carried price is the ceiling of that
+     * range, so an opener who waits for a dead moment gains nothing. Also the
+     * settlement price under silence (`settlementPrice`, I40).
+     */
+    function deadOracleOpeningPrice() public view returns (uint256 price) {
+        price = _carried;
+        if (_firedPlusOne == 0) return price;
+        uint256 floor = ArkStakeMath.emergencyPriceFloor(
+            price, _p().maxEpochMoveBps, ArkEpoch.current() + 1 - uint256(_firedPlusOne)
+        );
+        if (floor < price) price = floor;
+    }
+
+    /// The conversion haircut in force: the measured drawdown, capped. Whitepaper §4.3.
+    function fxHaircutBps() public view returns (uint256) {
+        if (address(priceOracle) == address(0)) return 0;
+        IArkStakeParams.RegistryParams memory p = _p();
+        uint256 drawdown = priceOracle.maxDrawdownBps(0, address(0), uint256(p.fxWindowDays) * 1 days);
+        return ArkStakeMath.fxHaircutBps(drawdown, p.fxHaircutMaxBps);
+    }
+
+    function _bondOutstanding() private view returns (uint256) {
+        if (address(bond) == address(0)) return 0;
+        return bond.outstandingPrincipal();
+    }
+
+    /// Probable maximum loss: measured from the book, then floored.
+    function pmlBps() public view returns (uint256) {
+        return ArkStakeMath.pmlBps(_p().pmlFloorBps, observedMaxGroupShareBps());
+    }
+
+    /// The indemnity actually promised, after the §4.3 reduction.
+    function effectiveIndemnityBps() public view returns (uint256) {
+        return ArkStakeMath.effectiveIndemnityBps(sigmaTargetBps(), _p().indemnityBps, pmlBps());
+    }
+
+    /// Capital required per unit anchored. Rounds up; see ArkStakeMath.
+    function effectiveAttachmentBps() public view returns (uint256) {
+        return ArkStakeMath.effectiveAttachmentBps(effectiveIndemnityBps(), pmlBps());
+    }
+
+    /// Capital the book requires, and identically the occurrence limit.
+    function requiredCapital() public view returns (uint256) {
+        return ArkStakeMath.requiredCapital(totalAnchored, effectiveAttachmentBps());
+    }
+
+    /// Bond principal at the capacity conversion, the quantity cover is measured against.
+    function bondCapacityInOrigin() public view returns (uint256) {
+        return ArkStakeMath.bondCapacityInOrigin(_bondOutstanding(), referencePrice(), fxHaircutBps());
+    }
+
+    /// Anchored notional the outstanding bond and the origin-asset buffer can carry.
+    function capacity() external view returns (uint256) {
+        return ArkStakeMath.capacity(_bondOutstanding(), bondCapacityInOrigin(), bufferOrig, effectiveAttachmentBps());
+    }
+
+    /// Cover sold against the requirement, uncapped: the reciprocal of utilisation.
+    function coverageRatioBps() external view returns (uint256) {
+        return ArkStakeMath.coverageRatioBps(
+            _bondOutstanding(), referencePrice(), requiredCapital(), fxHaircutBps(), bufferOrig
+        );
+    }
+
+    /**
+     * The fraction of the requirement the outstanding bond and the buffer
+     * actually meet. While the series is silent the bond is converted at the
+     * carried price, the last mark's (yellow paper §6.1, I40: capacity and
+     * cover carry the last mark), so the allocation leaf stays computable.
+     */
+    function coveredBps() public view returns (uint256) {
+        (uint256 price,) = _series();
+        if (price == 0) price = _carried;
+        return ArkStakeMath.coveredBps(_bondOutstanding(), price, requiredCapital(), fxHaircutBps(), bufferOrig);
+    }
+
+    /**
+     * Utilisation, `ceil(K * BPS / (N^cap_30 + buffer_orig))`: the reading the
+     * bond's conditional release is gated on (whitepaper §5.3), measured here
+     * because every term of it is held or read here. See ArkStakeMath.
+     */
+    function utilisationBps() external view returns (uint256) {
+        return ArkStakeMath.utilisationBps(requiredCapital(), _bondOutstanding(), bondCapacityInOrigin(), bufferOrig);
+    }
+
+    /// The ceiling on the target share in force: the surge value while the run-off gate is closed.
+    function premiumCeilingInForceBps() public view returns (uint256) {
+        bool gate = address(bond) != address(0) && bond.runoffGateClosed();
+        IArkStakeParams.RegistryParams memory p = _p();
+        return ArkStakeMath.premiumCeilingInForceBps(gate, p.premiumCeilingBps, p.surgeCeilingBps);
+    }
+
+    /**
+     * The target share at the cover in force, before cover scales it. The
+     * slope is the ratio rho of the target in force since 2026-09-30 (EC-07):
+     * alpha_t = floor(sigma_t * rho / BPS), computed in the kernel.
+     */
+    function premiumTargetBps() external view returns (uint256) {
+        return ArkStakeMath.premiumTargetBps(
+            sigmaTargetBps(), _p().premiumSlopeRatioBps, premiumCeilingInForceBps(), coveredBps()
+        );
+    }
+
+    /// The premium share the book prices at now, ignoring the breaker. The slope as `premiumTargetBps` takes it.
+    function _pricedPremiumBps() private view returns (uint256) {
+        return ArkStakeMath.premiumShareBps(
+            sigmaTargetBps(), _p().premiumSlopeRatioBps, premiumCeilingInForceBps(), coveredBps()
+        );
+    }
+
+    /**
+     * The premium share charged this epoch. Zero when no cover has been sold.
+     *
+     * While the breaker holds, the last share priced outside it is carried
+     * rather than repriced: a price the breaker has declared unreliable must
+     * not reach the share of yield a position pays. A book that was never
+     * marked before the breaker fired carries zero, and the failure mode of a
+     * missing price is then a coupon shortfall, which §4.7 specifies a response
+     * to, rather than an over-charge on the anchored positions, which nothing
+     * does.
+     *
+     * A silent series carries the mark the same way (yellow paper §6.1, I40),
+     * so `allocation` and the root that seals it never wait on the oracle.
+     */
+    function premiumShareBps() public view returns (uint256) {
+        (uint256 twap30d,) = _series();
+        if (twap30d == 0 || breakerActive()) return _markBps;
+        return _pricedPremiumBps();
+    }
+
+    /**
+     * Record the premium share of the epoch in progress, so the breaker has a
+     * figure to carry. Permissionless: the figure is computed, not supplied.
+     * Also run at the end of every path that changes the book, so the mark is
+     * the price of the book as it stands rather than as it stood.
+     */
+    function markPremium() external {
+        _markPremium();
+    }
+
+    /**
+     * Mark at the end of a change to the book, without letting the pricing
+     * inputs decide whether the change happens.
+     *
+     * An external self-call, because only an external call can be caught: the
+     * mark reads the valuation oracle and the bond, and an oracle that reverts,
+     * is paused, or reports a price the arithmetic overflows on would
+     * otherwise block every release instruction and every proven deposit —
+     * the exit, and a record without which the exit is lost. A mark skipped
+     * here is written by the next change or by anyone calling `markPremium`
+     * once the oracle answers; until then the breaker carries the older mark,
+     * which is the failure whitepaper §4.7 already answers.
+     */
+    function _tryMarkPremium() private {
+        try this.markPremium() {}
+        catch {
+            // Starved by the caller (the 63/64 rule) rather than refused by
+            // the oracle: the caller would choose when the boundary reading
+            // and the breaker's first epoch are taken (OC-LEGB-11).
+            if (gasleft() < MARK_GAS_FLOOR) revert MarkStarved();
+        }
+    }
+
+    function _markPremium() private {
+        uint256 epoch = ArkEpoch.current();
+        bool fired = breakerActive();
+        uint256 ref = referencePrice();
+        // The boundary reading of this epoch, at its first touch only (see
+        // `_readings`): recorded outside the breaker and where the series
+        // answers, and in every case the boundary counts as read.
+        if (_readEpoch < epoch) {
+            _readEpoch = uint64(epoch);
+            if (!fired && ref != 0) {
+                _readings[epoch] = ref;
+                emit BoundaryReading(epoch, ref);
+            }
+        }
+        // The settlement price's two records (see `settlementPrice`): the
+        // epoch the breaker is first seen active in, and outside it the
+        // thirty-day average as the carried price.
+        if (fired) {
+            if (_firedPlusOne == 0) _firedPlusOne = uint64(epoch + 1);
+            return;
+        }
+        _carried = ref;
+        _carriedEpoch = uint64(epoch);
+        _firedPlusOne = 0;
+        uint256 premium = _pricedPremiumBps();
+        if (_markEpoch == epoch && _markBps == premium) return;
+        _markEpoch = uint64(epoch);
+        _markBps = uint16(premium);
+        emit PremiumMarked(epoch, uint16(premium));
+    }
+
+    /// The carried mark and the epoch it was priced in.
+    function premiumMark() external view returns (uint64 epoch, uint16 premiumBps) {
+        return (_markEpoch, _markBps);
+    }
+
+    /**
+     * The first boundary reading recorded at or after the boundary that opens
+     * `epoch`, and the epoch it was read at; zero and zero where none stands
+     * yet (the model's `severityReadingEpoch` and the first later reading of
+     * whitepaper §5.2). The trigger-2 severity reads it at `epoch + W_a` of
+     * its opening. Walks the epochs from `epoch` to the current one: bounded
+     * by the epochs since, which the caller chooses by when it settles.
+     */
+    function readingFrom(uint256 epoch) external view returns (uint256 price, uint256 readEpoch) {
+        uint256 last = ArkEpoch.current();
+        for (uint256 e = epoch; e <= last; e++) {
+            uint256 p = _readings[e];
+            if (p != 0) return (p, e);
+        }
+    }
+
+    /**
+     * The buffer share in force: the escalator of whitepaper §4.2 at the
+     * conversion haircut in force, `250 + 1,250 * h_fx / h_max` at the
+     * reference values. The cap is the governable `bufferEscalatorCapBps`
+     * since 2026-09-28, read from the set as the model reads it. The ramp
+     * below the buffer threshold is applied by `allocation`, as the model's
+     * `bufferShareInStateBps` applies it over this.
+     */
+    function bufferShareInForceBps() public view returns (uint256) {
+        IArkStakeParams.RegistryParams memory p = _p();
+        return ArkStakeMath.bufferShareInForceBps(
+            p.bufferBps, p.bufferEscalatorCapBps, p.fxHaircutMaxBps, fxHaircutBps()
+        );
+    }
+
+    /// The stabilization levy in force (whitepaper §4.2): lambda while the stage is below its fourth value.
+    function stabilizationLevyInForceBps() external view returns (uint256) {
+        return uint256(allocation().levyBps);
+    }
+
+    /**
+     * The shares of whitepaper §4.2 and what a term commitment needs (§4.4):
+     * the model's `allocate`. The staker share is the residual net of the
+     * levy, so the five sum to BPS; the buffer share is the escalated one of
+     * `bufferShareInForceBps`; the escrow checks every figure against its own
+     * ranges. `sigmaTargetBps` is the rung in force, unscaled — what a
+     * position anchoring now locks and what the reserve tops a committed one
+     * up to — and `coveredBps` the fraction it is scaled by (I39).
+     */
+    function allocation() public view returns (Allocation memory a) {
+        uint256 premium = premiumShareBps();
+        uint256 buffer = bufferShareInForceBps();
+        IArkStakeParams.RegistryParams memory p = _p();
+        // The ramp of whitepaper §4.2 (EC-05; the model's
+        // `bufferShareInStateBps`): while buffer_orig stands below the ramp
+        // threshold of K, the buffer share is at least its seeding value.
+        if (buffer < SEED_BUFFER_BPS && ArkStakeMath.bufferBelowRampThreshold(p.bufferRampThresholdBps, bufferOrig, requiredCapital())) {
+            buffer = SEED_BUFFER_BPS;
+        }
+        uint256 levy = ArkStakeMath.stabilizationLevyInForceBps(p.stabilizationLevyBps, uint256(PARAMS.threatStage()));
+        uint256 staker = ArkStakeMath.stakerShareBps(buffer, p.operationsBps, premium);
+        a.stakerBps = uint16(staker > levy ? staker - levy : 0);
+        a.premiumBps = uint16(premium);
+        a.bufferBps = uint16(buffer);
+        a.operationsBps = p.operationsBps;
+        a.jurorFeeShareBps = p.jurorFeeShareBps;
+        a.levyBps = uint16(levy);
+        a.sigmaTargetBps = uint16(sigmaTargetBps());
+        a.coveredBps = uint16(coveredBps());
+        a.psrCapBps = uint16(ArkStakeMath.psrCapFactorBps(p.psrCapEpochs, p.threatStage1Bps, p.threatStage4Bps));
+        a.commitTermEpochs = p.commitmentTermEpochs;
+        // A step of the threat stage voted and not yet in force (V4; QL-25,
+        // PV-20): the escrow refuses a term commitment while it stands. Two
+        // sources: the step executed and staged by the parameter set for the
+        // next boundary, and a step still queued in the timelock that governs
+        // the set (`stageStepQueued()` of core's ArkTimelock, 2026-09-30).
+        // Both are read by the parameter set's `stageStepQueued()`.
+        a.stepQueued = PARAMS.stageStepQueued();
+    }
+
+    /**
+     * The allocation leaf for the epoch in progress at one escrow, as an
+     * attester seals it (`ArkStakeLeaves.allocationLeaf`). One per escrow:
+     * every leaf binds the escrow that acts on it (D10).
+     */
+    function currentAllocationLeaf(address escrow) external view returns (uint256 epoch, bytes32 leaf) {
+        epoch = ArkEpoch.current();
+        leaf = ArkStakeLeaves.allocationLeaf(escrow, epoch, allocation());
+    }
+
+    /// The coupon multiple this book earns at exact cover.
+    function couponMultipleBps() external view returns (uint256) {
+        return ArkStakeMath.couponMultipleBps(sigmaTargetBps(), effectiveAttachmentBps());
+    }
+
+    /// The vesting factor applied to a settlement for this position. Whitepaper §5.3.
+    function vestingBpsOf(bytes32 id) external view returns (uint256) {
+        Anchor memory a = _anchors[id];
+        if (a.status == 0) revert UnknownAnchor(id);
+        return ArkStakeMath.vestingBps(a.anchoredAt, block.timestamp, VESTING_WINDOW);
+    }
+}

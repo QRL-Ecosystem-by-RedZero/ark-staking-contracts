@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * Leg B's principal, as the objection chamber of decision D6 reads it
+ * (design §6.8). Implemented by the Ark Staking bond (`ArkCatBondStore` or a
+ * view beside it); declared here so the governor compiles without it.
+ *
+ * WHY PRINCIPAL AND NOT veARK
+ * ---------------------------
+ * veARK receives no cash flow from Ark Staking (D8), yet it prices cover and
+ * sets indemnity — decisions that move value between the two legs. The chamber
+ * gives the leg that bears the decision a way to force a stricter re-vote. It
+ * is escalation, not a veto: a Contested proposal can still pass, at 15% quorum
+ * and 75% approval.
+ *
+ * CHECKPOINTING RULE THE IMPLEMENTER MUST KEEP
+ * --------------------------------------------
+ * `principalAt(holder, epoch)` is the principal `holder` held at the boundary
+ * that OPENED `epoch` — never a live balance. The governor asks at the epoch in
+ * which the proposal was queued, so principal subscribed after a proposal became
+ * visible in the timelock cannot object to it, and a transfer during the
+ * objection window cannot count the same principal twice.
+ * `totalPrincipalAt(epoch)` is the sum of the same quantity over all holders.
+ */
+interface IObjectionSource {
+    function principalAt(address holder, uint256 epoch) external view returns (uint256);
+
+    function totalPrincipalAt(uint256 epoch) external view returns (uint256);
+}

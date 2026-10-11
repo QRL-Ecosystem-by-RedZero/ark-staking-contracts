@@ -1,0 +1,254 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./IArkCourtEscalation.hyp";
+
+/**
+ * The dispute court of Ark Staking (whitepaper §6.2, §6.6; yellow paper §4.1,
+ * §4.3, §4.5): a bonded assertion of one of four findings, heard on the
+ * product's own juror pool, and the one account the bond takes those findings
+ * from (`IArkCatBondCourtSide`).
+ *
+ * Not the protocol's `IDisputeCourt` (the insurance court, copied into this
+ * tree with the inherited contracts): that one is opened on an insurance tier
+ * and a case kind of that product, neither of which exists here. The
+ * vocabulary is kept — commit and reveal, appeal, `escalateToGovernance`,
+ * `isDrawnJuror`, `voteCommitment`, `IncorrectBond`, `NotADrawnJuror` — and
+ * the governor's half of the terminal step is contracts/core's
+ * `IArkCourtEscalation`, word for word.
+ *
+ * A case runs, with the windows frozen at its opening (G8):
+ *
+ *   assertFinding  --challenge window-->  unchallenged: the finding stands
+ *        | challenge (the same deposit)
+ *   evidence window --> armDraw --8 blocks--> drawPanel (7, any of the next 256 blocks) --> commit --> reveal
+ *        --> appeal window: the loser appeals (2 x deposit) --> panel of 14 --> commit --> reveal
+ *        --> escalation window: the loser escalates (4 x deposit) --> the governor votes 5 days
+ *              uphold: the appeal verdict stands; retrial: a panel of 28, neither earlier panel --> final
+ *   finalize: the finding reaches the bond if it stands; deposits, fees and seats settle
+ */
+interface IArkStakeCourt is IArkCourtEscalation {
+    /// What an assertion asserts. An ordinal in event topics: append, never reorder.
+    enum Kind {
+        None,
+        /// Trigger 1: positions of one escrow lost these units (whitepaper §5.1). Payload `(bytes32[] ids, uint256[] lossUnits)`.
+        Loss,
+        /// The censorship ground (whitepaper §3.6). Payload `(uint256 transitUnits)`.
+        Censorship,
+        /// m_loss of a held trigger-2 balance (whitepaper §4.6, yellow paper §4.3). Payload `(uint256 measuredLossBps)`.
+        Severity,
+        /// A realised escrow on an admitted successor (whitepaper §5.4). Payload `(uint256 chainId, bytes32 successorId, address escrow, uint256 realisedUnits, uint256 anchoredBase)`.
+        Recovery
+    }
+
+    enum Verdict {
+        None,
+        Uphold,
+        Reject
+    }
+
+    enum Stage {
+        None,
+        /// Asserted; challengeable until the window closes, challenged or not.
+        Challenge,
+        /// Challenged and past the evidence window: a round is being drawn, voted or awaits its appeal.
+        Rounds,
+        /// The loser of the appeal escalated; the governor decides uphold or retrial.
+        Escalated,
+        /// The governor upheld the appeal verdict; awaiting `finalize`.
+        Decided,
+        Final
+    }
+
+    struct Case {
+        address asserter;
+        uint8 kind;
+        uint8 stage;
+        /// The round in progress or last held: 1, 2, 3. Zero before the first draw is armed.
+        uint8 round;
+        /// The final verdict, once final.
+        uint8 outcome;
+        address challenger;
+        uint64 openedAt;
+        uint64 escalatedAt;
+        /// Frozen at the opening (G8; whitepaper §6.2, §6.5): κ, the slash and the five windows in days.
+        uint16 coverBps;
+        uint16 slashBps;
+        uint16 challengeDays;
+        uint16 evidenceDays;
+        uint16 commitDays;
+        uint16 revealDays;
+        uint16 appealDays;
+        bytes32 payloadHash;
+        /// Committed at the opening, before any draw (yellow paper §4.1 "Randomness").
+        bytes32 seed;
+        /// V: the bond principal the finding can move, in QRL; for a recovery, its escrow's residual P_rem (OC-COURT-05).
+        uint128 value;
+        /// ARK one seat holds and slashes against: s_min of yellow paper §4.1.
+        uint128 seat;
+        /// D_1, in QRL; the appeal posts 2 D_1 and the escalation 4 D_1.
+        uint128 deposit;
+        /// Deposits posted by the asserter [0] and the challenger [1].
+        uint128[2] posted;
+        /**
+         * A value slice of a single fact (whitepaper §6.2, EC-04; appended
+         * 2026-09-30): the group — the assertion's own case id, which the
+         * bond's determination and slice group carry — this slice's index
+         * and the group's count; zero `slices` for a case heard whole.
+         */
+        bytes32 group;
+        uint8 sliceIndex;
+        uint8 slices;
+    }
+
+    struct Round {
+        /// The veARK snapshot the bonus is read at.
+        uint64 armBlock;
+        /// The target block, `DRAW_LOOKAHEAD` (8) after the arm: its hash draws the panel, in any of the 256 blocks after it (QL-18).
+        uint64 drawBlock;
+        uint64 commitEnd;
+        uint64 revealEnd;
+        /// The appeal window of round 1, the escalation window of round 2; the reveal's end in a retrial.
+        uint64 appealEnd;
+        uint16 upholds;
+        uint16 rejects;
+        uint8 verdict;
+        /// When the round was first armed, and when its draw window last opened (phase C3b, court question w).
+        uint64 armedAt;
+        uint64 windowOpens;
+        /// Draw windows that lapsed without a panel, each counted at the re-arm that opens the next.
+        uint8 lapses;
+        /**
+         * The seat this round draws at: the case's own, fixed at its
+         * assertion as the minimum juror stake indexed on V_max then (PV-07),
+         * the same in every round and every re-arm (re-audit 2026-09-30,
+         * COURT-01), so the pool's per-case seat never mismatches.
+         */
+        uint128 seat;
+    }
+
+    struct Vote {
+        bytes32 commitment;
+        uint8 vote;
+    }
+
+    event AssertionOpened(
+        bytes32 indexed caseId,
+        uint8 indexed kind,
+        address indexed asserter,
+        bytes payload,
+        bytes32 evidence,
+        uint256 value,
+        uint256 seatStake,
+        uint256 deposit
+    );
+    event Challenged(bytes32 indexed caseId, address indexed challenger, uint256 deposit);
+    event EvidenceSubmitted(bytes32 indexed caseId, address indexed by, bytes32 evidence);
+    event DrawArmed(bytes32 indexed caseId, uint8 round, uint256 drawBlock);
+    event JuryDrawn(bytes32 indexed caseId, uint8 round, uint16 jurySize, bytes32 drawSeed);
+    event VoteCommitted(bytes32 indexed caseId, address indexed juror, bytes32 commitment);
+    event VoteRevealed(bytes32 indexed caseId, address indexed juror, uint8 vote);
+    event RoundDecided(bytes32 indexed caseId, uint8 round, uint8 verdict, uint16 upholds, uint16 rejects);
+    event Appealed(bytes32 indexed caseId, uint8 newRound, uint256 newBond);
+    event EscalatedToGovernance(bytes32 indexed caseId, address indexed by, uint256 bond);
+    event EscalationResolved(bytes32 indexed caseId, bool retrial);
+    /// `toBuffer`: what the losing deposits leave where the assertion failed, forfeited into the fee pool (OC-COURT-07).
+    event CaseFinal(bytes32 indexed caseId, uint8 outcome, uint256 jurorFees, uint256 fromFeePool, uint256 toBuffer);
+    /// A round whose panel could not be drawn lapsed: in round one the assertion is rejected and every deposit refunded (phase C3b); later, the previous round's verdict stands (QL-19).
+    event DrawLapsed(bytes32 indexed caseId, uint8 round, uint8 lapses);
+    /// Too few jurors were eligible at the arm: the arm is spent, and the round is armed again once its window has passed.
+    event PanelUnseatable(bytes32 indexed caseId, uint8 round);
+    /// Emitted by the findings module inside the court's delegatecall, so at the court's address.
+    event FindingApplied(bytes32 indexed caseId, uint8 kind);
+    event FindingRefused(bytes32 indexed caseId, uint8 kind, bytes reason);
+    event FeePoolFunded(address indexed by, uint256 amount);
+    event Claimed(address indexed to, uint256 amount);
+
+    error IncorrectBond(uint256 required, uint256 supplied);
+    error InvalidCaseState(bytes32 caseId, uint8 stage);
+    error NotADrawnJuror(bytes32 caseId, address caller);
+    error RevealMismatch(bytes32 caseId, address juror);
+    error WindowClosed(bytes32 caseId, uint256 closedAt);
+    error WindowOpen(bytes32 caseId, uint256 closesAt);
+    error NotTheLoser(bytes32 caseId, address caller);
+    error NotEscalated(bytes32 caseId);
+    error OnlyGovernor(address caller);
+    error BadPayload();
+    error PoolAtCapacity(uint256 open, uint256 cap);
+    error FindingNotDelivered(bytes reason);
+    error NotDrawBlock(uint256 drawBlock, uint256 current);
+    error NothingOwed(address caller);
+    error TransferFailed();
+    /// A loss, censorship or severity finding valued at zero moves nothing and is not heard (QL-20).
+    error NothingToMove();
+    /// A single-fact finding of this kind is already open (QL-23); or, for a loss, the asserter's one loss as an outsider (OC-COURT-02).
+    error FindingPending(uint8 kind);
+    /// A call to the bond failed with less than an eighth of its gas left: retried with enough, never recorded (QL-22).
+    error DeliveryStarved(uint256 gasGiven);
+
+    /**
+     * Assert a finding against the deposit `ArkCourtFindings.quoteFor` gives,
+     * `D_1 = max(ceil(base_orig * refPrice_a), ceil(V / 100), 7 * fee)` per
+     * case (yellow paper §5.1), where V is the bond principal the finding can
+     * move. A bond below the deposits reverts `IncorrectBond`; one above them
+     * is admitted, the excess owed to the sender (technical reference §1.8).
+     * Opens a determination on the bond for a loss or the censorship ground —
+     * issuance suspends and maturities inside the cycle are held from this
+     * block.
+     */
+    function assertFinding(uint8 kind, bytes calldata payload, bytes32 evidence) external payable returns (bytes32 caseId);
+
+    /// Contest an assertion inside its challenge window, against the same deposit.
+    function challenge(bytes32 caseId) external payable;
+
+    /// Emit evidence for the record, until the evidence window closes. Anyone.
+    function submitEvidence(bytes32 caseId, bytes32 evidence) external;
+
+    /// Fix the target block of the round awaiting its panel, eight blocks ahead; again once its 256-block window passed undrawn. Anyone.
+    function armDraw(bytes32 caseId) external;
+
+    /// Draw the panel from the target block's hash, in any of the 256 blocks after it: the same panel in each. Anyone.
+    function drawPanel(bytes32 caseId) external;
+
+    /**
+     * Resolve a case whose panel cannot be drawn (too few eligible jurors),
+     * once its round has been re-armed after `MAX_DRAW_LAPSES` lapsed draw
+     * windows or `MAX_DRAW_LAPSES` draw windows have passed since it was first
+     * armed. In round one the assertion is rejected and every deposit is
+     * refunded; a determination can always be asserted again. In a later
+     * round the previous round's verdict stands and the case is decided on it,
+     * closed by `finalize` like any other (QL-19). A challenged case nobody
+     * armed lapses as a first round once its evidence window and
+     * `MAX_DRAW_LAPSES` draw windows have passed (OC-COURT-08). Anyone.
+     */
+    function lapseDraw(bytes32 caseId) external;
+
+    /// @param commitment `voteCommitment(caseId, round, vote, salt, juror)`.
+    function commitVote(bytes32 caseId, bytes32 commitment) external;
+
+    function revealVote(bytes32 caseId, uint8 vote, bytes32 salt) external;
+
+    /// The loser of the first round, inside the appeal window, against twice the deposit.
+    function appeal(bytes32 caseId) external payable;
+
+    /// The loser of the appeal, inside the escalation window, against twice the appeal deposit.
+    function escalateToGovernance(bytes32 caseId) external payable;
+
+    /// Close the case once its outcome is fixed; `payload` is the asserted one, needed where the finding stands. Anyone.
+    function finalize(bytes32 caseId, bytes calldata payload) external;
+
+    /// Pay what the caller is owed: deposits returned, the winner's share, juror fees.
+    function claim() external;
+
+    /// The juror fee pool of whitepaper §6.2: anyone may fund it; it pays what it holds.
+    function fundFeePool() external payable;
+
+    function caseOf(bytes32 caseId) external view returns (Case memory);
+    function roundOf(bytes32 caseId, uint8 round) external view returns (Round memory);
+    function voteOf(bytes32 caseId, address juror) external view returns (Vote memory);
+    function isDrawnJuror(bytes32 caseId, address juror) external view returns (bool);
+    function voteCommitment(bytes32 caseId, uint8 round, uint8 vote, bytes32 salt, address juror)
+        external
+        pure
+        returns (bytes32);
+}

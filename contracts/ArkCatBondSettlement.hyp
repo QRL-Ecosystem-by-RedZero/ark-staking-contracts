@@ -1,0 +1,623 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./ArkCatBondStore.hyp";
+import "./ArkCatBondRecovery.hyp";
+
+import "./utils/ArkStakeLeaves.hyp";
+import "./interfaces/IArkFlow.hyp";
+
+/**
+ * Build 2 of `ArkCatBond`: the settlement of both triggers, the settlement
+ * entitlement and the trigger draw on the run-off queue at its weight —
+ * executed in the bond's own storage via `delegatecall`, reached through the
+ * bond's `fallback`. The claimant record and the subrogation recovery run one
+ * module further, in `ArkCatBondRecovery`, which this module's own `fallback`
+ * reaches the same way (phase C3b).
+ *
+ * THE ONE RULE
+ * ------------
+ * **Bond principal leaves the pool to settle a trigger only in the quantity the
+ * waterfall of whitepaper §5.2 determines, junior before senior, and the bond
+ * recovers afterwards at most what it paid, senior before junior** (I11, I14,
+ * I21, I23′, I36, I37). Every draw here is one write per class — holdings are
+ * shares of a class's principal — and every payment is pulled by the party it
+ * is owed to, so nothing iterates holdings or positions except the list a
+ * determination itself names.
+ *
+ * WHY A THIRD BODY OF CODE, AND A FOURTH
+ * --------------------------------------
+ * `ArkCatBondExit`'s reason: the bond's v3 runtime cannot hold this beside
+ * what it already carries. Not created by the bond's constructor, as the exit
+ * module is — its creation code beside the exit module's would put the bond's
+ * initcode past EIP-3860 — but deployed first on the bond's five
+ * dependencies and named in the bond's constructor, which checks them and
+ * fixes the address in an immutable. Phase C3b's claimant record and
+ * per-escrow subrogation did not fit beside the settlement either (v3 runtime
+ * 23,317 of 24,576 before it), so they are `ArkCatBondRecovery`, deployed
+ * first again and named in THIS module's constructor, which checks it the
+ * same way (`ModuleMismatch`) and delegatecalls every selector it does not
+ * declare there. All three inherit the one storage declaration of
+ * `ArkCatBondStore`: no setter, no admin, not a proxy. Called directly a
+ * module acts on its own empty storage and holds no value (`inBond` refuses
+ * every state change there).
+ *
+ * WHAT THE COURT IS, HERE
+ * -----------------------
+ * The product's court (whitepaper §6.2) pushes four facts, from the account
+ * the bond names as its court: a trigger-1 determination's list of positions
+ * and losses (`determineLoss`), the censorship ground (`determineCensorship`),
+ * the m_loss of a held balance (`fixSeverity`) and a recovery's realised
+ * escrow on an admitted successor (`openRecovery`). Each is refused unless
+ * the bond's own record admits it. Since the value slices of 2026-09-30
+ * (EC-04) the last three and the closing of a slice (`closeSlice`) run in
+ * the recovery module, and the opening of a group of slices (`openSlices`)
+ * with them since the re-audit of 2026-09-30 (this module's v3 room); this
+ * one keeps the opening of trigger 2 (and of a declaration on a censorship
+ * ground's remainder), the measured severity (`settleSeverity`) and the
+ * entitlement, and the draw itself (`_drawTo`, `_rehold`, `_settleBalance`)
+ * is the store's, shared by both. Since the audit of 2026-10-03
+ * (OC-COURT-01) every finding's body — trigger 1's included — runs in
+ * `ArkCatBondDeterminations`, behind stubs of the same selectors here and in
+ * the recovery module, so each draws no more than the V it was admitted at.
+ *
+ * TRIGGER 2 SINCE PAPERS SYNC 5 (phase C3b)
+ * -----------------------------------------
+ * Every claimant recorded as of T — the ratification, or the court's
+ * censorship determination — weighs its recorded principal times its vesting
+ * factor at T; W is the sum. At the opening the settlement price (§5.5), W
+ * and the pool fix `S_full = min(pool, W * price / (BPS * PRICE_SCALE))`, and
+ * each draw is `D * S_full / BPS` — D_0 at the opening, D_total after the
+ * assessment window: the severity applies AFTER the one haircut. A claimant is
+ * owed `draw * w_p / W` of each (`ArkStakeMath.trigger2Entitlement`, the
+ * balance as the difference of two entitlements).
+ */
+contract ArkCatBondSettlement is ArkCatBondStore {
+    uint256 private constant PRICE_SCALE = 1e18;
+
+    /// The residual draw of the Cushion, by the id its entitlements are claimed under (technical reference §1.7).
+    bytes32 private constant T2_CUSHION = keccak256("ARK_T2_CUSHION");
+
+    /// This module's own address: under a delegatecall `address(this)` is the bond's.
+    address private immutable SELF;
+
+    /// Where the claimant record and the subrogation run (`ArkCatBondRecovery`), fixed here.
+    address public immutable RECOVERY_MODULE;
+
+    /// Where trigger 1 runs (`ArkCatBondDeterminations`): the recovery module's, read at construction.
+    address private immutable DETERMINATIONS_MODULE;
+
+    constructor(
+        address registry_,
+        address params_,
+        address coupon_,
+        address qday_,
+        address attestation_,
+        address recovery_
+    ) ArkCatBondStore(registry_, params_, coupon_, qday_, attestation_) {
+        SELF = address(this);
+        ArkCatBondStore r = ArkCatBondStore(recovery_);
+        if (
+            recovery_.code.length == 0 || address(r.REGISTRY()) != registry_ || address(r.PARAMS()) != params_
+                || address(r.COUPON()) != coupon_ || address(r.QDAY()) != qday_
+                || address(r.ATTESTATION()) != attestation_
+        ) revert ModuleMismatch(recovery_);
+        RECOVERY_MODULE = recovery_;
+        // Created by the recovery module's constructor on the same five
+        // dependencies (OC-COURT-01): trigger 1 runs there, through the stub
+        // `determineLoss`.
+        address d = ArkCatBondRecovery(recovery_).DETERMINATIONS_MODULE();
+        if (d.code.length == 0) revert ModuleMismatch(d);
+        DETERMINATIONS_MODULE = d;
+    }
+
+    /// Only through the bond: called directly this contract's storage is an empty book.
+    modifier inBond() {
+        if (address(this) == SELF) revert ZeroAddress();
+        _;
+    }
+
+    /**
+     * The recovery module: every selector this module does not declare runs
+     * there, on the bond's storage (a delegatecall inside the bond's own
+     * delegatecall keeps the bond's storage, caller and value), its result or
+     * revert returned byte for byte. Refused outside the bond, so a direct call
+     * cannot run the recovery code on this module's own storage either.
+     */
+    fallback() external {
+        _forward(RECOVERY_MODULE);
+    }
+
+    /// Run this call in module `m`, in the bond's storage, and end with its result or revert.
+    function _forward(address m) private {
+        if (address(this) == SELF) revert ZeroAddress();
+        /// @hyperion memory-safe-assembly
+        assembly {
+            let p := mload(0x40)
+            calldatacopy(p, 0, calldatasize())
+            let ok := delegatecall(gas(), m, p, calldatasize(), 0, 0)
+            returndatacopy(p, 0, returndatasize())
+            if iszero(ok) { revert(p, returndatasize()) }
+            return(p, returndatasize())
+        }
+    }
+
+    function _book() private view returns (IArkStakeSettlementBook) {
+        return IArkStakeSettlementBook(address(REGISTRY));
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Trigger 1. Whitepaper §5.1, §5.2; yellow paper §1.4                 */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Settle a trigger-1 determination through the waterfall of whitepaper
+     * §5.2. Court only, on a determination the court opened, drawing no more
+     * than the V the court admitted it at (OC-COURT-01).
+     *
+     * Runs in `ArkCatBondDeterminations` (the recovery module creates it;
+     * this one reads its address there at construction): this module's v3
+     * room could not take the bound on V. Forwarded unchanged; the selector,
+     * events and refusals are where they were.
+     */
+    function determineLoss(bytes32, bytes32[] calldata, uint256[] calldata, uint256) external {
+        _forward(DETERMINATIONS_MODULE);
+    }
+
+    /**
+     * Name where the buffer's part of a position's trigger-1 settlement is paid
+     * on the origin chain, and emit the loss leaf the quorum seals for the
+     * escrow's `settleLoss` (whitepaper §3.5, yellow paper §2.2). The bound
+     * beneficiary alone, under ML-DSA-87; once per position per determination.
+     * The quantity was fixed in units of the origin asset at the
+     * determination, so no rebase before the payment reduces it (D13).
+     */
+    function nameLossDestination(bytes32 determinationId, bytes32 stakeAssetId, address destination)
+        external
+        inBond
+        nonReentrant
+        returns (bytes32 leaf)
+    {
+        LossPart storage lp = _lossParts[determinationId][stakeAssetId];
+        if (lp.bufferUnits == 0) revert NotClaimant(stakeAssetId);
+        if (lp.named) revert AlreadyClaimed(stakeAssetId);
+        IArkStakeRegistry.Anchor memory a = _beneficiary(stakeAssetId);
+        _requireOriginAddress(destination);
+        lp.named = true;
+        _bufferUnnamed -= lp.bufferUnits;
+        leaf = ArkStakeLeaves.lossLeaf(a.chainId, a.escrow, determinationId, stakeAssetId, destination, lp.bufferUnits);
+        emit LossLeafSealed(determinationId, stakeAssetId, a.chainId, a.escrow, destination, lp.bufferUnits, leaf);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Trigger 2. Whitepaper §4.6, §5.1, §5.2; yellow paper §3.4; I37      */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Open the trigger-2 settlement: the floor draw D_0 (whitepaper §4.6,
+     * §5.2). Anyone, once, from the ratification — or, on the censorship
+     * ground, from the court's finding — and only on a complete claimant
+     * record (`recordClaimants`, the recovery module): a declaration's once
+     * every position still anchored has been recorded (`live` equal to the
+     * registry's `totalAnchored`; nothing can be released after the
+     * ratification, so nothing leaves the book it is compared against) and
+     * the forward root of the epoch before the ratification's is accepted
+     * (audit 2026-09-22, G6), the
+     * censorship ground's once the positions anchored at the determination
+     * sum to the anchored notional read then, and the qualifying releases to
+     * the court's figure — or the assessment window has elapsed since the
+     * finding, so a transit figure no record can meet does not hold the
+     * settlement for ever.
+     *
+     * Fixed here, for every later draw of this settlement (G8): D_0, S_floor
+     * and W_a in force now, the settlement price (§5.5), the bounded series
+     * m_loss is later measured from, the claimants' base and W, and the pool.
+     */
+    function settleDeclaration() external inBond closedFirst nonReentrant {
+        IArkStakeSettlementBook book = _book();
+        // A declaration ratified after the censorship ground settled opens on
+        // the remainder the ground did not reach (re-audit 2026-09-30,
+        // COURT-04), once; nothing else follows an opening.
+        if (_t2.stage != 0) {
+            if (!_openRemainder(book)) revert DeclarationAlreadySettled();
+            return;
+        }
+        _groundDeclaration();
+        Claimants storage c = _claim;
+        if (c.ground == GROUND_DECLARATION) {
+            uint256 live = book.totalAnchored();
+            if (c.live != live) revert ClaimantsIncomplete(c.live, live);
+            // Not before every anchor the forward roots through the epoch
+            // preceding the ratification's prove is recorded and in the record
+            // (whitepaper §5.2; audit 2026-09-22, G6; audit 2026-09-29,
+            // QL-06): a deposit of those epochs is a claimant, and until its
+            // proof is recorded it is in neither the record nor the book the
+            // record is complete against. That root's count leaf says how many
+            // there are, cumulatively (`provePriorAnchors`; re-audit
+            // 2026-09-30, BOND-02: a count of that root alone let a late-sealed
+            // earlier root's deposit be left out); the relayer seals a root,
+            // with its count, for every closed epoch, a quiet one included
+            // (QL-05). The wait lapses W_a epochs after T, at the W_a in force
+            // at the grounding (the papers' rule): an anchor still unrecorded
+            // then is excluded from this declaration — no trigger-2 claim —
+            // and the count excluded is emitted.
+            if (!_priorProven || _priorRecorded < _priorCount) _priorAnchorsLapse(uint256(c.at));
+        } else {
+            if (c.anchored != c.baseAtT) revert ClaimantsIncomplete(c.anchored, c.baseAtT);
+            (,, uint16 windowEpochs,) = PARAMS.trigger2Params();
+            if (
+                c.transit != c.transitFound
+                    && ArkEpoch.current() < ArkEpoch.epochOf(uint256(c.at)) + uint256(windowEpochs)
+            ) revert ClaimantsIncomplete(c.transit, c.transitFound);
+        }
+        _syncLoss();
+        (uint256 price, uint256 refOpen) = _openingPrices(book);
+        _openTrigger2(price, refOpen);
+        // The censorship ground settles at its opening; a declaration already
+        // ratified opens on its remainder in the same call.
+        _openRemainder(book);
+    }
+
+    /**
+     * A ratified declaration on the part of the full settlement a settled
+     * censorship ground did not reach (re-audit 2026-09-30, COURT-04; the
+     * model's `declarationRemainderFraction` and `trigger2Settlement(...,
+     * remainder)`): the same claimant record and S_full, z continuing from
+     * the ground's `U * D_0`, the floor `(1 - U) * D_0` drawn now and the
+     * severity on `1 - U` after a fresh assessment window measured from the
+     * reading now, as a declaration's balance is — held, measured, or fixed
+     * by the court. U is exact: every increment of the ground's z was a
+     * fraction times D_0. A remainder of zero (every slice upheld) opens
+     * nothing and only lifts the hold. Returns whether it ran.
+     */
+    function _openRemainder(IArkStakeSettlementBook book) private returns (bool) {
+        Declaration storage t = _t2;
+        if (!t.censorship || t.stage != T2_SETTLED || _onRemainder || !QDAY.declared()) return false;
+        _onRemainder = true;
+        uint256 d0 = uint256(t.d0);
+        uint256 remainder = ArkStakeMath.SLICE_SCALE - (d0 == 0 ? 0 : t.z / d0);
+        if (remainder != 0) {
+            _syncLoss();
+            (, uint256 refOpen) = _openingPrices(book);
+            t.refOpen = refOpen;
+            t.epoch = uint64(ArkEpoch.current());
+            t.z += remainder * d0;
+            t.phiOpen = remainder;
+            t.stage = T2_WINDOW;
+            _drawTo(T2_REMAINDER, type(uint256).max);
+            emit DeclarationOnRemainder(remainder, refOpen);
+        }
+        return true;
+    }
+
+    /**
+     * The settlement and reference prices the opening fixes, each read through
+     * `try`. Where the oracle is dead at the opening — either read reverts or
+     * is zero — the settlement opens at the registry's carried price, the
+     * last reference price accepted outside the breaker (audit 2026-09-29,
+     * QL-07): D_0 is drawn on it and the balance follows item 25a's rule, HELD
+     * while the series stays silent and fixed by the court after 2 x W_a, so a
+     * dead oracle no longer holds every principal with no path forward (I37).
+     * Only a registry that has never marked a price leaves nothing to open at.
+     */
+    function _openingPrices(IArkStakeSettlementBook book) private returns (uint256 price, uint256 refOpen) {
+        try book.settlementPrice() returns (uint256 p) {
+            price = p;
+        } catch {}
+        try book.referencePrice() returns (uint256 r) {
+            refOpen = r;
+        } catch {}
+        if (price != 0 && refOpen != 0) return (price, refOpen);
+        (uint256 carried,,) = book.carriedPrice();
+        if (refOpen == 0) refOpen = carried;
+        // After the breaker has fired, the lesser of the carried price and the
+        // floor it has compounded down to since (re-audit 2026-09-30, BOND-05;
+        // the registry's `deadOracleOpeningPrice`).
+        if (price == 0) price = book.deadOracleOpeningPrice();
+        emit OpenedAtCarriedPrice(price, refOpen);
+    }
+
+    /**
+     * The wait for the anchors of the root of `epochOf(T) - 1` (QL-06): refused
+     * until W_a epochs have passed since T; after that the opening proceeds
+     * and the anchors unrecorded are excluded, counted in `AnchorsExcluded`
+     * (zero and `counted == false` where the root's count was never proven).
+     */
+    function _priorAnchorsLapse(uint256 at) private {
+        uint256 prior = ArkEpoch.epochOf(at) - 1;
+        // W_a in force at the grounding, not now (re-audit 2026-09-30, BOND-09).
+        if (ArkEpoch.current() < prior + 1 + uint256(_waAtT)) {
+            if (!_priorProven) revert RootUnadmitted(prior);
+            revert AnchorsUnrecorded(_priorRecorded, _priorCount);
+        }
+        // Saturating (BOND-09): a record past the count can never revert the lapse.
+        uint256 count = _priorCount;
+        uint256 recorded = _priorRecorded;
+        emit AnchorsExcluded(prior, count > recorded ? count - recorded : 0, _priorProven);
+    }
+
+    /// The group of value slices before the court, zero where none.
+    function sliceGroup() external view returns (SliceGroup memory) {
+        return _group;
+    }
+
+    function _openTrigger2(uint256 price, uint256 refOpen) private {
+        if (price == 0 || refOpen == 0) revert SeverityUnmeasurable();
+        Declaration storage t = _t2;
+        Claimants storage c = _claim;
+        (uint16 d0, uint16 severityFloor, uint16 windowEpochs, uint16 move) = PARAMS.trigger2Params();
+        bool censorship = c.ground == GROUND_CENSORSHIP;
+        t.censorship = censorship;
+        t.d0 = d0;
+        t.severityFloor = severityFloor;
+        t.windowEpochs = windowEpochs;
+        // The clamp on every measured severity (PV-03): 6,835 bps at the
+        // reference m_epoch 2,500 and W_a 4.
+        t.severityCeiling = uint16(ArkStakeMath.measuredSeverityCeilingBps(move, windowEpochs));
+        t.epoch = uint64(ArkEpoch.current());
+        t.declaredAt = c.at;
+        t.price = price;
+        t.refOpen = refOpen;
+        t.base = c.anchored + c.transit;
+        t.weight = c.weight;
+        t.pool = outstandingPrincipal();
+        // K_T (whitepaper §5.2, EC-02): the capital requirement of §4.3 on
+        // the claimants' recorded principal N_T — the anchored claimants and,
+        // on the censorship ground, the qualifying releases — at the
+        // attachment fixed at the grounding. The requirement the premium was
+        // charged against, so an over-covered book draws D of K_T and no more.
+        t.capUnits = ArkStakeMath.trigger2CapUnits(t.base, c.att);
+        t.fullSettlement = ArkStakeMath.trigger2FullSettlement(c.weight, t.pool, price, t.capUnits);
+        t.sharesAt = _shares;
+        t.genAt = _gen;
+        uint256 cap = type(uint256).max;
+        if (censorship) {
+            // The floor is all the ground draws (item 25b), and of it the
+            // fraction U its upheld slices found, held in z until now
+            // (whitepaper §6.2, EC-04): z = U * D_0. The ground stands only
+            // once every slice has closed (re-audit 2026-09-30, COURT-04), so
+            // nothing is open and the settlement is settled at once. No more
+            // than the V its upheld slices were admitted at (OC-COURT-01): a
+            // declaration ratified later opens on the same S_full and z, so
+            // its draw on the remainder is the declaration's floor in full.
+            t.z = t.z * d0;
+            t.stage = T2_SETTLED;
+            cap = _censorshipValue;
+        } else {
+            // A declaration: D_0 of the whole, the balance judged after the
+            // assessment window, on the whole object (φ_open = the whole).
+            t.z = uint256(d0) * ArkStakeMath.SLICE_SCALE;
+            t.phiOpen = ArkStakeMath.SLICE_SCALE;
+            t.stage = T2_WINDOW;
+        }
+        _drawTo(T2_FLOOR, cap);
+    }
+
+    /**
+     * The severity balance, at or after the close of the assessment window
+     * (whitepaper §4.6). Anyone.
+     *
+     * The thirty-day series measured against its reading at the opening gives
+     * m_loss; the balance is drawn to `max(D_0, S)` of S_full, `S =
+     * clamp(m_loss, S_floor, 1 - (1 - m_epoch)^W_a)` (PV-03: the clamp holds on
+     * every measured path), and what it does not reach stays with its class —
+     * "released back" is the absence of a draw. The second reading is the one
+     * the registry recorded at the boundary W_a epochs after the opening, or
+     * the first it recorded after that (EC-01, PV-03): fixed by the opening,
+     * never by the caller's moment. The registry records a reading at the
+     * first touch after each boundary, outside the breaker; this call sends
+     * one first (`markPremium`). Where no reading is recorded the balance is
+     * HELD in its classes, neither drawn nor released (I37): the reading
+     * defaults to nothing, so neither leg gains from impairing it. A held
+     * balance is settled here once a later reading is recorded — whatever of
+     * it value slices have not settled (whitepaper §6.2) — or by the court
+     * (`fixSeverity`, `closeSlice`, in the recovery module).
+     */
+    function settleSeverity() external inBond closedFirst nonReentrant {
+        Declaration storage t = _t2;
+        uint8 stage = t.stage;
+        if (stage == T2_WINDOW) {
+            uint256 closes = uint256(t.epoch) + uint256(t.windowEpochs);
+            if (ArkEpoch.current() < closes) revert AssessmentWindowOpen(closes);
+        } else if (stage != T2_HELD) {
+            revert NothingHeld();
+        }
+        _syncLoss();
+
+        (bool measured, uint256 loss) = _measure();
+        if (measured) {
+            // The whole of what is open, at the measured draw.
+            _settleBalance(T2_BALANCE, t.phiOpen, loss, false);
+            return;
+        }
+        if (stage == T2_HELD) revert SeverityUnmeasurable();
+
+        // The principal a total severity would draw above the floor draw,
+        // `S_full - floor(D_0 * S_full / BPS)` (the model's
+        // `trigger2HeldPrincipal`, `slicedHeldPrincipal` with nothing
+        // settled), junior first — exactly what any later draw can reach. It
+        // stays in its class (deployed, earning the staking distribution for
+        // its holders), outside the coupon base and the conditional release,
+        // and each holding's pro-rata part of it stays until the hold settles.
+        t.stage = T2_HELD;
+        _rehold();
+    }
+
+    /**
+     * The close of the Cushion (yellow paper §4.5; technical reference §1.7;
+     * I11, I42). Anyone, once the settlement of a declaration has drawn its
+     * whole balance — a declaration ratified, not the censorship ground alone,
+     * nothing held and no slice open: draws what remains of the Cushion to
+     * the claimants of trigger 2, `min(N_C, floor(W * price / (BPS *
+     * PRICE_SCALE)) - drawn)` at the settlement price fixed at the opening,
+     * `drawn` every trigger-2 draw so far (the model's `cushionResidualDraw`),
+     * recorded on the vested weight fixed at the opening and paid by
+     * `claimSettlement`. It enters no P: `drawnByClass` is untouched, so the
+     * recovery of yellow paper §5.3 never counts it. The cushion lane then
+     * closes for good. What lies above the claimants' vested notional stays in
+     * the pool and reaches no account.
+     */
+    function drawCushionResidual() external inBond nonReentrant {
+        Declaration storage t = _t2;
+        if (!QDAY.declared() || (t.censorship && !_onRemainder)) revert DeclarationNotRatified();
+        if (t.stage != T2_SETTLED) revert DeclaredPendingSettlement();
+        if (_cushionClosed) revert IArkFlowReceiver.LaneClosed(ArkLanes.CUSHION);
+        uint256 value = (t.weight * t.price) / (BPS * PRICE_SCALE);
+        uint256 owed = value > t.drawn ? value - t.drawn : 0;
+        uint256 c = uint256(_cushion);
+        uint256 amount = owed < c ? owed : c;
+        _cushion = uint128(c - amount);
+        _cushionClosed = true;
+        t.drawn += amount;
+        if (amount != 0) _record(T2_CUSHION, KIND_T2, amount, t.weight);
+        emit CushionDrawn(T2_CUSHION, amount);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The entitlement. Yellow paper §1.4                                  */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Pay a position's settlement entitlement as far as the pool has reached it.
+     * The bound beneficiary, from the epoch after the determination (yellow
+     * paper §1.4: recorded in the following epoch).
+     *
+     * In QRL, from principal not deployed first and then as the exits
+     * requested under whitepaper §3.4 return it (`principalOwedNow` counts the
+     * entitlements, so `ArkBondStaking.requestExit` asks for them), in the
+     * order the determinations were recorded and pro rata within one. Fixed in
+     * quantity and not transferable; the wait reduces nothing.
+     */
+    function claimSettlement(bytes32 settlementId, bytes32 stakeAssetId)
+        external
+        inBond
+        nonReentrant
+        returns (uint256 amount)
+    {
+        Settlement storage s = _settlements[settlementId];
+        if (s.kind == 0 || ArkEpoch.current() <= uint256(s.epoch)) revert NotClaimant(stakeAssetId);
+        IArkStakeRegistry.Anchor memory a = _beneficiary(stakeAssetId);
+        uint256 mine = _partOf(s, settlementId, stakeAssetId, a);
+
+        _serve();
+        uint256 reached = _settleServed > uint256(s.cumBefore) ? _settleServed - uint256(s.cumBefore) : 0;
+        uint256 total = uint256(s.total);
+        if (reached > total) reached = total;
+        // Truncates, toward the entitlements still waiting. A determination
+        // the buffer met whole drew nothing from the bond and owes nothing here.
+        uint256 entitled = total == 0 ? 0 : (reached * mine) / total;
+        uint256 paid = _settlePaidTo[settlementId][stakeAssetId];
+        if (entitled <= paid) revert NothingDue(uint256(stakeAssetId));
+
+        amount = entitled - paid;
+        // Never past what is served (OC-ECON-06): the class draws are capped
+        // at exposure, so a settlement's total can fall a wei below the sum
+        // of its parts, and the checked pots would then refuse every claim.
+        uint256 left = _settleServed - _settlePaid;
+        if (amount > left) amount = left;
+        _settlePaidTo[settlementId][stakeAssetId] = entitled;
+        _settlePaid += amount;
+        emit SettlementClaimed(settlementId, stakeAssetId, msg.sender, amount);
+        _send(msg.sender, amount);
+    }
+
+    /**
+     * A position's whole part of one settlement: recorded per position under
+     * trigger 1; under trigger 2, a claimant of the record only, its
+     * entitlement `floor(draw * w_p / W)` on its vested weight at T — the
+     * floor draw's, or the balance's as the entitlement at the whole draw less
+     * the one at the floor draw (the model's `trigger2Entitlement` and
+     * `trigger2BalanceEntitlement`). The draws read are the ones actually
+     * taken, so the parts of a settlement never sum above what it drew.
+     */
+    function _partOf(Settlement storage s, bytes32 settlementId, bytes32 id, IArkStakeRegistry.Anchor memory a)
+        private
+        view
+        returns (uint256)
+    {
+        if (s.kind == KIND_T1) return uint256(_lossParts[settlementId][id].qrl);
+        if (_t2Kind[id] != CLAIMANT) revert NotClaimant(id);
+        uint256 w = _weightAtT(a.anchoredNotional, a.anchoredAt);
+        uint256 floorDraw = uint256(_settlements[T2_FLOOR].total);
+        if (settlementId == T2_FLOOR) return ArkStakeMath.trigger2Entitlement(floorDraw, s.base, w);
+        if (settlementId == T2_BALANCE) {
+            return ArkStakeMath.trigger2BalanceEntitlement(floorDraw, floorDraw + uint256(s.total), s.base, w);
+        }
+        // A value slice's own draw (whitepaper §6.2, EC-04): one record per
+        // increment, `floor(increment * w_p / W)` (`trigger2Entitlement`).
+        return ArkStakeMath.trigger2Entitlement(uint256(s.total), s.base, w);
+    }
+
+    /**
+     * Authorise what the balance can pay of the entitlements not yet reached:
+     * everything the contract holds outside the holder pots and what is
+     * already authorised and unpaid. Ahead of maturities and the queue, which
+     * wait for exits instead: a settlement determined is paid first.
+     */
+    function _serve() private {
+        uint256 waiting = _settleTotal - _settleServed;
+        if (waiting == 0) return;
+        // The Cushion is a pot (I42): an entitlement is paid from it only once a draw has moved it out.
+        uint256 pots =
+            _freePool + _principalOwed + _freeDust + (_settleServed - _settlePaid) + _reliefOwed + uint256(_cushion);
+        uint256 bal = address(this).balance;
+        uint256 free = bal > pots ? bal - pots : 0;
+        _settleServed += waiting < free ? waiting : free;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Views                                                               */
+    /* ------------------------------------------------------------------ */
+
+    /// The trigger-2 settlement as it stands.
+    function declaration() external view returns (Declaration memory) {
+        return _t2;
+    }
+
+    /// A position's place in the record (0 none, 1 claimant, 2 recorded after T) and its vested weight at T.
+    function claimantOf(bytes32 stakeAssetId) external view returns (uint8 kind, uint256 vestedWeight) {
+        kind = _t2Kind[stakeAssetId];
+        if (kind == CLAIMANT) {
+            IArkStakeRegistry.Anchor memory a = _book().anchorOf(stakeAssetId);
+            vestedWeight = _weightAtT(a.anchoredNotional, a.anchoredAt);
+        }
+    }
+
+    /// A settlement's record, and how far the entitlements have been authorised and paid across all of them.
+    function settlementOf(bytes32 settlementId)
+        external
+        view
+        returns (Settlement memory s, uint256 served, uint256 paid)
+    {
+        return (_settlements[settlementId], _settleServed, _settlePaid);
+    }
+
+    /// A position's two parts of a trigger-1 settlement.
+    function lossPartOf(bytes32 determinationId, bytes32 stakeAssetId) external view returns (LossPart memory) {
+        return _lossParts[determinationId][stakeAssetId];
+    }
+
+    /// What a position has drawn of a settlement.
+    function settlementPaidTo(bytes32 settlementId, bytes32 stakeAssetId) external view returns (uint256) {
+        return _settlePaidTo[settlementId][stakeAssetId];
+    }
+
+    /**
+     * The run-off queue's clean-age clock, and each class's queued shares at
+     * face and at their exposure weight as last measured (whitepaper §5.3,
+     * I26′; gap item 24).
+     */
+    function queueExposure()
+        external
+        view
+        returns (uint256 clock, uint256 queuedJunior, uint256 queuedSenior, uint256 weightedJunior, uint256 weightedSenior)
+    {
+        return (
+            _cleanClock,
+            _queuedShares[JUNIOR],
+            _queuedShares[SENIOR],
+            _weightedShares[JUNIOR],
+            _weightedShares[SENIOR]
+        );
+    }
+}

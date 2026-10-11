@@ -1,0 +1,1630 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/security/ReentrancyGuard.hyp";
+
+import "./interfaces/IArkCatBond.hyp";
+import "./interfaces/IArkStakeExternal.hyp";
+import "./interfaces/IArkStakeParams.hyp";
+import "./interfaces/IArkStakeRegistry.hyp";
+import "./lib/EvmWords.hyp";
+import "./utils/ArkEpoch.hyp";
+import "./utils/ArkStakeMath.hyp";
+import "./utils/QuantumErrors.hyp";
+
+/**
+ * The registry, as the settlement and recovery modules read it: the position
+ * record, the vesting factor, the buffer an escrow reported, and the capital
+ * model and prices at a determination. Narrow for `IArkStakeBook`'s reason.
+ */
+interface IArkStakeSettlementBook {
+    function anchorOf(bytes32 id) external view returns (IArkStakeRegistry.Anchor memory);
+    function vestingBpsOf(bytes32 id) external view returns (uint256);
+    function bufferOf(bytes32 key) external view returns (uint256 units, uint256 epoch);
+    function assetKey(uint256 chainId, address asset) external pure returns (bytes32);
+    function effectiveIndemnityBps() external view returns (uint256);
+    function effectiveAttachmentBps() external view returns (uint256);
+    function requiredCapital() external view returns (uint256);
+    function totalAnchored() external view returns (uint256);
+    function referencePrice() external view returns (uint256);
+    function settlementPrice() external view returns (uint256);
+    function breakerActive() external view returns (bool);
+    function carriedPrice() external view returns (uint256 carried, uint64 epoch, uint64 firedPlusOne);
+    function deadOracleOpeningPrice() external view returns (uint256);
+    function readingFrom(uint256 epoch) external view returns (uint256 price, uint256 readEpoch);
+    function markPremium() external;
+}
+
+/**
+ * Everything `ArkCatBond` and `ArkCatBondExit` share: every state variable, in
+ * the one declaration order, and the machinery both sides run.
+ *
+ * WHY THIS BASE EXISTS
+ * --------------------
+ * The QIP-55 compiler's 64-byte-word ABI plumbing grew every external
+ * function of the bond by about 21%, and EIP-170 did not move: the v3 runtime
+ * came out at 27,226 bytes against 24,576. Compiler flags could not close a
+ * gap that size (viaIR is WORSE on this line), so the cut is structural: the
+ * bond's exit machinery executes in a sibling contract, `ArkCatBondExit`, via
+ * `delegatecall`. Both contracts inherit this base, so the storage layout is
+ * shared BY CONSTRUCTION — the exact declarations of the one contract this
+ * used to be, `ReentrancyGuard` first, in the original order, appended to and
+ * never reordered. A layout kept equal by two hand-maintained copies would be
+ * a silent-corruption bug waiting for its editor; one declaration cannot
+ * diverge from itself.
+ *
+ * WHY THE DEPENDENCIES STAY IMMUTABLE
+ * -----------------------------------
+ * An immutable is not storage: the module cannot read the bond's through the
+ * delegatecall, so each dependency is either set again in the module's own
+ * constructor (the bond passes its arguments along in `new ArkCatBondExit`)
+ * or converted to storage the module reads at run time. All five stay
+ * immutable and are passed along, because the choice is priced in the BOND's
+ * runtime: a conversion to storage would put an SLOAD into every bond path
+ * that prices the book (`_closeBatch` reads PARAMS and COUPON on every
+ * boundary), while a second immutable costs the bond nothing and the module —
+ * which has thousands of bytes of room — one constructor argument. The values
+ * cannot diverge: the bond's constructor is the only thing that ever
+ * constructs the module, and it hands over the same arguments it keeps.
+ *
+ * The `nonReentrant` guard is shared the same way: `ReentrancyGuard._status`
+ * is one storage slot of the bond, written by whichever side's modifier runs,
+ * so a moved function is guarded against re-entering an unmoved one and the
+ * other way round — provided the bond's thin stubs are NOT also nonReentrant,
+ * which would deadlock against the module's own prologue.
+ */
+abstract contract ArkCatBondStore is IArkCatBond, IArkCatBondView, ReentrancyGuard {
+    /* ------------------------------------------------------------------ */
+    /* Constants                                                           */
+    /* ------------------------------------------------------------------ */
+
+    uint256 internal constant BPS = 10000;
+
+    /// The scale the per-share indices carry, as `VeArk` and `StakingVault` carry it.
+    uint256 internal constant ACC = 1e18;
+
+    uint8 internal constant JUNIOR = 0;
+    uint8 internal constant SENIOR = 1;
+
+    /**
+     * The admitted terms of whitepaper §6.3 — three months, one year, three
+     * years — counted in EPOCHS rather than in days.
+     *
+     * A maturity has to land on an epoch boundary, because the ladder is keyed
+     * by epoch and the coupon is paid per epoch, and none of 90, 365 or 1,095
+     * days is a whole number of seven-day epochs (12.86, 52.14, 156.43). An
+     * epoch count needs no scaling under a time-compressed build profile
+     * either, because the epoch itself scales, so there is nothing left for
+     * `scripts/lib/profile.js` to get right or wrong. 91, 364 and 1,092 days.
+     *
+     * A `constant` although §6.3 makes the set governable, for the reason
+     * `ArkEpoch` gives about the epoch length: a maturity epoch is the key the
+     * ladder, the queue and every holding are recorded under, so a vote that
+     * moved a term would repoint records rather than adjust a rate.
+     */
+    uint16 internal constant TERM_QUARTER_EPOCHS = 13;
+    uint16 internal constant TERM_YEAR_EPOCHS = 52;
+    uint16 internal constant TERM_THREE_YEAR_EPOCHS = 156;
+
+    /**
+     * The conditional release of whitepaper §5.3: principal above the capital
+     * requirement is returned where utilisation stays below this for this many
+     * consecutive epochs.
+     *
+     * Constants, and NOT parameters. §5.3 states both as figures and §6.3's table
+     * of governable parameters lists neither, so `IArkStakeParams.Params` carries
+     * neither — the sibling model's `releaseUtilisationBps` and `releaseEpochs`
+     * are the same two figures on the same footing. Recorded as an open item:
+     * whether they should be governable is a question for the whitepaper.
+     */
+    uint256 internal constant RELEASE_UTILISATION_BPS = 2500;
+    uint8 internal constant RELEASE_EPOCHS = 2;
+
+    /**
+     * Whole epochs between an epoch's close and its coupon: the settlement
+     * window of `t` closes four days into `t + 2` (`ArkEpoch.settlementCloses`),
+     * so the coupon of the last two closed epochs is not yet known.
+     */
+    uint256 internal constant SETTLEMENT_LAG_EPOCHS = 2;
+
+    /**
+     * The least subscription, so a maturity epoch cannot be occupied for a
+     * rounding wei and the share arithmetic never divides by a dust balance.
+     */
+    uint256 internal constant MIN_SUBSCRIPTION = 1e15;
+
+    /**
+     * The most epochs one call closes. Each closed epoch writes a base into the
+     * coupon account, so an unbounded gap would make every path that crosses the
+     * boundary cost more gas than a block holds, for ever. A longer gap is closed
+     * by `closeEpochs` in batches, and every other path refuses by name until it
+     * has been.
+     */
+    uint256 internal constant MAX_CLOSE = 32;
+
+    /**
+     * The clean ages at which a queued cohort's weight can still stand above
+     * the exposure floor, for every admissible decay and floor: the weight is
+     * `BPS - decay * age`, decay is at least 1,000 and the floor at least
+     * 2,000 (whitepaper §6.3), so from an age of eight every weight is the
+     * floor. Cohorts that old are kept together in one bucket per class.
+     */
+    uint256 internal constant QUEUE_AGES = 8;
+
+    /**
+     * A class whose principal per share has fallen below one part in this is
+     * treated as drawn to nothing: minting against it would issue more shares
+     * than 128 bits hold, and what is left is dust owed to holders of a class
+     * that has in substance been lost.
+     */
+    uint256 internal constant DEAD_RATIO = 1e9;
+
+    /**
+     * The trigger-2 settlement's stages (whitepaper §4.6, §5.2): the floor
+     * drawn and the assessment window running; the severity balance held
+     * against an unmeasurable reading; settled. Ordered: a payout waits for
+     * the second or later.
+     */
+    uint8 internal constant T2_WINDOW = 1;
+    uint8 internal constant T2_HELD = 2;
+    uint8 internal constant T2_SETTLED = 3;
+    /**
+     * The censorship ground opened while slices of its finding are still
+     * before the court (whitepaper §6.2, EC-04; 2026-09-30): the upheld part
+     * drawn, the open part held. Ordered after T2_HELD, which it is to a
+     * payout; T2_SETTLED once the last slice closes.
+     */
+    uint8 internal constant T2_SLICES = 4;
+
+    /// The two kinds of finding heard in value slices (`IArkStakeCourt.Kind`).
+    uint8 internal constant SLICE_CENSORSHIP = 2;
+    uint8 internal constant SLICE_SEVERITY = 3;
+
+    /// The most slices one finding opens (whitepaper §6.2; the width of the group's masks).
+    uint256 internal constant MAX_SLICES = 16;
+
+    /// A settlement's kind (`Settlement.kind`): a trigger-1 determination, a trigger-2 draw.
+    uint8 internal constant KIND_T1 = 1;
+    uint8 internal constant KIND_T2 = 2;
+
+    /// The two unsliced settlements of trigger 2, by the id their entitlements are claimed under.
+    bytes32 internal constant T2_FLOOR = keccak256("ARK_T2_FLOOR");
+    bytes32 internal constant T2_BALANCE = keccak256("ARK_T2_BALANCE");
+    /// The floor draw of a declaration on a censorship ground's remainder (re-audit 2026-09-30, COURT-04).
+    bytes32 internal constant T2_REMAINDER = keccak256("ARK_T2_REMAINDER");
+
+    /* ------------------------------------------------------------------ */
+    /* Dependencies                                                        */
+    /* ------------------------------------------------------------------ */
+
+    IArkStakeBook public immutable REGISTRY;
+    IArkStakeParams public immutable PARAMS;
+    IArkBondCoupon public immutable COUPON;
+    IQDayOracle public immutable QDAY;
+    IAttestationVerifier public immutable ATTESTATION;
+
+    /// Where bond principal goes to be staked. One-shot; set by the bond. See `ArkCatBond._deployer`.
+    address public staking;
+
+    /// The product's dispute court, which is not in this tree. One-shot, as above.
+    address public court;
+
+    /* ------------------------------------------------------------------ */
+    /* The book                                                            */
+    /* ------------------------------------------------------------------ */
+
+    mapping(uint256 => Holding) internal _holdings;
+    uint256 internal _nextId;
+
+    /**
+     * The coupon still owed on shares a payout retired: the epochs they stood
+     * in the base of, after the last one distributed when they left. See
+     * `ArkCatBondExit._openTail`.
+     */
+    struct CouponTail {
+        address owner;
+        uint8 class_;
+        uint32 fromEpoch;
+        uint32 throughEpoch;
+        uint128 shares;
+        /// Queued shares (phase C3): paid at their weight after this epoch, from this clock.
+        uint32 queuedAfter;
+        uint64 clock;
+    }
+
+    mapping(uint256 => CouponTail) internal _tails;
+    uint256 internal _nextTail;
+
+    /// Shares and principal per class. A holding is worth `shares * P / S`.
+    uint128[2] internal _shares;
+    uint128[2] internal _principal;
+
+    /**
+     * Generation of each class. Bumped where a class's principal is drawn to
+     * zero while shares remain; a holding of a stale generation is void.
+     */
+    uint16[2] internal _gen;
+
+    /// Cumulative QRL per share of the staking distribution of whitepaper §3.4, scaled by ACC.
+    uint256[2] internal _accFree;
+
+    /**
+     * What the truncating index divisions left behind, carried into the next
+     * round rather than abandoned.
+     *
+     * `VeArk` carries this term and `StakingVault` does not, which is defect 2
+     * of the inherited contracts. Three separate words and never one: merging
+     * them would let the staking distribution fund a coupon, which is precisely
+     * what invariant I8 forbids.
+     */
+    uint256 internal _freeDust;
+
+    /* ------------------------------------------------------------------ */
+    /* The epoch boundary                                                  */
+    /* ------------------------------------------------------------------ */
+
+    /// The last epoch `_close()` evaluated.
+    uint64 internal _lastClosed;
+
+    /**
+     * Shares whose cliff ends in an epoch, and which enter the coupon base at it.
+     * Keyed by epoch, class AND generation (`_key`), so shares of a generation
+     * drawn to nothing can never enter the base of the one that replaced it.
+     */
+    mapping(uint256 => uint128) internal _cliffEntering;
+
+    /// Shares eligible for a coupon now: outstanding, less what is still inside a cliff.
+    uint128[2] internal _eligible;
+
+    /* ------------------------------------------------------------------ */
+    /* The maturity ladder and the run-off queue                           */
+    /* ------------------------------------------------------------------ */
+
+    /// Shares maturing in each epoch, keyed as `_cliffEntering` is. In shares, so a draw reprices it.
+    mapping(uint256 => uint128) internal _maturing;
+
+    /**
+     * Shares whose maturity epoch has closed and which have not been paid out,
+     * queued or not, per class. What they are worth is reserved out of the
+     * balance (`unencumbered`) and counted as owed (`principalOwedNow`): yellow
+     * paper §1.4 requests an exit when a maturity or the queue exceeds principal
+     * not deployed, which needs both to be visible and neither to be staked.
+     */
+    uint128[2] internal _dueShares;
+
+    /// Distinct future epochs carrying principal, which is what makes the ladder satisfiable.
+    uint256 internal _maturityEpochsUsed;
+
+    bool internal _gateClosed;
+    uint8 internal _clearEpochs;
+    /**
+     * Outstanding principal at the close of each of the last three epochs,
+     * less what the conditional release has returned since (B-M3): the
+     * contraction ground measures principal that left by maturity, net of
+     * the release (whitepaper §5.3). See `conditionalRelease`.
+     */
+    uint128[3] internal _ring;
+    /// Outstanding when the gate last closed: the base the run-off bound is taken on.
+    uint256 internal _atGateClose;
+
+    /**
+     * One maturity cohort in the run-off queue.
+     *
+     * `cumBefore` is the nominal QRL of every cohort ahead of this one, so the
+     * queue is served in order of maturity (whitepaper §5.3) without a cursor
+     * that a holder who never comes to collect could stall.
+     *
+     * `due`, `qrl` and `shares` are the cohort as it entered the queue: what it
+     * was worth, per class, and the shares that stood behind it. A holding's part
+     * is taken against these and never against what the cohort has left, which
+     * falls with every draw and would pay the first drawer out of the others.
+     */
+    struct Cohort {
+        bool opened;
+        uint128 cumBefore;
+        uint128 due;
+        uint128[2] qrl;
+        uint128[2] shares;
+        /**
+         * The clean-age clock when the cohort entered the queue (phase C3,
+         * whitepaper §5.3): its clean age is the clock less this, and its
+         * exposure weight falls with it.
+         */
+        uint64 clock;
+    }
+
+    mapping(uint256 => Cohort) internal _queued;
+    uint128 internal _queueTotal;
+    uint128 internal _served;
+
+    /* ------------------------------------------------------------------ */
+    /* The conditional release and the determination                       */
+    /* ------------------------------------------------------------------ */
+
+    /// Cumulative QRL per share owed by a conditional release, scaled by ACC.
+    uint256[2] internal _accRelease;
+    uint8 internal _belowEpochs;
+
+    mapping(bytes32 => uint64) internal _openedAt;
+    uint256 internal _open;
+    /**
+     * When the hold under a determination began. NOT cleared when the last
+     * determination closes: it restarts only on an opening that follows a full
+     * cap with none open (`_lastClearedAt`), so closing one and opening another
+     * cannot renew a hold the whitepaper caps at twenty days (§5.3).
+     */
+    uint64 internal _firstOpenedAt;
+    uint64 internal _lastClearedAt;
+    /*
+     * "A coupon shortfall is unrecovered" (whitepaper §4.7, §5.3) is no longer
+     * a flag here: it is the ledger's shortfall carry (I34), read live by
+     * `_shortfallUnrecovered`. The bool that stood in this slot was set by
+     * nothing (audit C4); removing it moves no other slot, since it shared
+     * one with the two timestamps above.
+     */
+
+    /* ------------------------------------------------------------------ */
+    /* The three pots; the fourth, `_cushion`, is appended at the end      */
+    /* ------------------------------------------------------------------ */
+
+    uint256 internal _freePool;
+    uint256 internal _principalOwed;
+
+    /// What this contract has placed with the delegation, less what it has taken back.
+    uint256 internal _placed;
+
+    /* ------------------------------------------------------------------ */
+    /* The opening snapshot of the staking distribution (whitepaper §3.4)  */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Shares minted in `_newEpoch`, per class. A distribution received in an
+     * epoch is divided over the holdings recorded at its opening (whitepaper
+     * §3.4, audit D16), so these are left out of its base: a subscription
+     * placed just ahead of `harvest` took a share of a reward its principal
+     * did not earn. Shares minted in an epoch cannot leave the class inside
+     * it (nothing matures in its own epoch), so the count only rises there.
+     */
+    uint128[2] internal _newShares;
+    uint64 internal _newEpoch;
+
+    /**
+     * The distribution index at the end of each epoch it moved in, keyed as
+     * `_cliffEntering` is: a holding created in `e` joins the distribution at
+     * `_accClose[e]`, the index its first eligible epoch opened on.
+     */
+    mapping(uint256 => uint256) internal _accClose;
+
+    /* ------------------------------------------------------------------ */
+    /* Build 2 (phase C3, 2026-09-28). Appended after every slot above;    */
+    /* the three bodies of the bond inherit this one declaration.          */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * The objection source of the governor (decision GD6, core's
+     * `IObjectionSource`): a class's shares and principal, and a holder's
+     * shares of a class, as they stood at the end of each epoch they moved in.
+     * A checkpoint written in epoch `e` is overwritten by later writes in `e`,
+     * so the last one before an epoch is what stood at the boundary opening it.
+     */
+    struct ClassCk {
+        uint64 epoch;
+        uint16 gen;
+        uint128 shares;
+        uint128 principal;
+    }
+
+    struct HolderCk {
+        uint64 epoch;
+        uint16 gen;
+        uint128 shares;
+    }
+
+    mapping(uint256 => ClassCk[]) internal _classCk;
+    mapping(address => mapping(uint256 => HolderCk[])) internal _holderCk;
+
+    /**
+     * A settlement entitlement's determination (yellow paper §1.4): the QRL it
+     * drew from bond principal, recorded for the positions it pays in the epoch
+     * after `epoch`. `cumBefore` is the QRL of every determination recorded
+     * ahead of it, so entitlements are paid in the order they were recorded
+     * and pro rata within one (whitepaper §5.2) without a cursor a silent
+     * beneficiary could stall — the run-off queue's device. `base` is the
+     * trigger-2 base a position's part is taken on; zero under trigger 1,
+     * whose parts are recorded per position.
+     */
+    struct Settlement {
+        uint8 kind;
+        uint64 epoch;
+        uint128 cumBefore;
+        uint128 total;
+        uint256 base;
+    }
+
+    mapping(bytes32 => Settlement) internal _settlements;
+    /// QRL recorded as entitlements, authorised to be paid, and paid: cumulative, all monotone.
+    uint256 internal _settleTotal;
+    uint256 internal _settleServed;
+    uint256 internal _settlePaid;
+
+    /**
+     * One position's two parts of a trigger-1 settlement: the buffer's, in
+     * units of the origin asset fixed at the determination (whitepaper §5.2),
+     * and the bond's, in QRL at the price fixed at the determination.
+     */
+    struct LossPart {
+        uint128 bufferUnits;
+        uint128 qrl;
+        bool recorded;
+        bool named;
+    }
+
+    mapping(bytes32 => mapping(bytes32 => LossPart)) internal _lossParts;
+    /// What each position has drawn of each settlement, in QRL.
+    mapping(bytes32 => mapping(bytes32 => uint256)) internal _settlePaidTo;
+
+    /**
+     * The trigger-2 settlement (whitepaper §4.6, §5.2; I37). One per pool: the
+     * triggers are exclusive. Every figure a later draw reads is fixed at the
+     * first: the parameters (G8), the settlement price, the claimants' base
+     * and vested weight, and the pool. `declaredAt` is T, the moment the
+     * claimants are recorded as of (the ratification, or the court's
+     * censorship determination); `epoch` is the opening's, from which the
+     * assessment window runs. Since phase C3b (papers sync 5) the draws are
+     * taken on the full settlement `fullSettlement` = S_full — the vested
+     * obligation `weight` (W) at `price`, bounded by `pool` — and `refOpen` is
+     * the bounded thirty-day series at the opening, the first reading of
+     * m_loss (which `price`, the settlement price of §5.5, no longer is).
+     */
+    struct Declaration {
+        uint8 stage;
+        bool censorship;
+        uint16 d0;
+        uint16 severityFloor;
+        uint16 windowEpochs;
+        uint64 epoch;
+        uint64 declaredAt;
+        uint256 price;
+        uint256 base;
+        uint256 pool;
+        uint256 drawn;
+        uint256 held;
+        uint128[2] drawnByClass;
+        uint128[2] heldByClass;
+        uint128[2] sharesAt;
+        uint16[2] genAt;
+        uint256 weight;
+        uint256 fullSettlement;
+        uint256 refOpen;
+        /**
+         * Appended 2026-09-30: the clamp on a measured severity, `1 - (1 -
+         * m_epoch)^W_a` at the opening's m_epoch and W_a (PV-03), and the cap
+         * K_T the full settlement was bounded by (EC-02), in origin units.
+         */
+        uint16 severityCeiling;
+        uint256 capUnits;
+        /**
+         * Appended 2026-09-30 (value slices, EC-04): the draw numerator z in
+         * bps times SLICE_SCALE, the whole trigger-2 draw being
+         * `slicedDrawTarget(fullSettlement, z)`, and the fraction of the
+         * finding's object not yet settled, `phiOpen`, in SLICE_SCALE units.
+         * Before the censorship ground opens, `z` holds the fraction its
+         * upheld slices found, U; the opening multiplies it by D_0.
+         */
+        uint256 z;
+        uint256 phiOpen;
+    }
+
+    Declaration internal _t2;
+
+    struct Recovery {
+        bytes32 successorId;
+        address escrow;
+        uint256 chainId;
+        uint256 toPositions;
+        uint256 base;
+        uint256[2] toClass;
+        /// The quantity the court found the escrow realised on the successor (zero: found non-realising).
+        uint256 realised;
+        /// The successor's place in the escrow's admission order: 0 the origin chain, 1 - 3 admitted successors.
+        uint8 slot;
+        /// Applied against the escrow's residual (whitepaper §5.4: only behind a finding on every earlier successor).
+        bool applied;
+    }
+
+    mapping(bytes32 => Recovery) internal _recoveries;
+    /// One leaf per recipient per recovery or loss settlement (the escrow spends it once).
+    mapping(bytes32 => bool) internal _sealed;
+
+    /**
+     * The run-off queue's decaying exposure (whitepaper §5.3, I26′; gap item
+     * 24). The clean-age clock advances at the close of an epoch during which
+     * no advisory was raised (the protective freeze is an advisory's), no
+     * determination was open and the freeze was not active; `_detEpoch` is
+     * the last epoch a determination opened or closed in. Queued shares are
+     * held per class by the clock they entered at (`_bucket`, keyed as
+     * `_key`, so a void generation's buckets are unreachable), the eight
+     * youngest clocks apart and every older one in `_floorShares`, at the
+     * floor. `_weightedShares` is the queue at its weight for the clock and
+     * the decay and floor last read (`_decayNow`, `_floorNow`), rounded up.
+     */
+    uint64 internal _cleanClock;
+    uint64 internal _detEpoch;
+    uint16 internal _decayNow;
+    uint16 internal _floorNow;
+    uint128[2] internal _queuedShares;
+    uint128[2] internal _floorShares;
+    uint128[2] internal _weightedShares;
+    mapping(uint256 => uint128) internal _bucket;
+
+    /**
+     * A trigger draw taken at the queue's weight (whitepaper §5.3, I26′): the
+     * class's principal fell uniformly by `perShare` a share (scaled by ACC),
+     * and a holding queued before `epoch` is owed back `BPS - x` of that,
+     * `x` its weight at `clock` under `decay` and `floor` — so it bore the
+     * draw at its weight while the class's other holdings bore it in full.
+     * What is owed back is held in `_reliefOwed` until the holding's next
+     * queue draw pays it.
+     */
+    struct Relief {
+        uint64 epoch;
+        uint64 clock;
+        uint16 decay;
+        uint16 floor;
+        uint256[2] perShare;
+    }
+
+    Relief[] internal _reliefs;
+    uint256 internal _reliefOwed;
+
+    /* ------------------------------------------------------------------ */
+    /* Phase C3b: the claimant record and the subrogation per escrow        */
+    /* ------------------------------------------------------------------ */
+
+    /// The two grounds of trigger 2 (whitepaper §5.1).
+    uint8 internal constant GROUND_DECLARATION = 1;
+    uint8 internal constant GROUND_CENSORSHIP = 2;
+
+    /// A position's place in the claimant record: a claimant, or a position recorded after T (counted, owed nothing).
+    uint8 internal constant CLAIMANT = 1;
+    uint8 internal constant LATE = 2;
+
+    /**
+     * The claimant record of a trigger-2 settlement (whitepaper §5.2; R-5).
+     * Its claimants are the positions recorded as of T — the ratification
+     * (`QDAY.declaredAt()`), or the court's censorship determination — each
+     * at its vesting factor at T, and on the censorship ground the qualifying
+     * releases with them; each adds its recorded principal and its vested
+     * weight `N_p * vesting_p(T)` here and to its escrow's ledger. A vested
+     * weight truncates per position (the vesting factor is in bps), so no
+     * running aggregate of the book reproduces the sum: the record is taken
+     * position by position, permissionlessly, before the settlement opens,
+     * and the opening requires it complete — `live` (every position still
+     * anchored, claimant or recorded after T) equal to the registry's
+     * `totalAnchored` for a declaration, after which no release is possible;
+     * `anchored` equal to `baseAtT`, the anchored notional read at the
+     * court's determination, for the censorship ground, with the qualifying
+     * transit at the court's figure `transitFound` or the assessment window
+     * elapsed. `window` is the registry's vesting window, read once.
+     */
+    struct Claimants {
+        uint8 ground;
+        uint64 at;
+        uint64 window;
+        /// att_eff at the grounding, the first record after the ratification (EC-02, PV-11): K_T's attachment.
+        uint16 att;
+        uint256 baseAtT;
+        uint256 transitFound;
+        uint256 anchored;
+        uint256 transit;
+        uint256 live;
+        uint256 weight;
+    }
+
+    Claimants internal _claim;
+    mapping(bytes32 => uint8) internal _t2Kind;
+
+    /**
+     * The subrogation of whitepaper §5.4 for one escrow (yellow paper §4.3,
+     * I23′, I36): its claimants' recorded principal and vested weight, the
+     * bond's settlement P paid to its positions, the residual `P_rem` and the
+     * class residuals, all in units of the origin asset at the settlement
+     * price fixed at the opening; `applied` is what of the trigger-2 draws,
+     * cumulated by class in origin units, is already in P (value slices of
+     * 2026-09-30: the draws are no longer two), the rest entering as one
+     * increment before the next realisation is applied. `found` holds the recovery found on each
+     * successor slot (0 the origin chain, 1 - 3 the admitted successors in
+     * admission order), `cursor` the next slot to apply: a finding applies
+     * only once every slot before it has one.
+     */
+    struct EscrowLedger {
+        uint256 notional;
+        uint256 weight;
+        uint256 paid;
+        uint256 residual;
+        uint256[2] classResidual;
+        uint8 cursor;
+        bytes32[4] found;
+        uint256[2] applied;
+    }
+
+    mapping(bytes32 => EscrowLedger) internal _ledgers;
+
+    /**
+     * The anchors of the forward root of `epochOf(T) - 1` under a declaration
+     * (audit 2026-09-29, QL-06): how many that root carries, proven against its
+     * count leaf, and how many of them the claimant record has passed. The
+     * settlement opens only when the two agree, so no deposit proven by that
+     * root and not yet recorded on QRL is left out of W. Appended to the
+     * layout, after every earlier declaration.
+     */
+    uint64 internal _priorRecorded;
+    uint64 internal _priorCount;
+    bool internal _priorProven;
+
+    /**
+     * The value slices of the finding before the court (whitepaper §6.2,
+     * EC-04; appended 2026-09-30): the group's id (the court's case id of the
+     * assertion), its kind, its slices, which have closed and which were
+     * upheld, and the fraction Φ it covers. One group at a time; cleared when
+     * its last slice closes.
+     */
+    struct SliceGroup {
+        bytes32 id;
+        uint8 kind;
+        uint8 n;
+        uint16 finalMask;
+        uint16 upheldMask;
+        uint256 phi;
+    }
+
+    SliceGroup internal _group;
+
+    /*
+     * Appended 2026-09-30, the re-audit's fix round. Every variable above
+     * keeps its slot.
+     *
+     * `_onRemainder`: a declaration ratified after a censorship ground has
+     * opened on the part of the full settlement the ground did not settle
+     * (COURT-04; zero-length remainders included, so nothing stays held for
+     * it). `_waAtT`: W_a in force at the grounding of a declaration, which the
+     * QL-06 lapse is counted in (BOND-09). `_bufferUnnamed`: origin units of
+     * trigger-1 buffer parts determined and not yet sealed as loss leaves,
+     * which hold the seed return (BOND-03).
+     */
+    bool internal _onRemainder;
+    uint16 internal _waAtT;
+    uint256 internal _bufferUnnamed;
+
+    /*
+     * Appended 2026-10-03 (OC-COURT-01). Every variable above keeps its slot.
+     *
+     * `_censorshipValue`: V, in QRL, of the censorship ground's upheld slices
+     * as the court admitted and bounded each at its assertion (I24, G8),
+     * summed; the floor draw the ground makes at its opening is no more
+     * (`_openTrigger2`). Restarted with each finding of the ground.
+     * `_classSealed`: what the holdings of each class have sealed of one
+     * recovery (OC-ECON-01, I23, I36), never above the class's part of it.
+     */
+    uint256 internal _censorshipValue;
+    mapping(bytes32 => uint256[2]) internal _classSealed;
+
+    /*
+     * Appended 2026-10-06: the Cushion (yellow paper §4.5; technical
+     * reference §1.7; I42). Every variable above keeps its slot, and
+     * `ArkCatBond` inherits `ArkFlowReceiver` AFTER this contract, so the
+     * receiver's `_laneTotal` takes a slot after all of these, which no module
+     * declares (test/Cushion.test.js pins it).
+     *
+     * `_cushion`: N_C, the fourth pot. Credited only by a deposit on the
+     * cushion lane (`ArkCatBond._onDeposit`) and debited only by a draw ahead
+     * of junior (`_drawLayers`) and by the residual draw that closes it
+     * (`ArkCatBondSettlement.drawCushionResidual`). Outside `_liquid`, so no
+     * redemption, queue payment, release or placement with staking reaches
+     * it; never in the coupon base; never staked. `_cushionCeilingBps`: c_max
+     * as in force at the last boundary the bond closed, so `deposit` reads no
+     * other contract (IArkFlow rule 2). `_cushionClosed`: set by the residual
+     * draw; the lane is closed for good.
+     */
+    uint128 internal _cushion;
+    uint16 internal _cushionCeilingBps;
+    bool internal _cushionClosed;
+
+    /**
+     * Fix T, the moment the claimants of trigger 2 are recorded as of, with
+     * the vesting window and the effective attachment K_T is taken at
+     * (whitepaper §5.2, EC-02, PV-11), so a stage step executed before the
+     * opening does not lower the cap. A declaration's T is its ratification,
+     * fixed by whoever first records a claimant or opens it; the censorship
+     * ground's is its first upheld slice (re-audit 2026-09-30, COURT-04),
+     * though the ground stands only when its last slice closes.
+     */
+    function _fixT(uint64 at) internal {
+        _claim.at = at;
+        _claim.window = REGISTRY.VESTING_WINDOW();
+        _claim.att = uint16(IArkStakeSettlementBook(address(REGISTRY)).effectiveAttachmentBps());
+    }
+
+    /// The declaration's ground, where it is ratified and not yet grounded.
+    function _groundDeclaration() internal {
+        if (_claim.ground != 0) return;
+        if (!QDAY.declared()) revert DeclarationNotRatified();
+        _claim.ground = GROUND_DECLARATION;
+        _fixT(QDAY.declaredAt());
+        // The W_a of the QL-06 lapse, in force at the grounding (BOND-09).
+        (,, _waAtT,) = PARAMS.trigger2Params();
+    }
+
+    /// The position, where the caller is its bound beneficiary (whitepaper §3.2).
+    function _beneficiary(bytes32 id) internal view returns (IArkStakeRegistry.Anchor memory a) {
+        a = IArkStakeSettlementBook(address(REGISTRY)).anchorOf(id);
+        if (a.status == 0 || a.boundQrlOwner != msg.sender) revert NotBeneficiary(id, msg.sender);
+    }
+
+    /// An origin-chain destination: the low twenty bytes of a QRL address word (D14).
+    function _requireOriginAddress(address destination) internal pure {
+        if (destination == address(0) || !EvmWords.isEvmAddress(destination)) {
+            revert DestinationNotOriginAddress(destination);
+        }
+    }
+
+    /// The key of one escrow's ledger: its origin chain and its address.
+    function _escrowKey(uint256 chainId, address escrow) internal pure returns (bytes32) {
+        return keccak256(abi.encode(chainId, escrow));
+    }
+
+    /**
+     * A claimant's vested weight at T, `N_p * vesting_p(T)` (the model's
+     * `trigger2VestedWeight`, the vesting factor of whitepaper §5.3 standing
+     * at T, truncating toward the bond).
+     */
+    function _weightAtT(uint256 notional, uint256 anchoredAt) internal view returns (uint256) {
+        return ArkStakeMath.trigger2VestedWeight(
+            notional, ArkStakeMath.vestingBps(anchoredAt, uint256(_claim.at), uint256(_claim.window))
+        );
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The trigger draws, shared by the settlement and recovery modules    */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Cross the epoch boundary before the guard is taken, through the bond's
+     * own `closeEpoch` — so a draw is taken on the book as the last epoch
+     * closed (the ring and the coupon base record what each epoch closed at,
+     * never what this call is about to make them) without carrying a second
+     * copy of the boundary code in a module. Under the delegatecall this is a
+     * call to the bond itself, before `nonReentrant` holds the shared guard.
+     */
+    modifier closedFirst() {
+        IArkCatBondClock(address(this)).closeEpoch();
+        _;
+    }
+
+    modifier onlyCourtHere() {
+        if (msg.sender != court) revert OnlyCourt(msg.sender);
+        _;
+    }
+
+    /**
+     * Draw trigger 2 to `slicedDrawTarget(S_full, z)` less what it already
+     * drew, junior first, and record the increment as the entitlement of
+     * every claimant under `settlementId` — T2_FLOOR at the opening, T2_BALANCE
+     * on the measured path or an unsliced finding, a slice's own id where a
+     * slice drew (whitepaper §4.6, §5.2, §6.2; the model's
+     * `slicedDrawTarget`). z only rises, so the increment is never negative
+     * and the whole settlement carries one truncation, toward bond principal,
+     * whatever the order its slices close in. The per-escrow subrogation
+     * ledgers read the cumulative draw by class (`drawnByClass`) and take their
+     * part of what they have not taken before the next realisation.
+     *
+     * THE ARITHMETIC OF RECORD for the draw is this one call and the
+     * settlement module's `_partOf`; nothing else reads z.
+     */
+    function _drawTo(bytes32 settlementId, uint256 cap) internal {
+        Declaration storage t = _t2;
+        uint256 target = ArkStakeMath.slicedDrawTarget(t.fullSettlement, t.z);
+        uint256 amount = target > t.drawn ? target - t.drawn : 0;
+        // A finding's draw is bounded by the V it was admitted at (OC-COURT-01).
+        if (amount > cap) amount = cap;
+        // The Cushion first (yellow paper §4.5, I42), except on the censorship
+        // ground, whose escrow is unimpaired: a declaration on its remainder
+        // draws it as any declaration does.
+        (uint256 dc, uint256 dj, uint256 ds) = _drawLayers(settlementId, amount, !t.censorship || _onRemainder);
+        uint256 drawn = dc + dj + ds;
+        // `drawn` counts the Cushion's part; `drawnByClass`, which P and P_rem
+        // read (yellow paper §5.3), does not.
+        t.drawn += drawn;
+        t.drawnByClass[JUNIOR] += uint128(dj);
+        t.drawnByClass[SENIOR] += uint128(ds);
+        if (drawn != 0) _record(settlementId, KIND_T2, drawn, t.weight);
+        // The draw numerator in bps, truncated: D itself on an unsliced settlement.
+        emit Trigger2Drawn(settlementId, t.z / ArkStakeMath.SLICE_SCALE, drawn, dj, ds);
+    }
+
+    /**
+     * The principal held for what is still open of a sliced settlement, after
+     * the draws (whitepaper §4.6, §6.2; the model's `slicedHeldPrincipal`):
+     * the most any later closing can still draw, Δ = BPS - D_0 of a severity
+     * balance, junior first on the principal left, as every later draw is
+     * junior first. A fall between two figures is released to the holders of
+     * its class — nothing is transferred; the class freeze
+     * (`_requirePayable`) reads the new figure. Settled once nothing is open.
+     */
+    function _rehold() internal {
+        Declaration storage t = _t2;
+        // Only a severity balance is ever held since the censorship ground
+        // opens with every slice closed (re-audit 2026-09-30, COURT-04): a
+        // declaration's, or one on a censorship ground's remainder.
+        uint256 reach = BPS - uint256(t.d0);
+        uint256 held = ArkStakeMath.slicedHeldPrincipal(t.fullSettlement, t.z, t.phiOpen, reach);
+        // Held from the Cushion first, then junior first (yellow paper §4.5):
+        // only the classes' part leaves the coupon base and freezes a class.
+        uint256 hc = uint256(_cushion);
+        if (hc > held) hc = held;
+        (uint256 hj, uint256 hs) = ArkStakeMath.classDrawsOnPrincipal(
+            held - hc, uint256(_principal[JUNIOR]), uint256(_principal[SENIOR])
+        );
+        t.held = hc + hj + hs;
+        t.heldByClass[JUNIOR] = uint128(hj);
+        t.heldByClass[SENIOR] = uint128(hs);
+        if (t.phiOpen == 0) t.stage = T2_SETTLED;
+        emit SeverityHeld(hc + hj + hs, hj, hs);
+    }
+
+    /**
+     * Settle the fraction `phi` of a severity balance at `measuredLoss`: z
+     * rises by `phi * (D - D_0)`, the fraction leaves the open part, the draw
+     * is taken to the new target under `id` and the hold recomputed — settled
+     * once nothing is open (whitepaper §4.6, §6.2). A severity the court fixes
+     * is a finding, bounded by the whole only; a measured one is clamped at
+     * the ceiling of W_a epochs (PV-03). At the whole fraction this is the
+     * unsliced balance, `floor(D * S_full / BPS)` drawn in all.
+     */
+    function _settleBalance(bytes32 id, uint256 phi, uint256 measuredLoss, bool byCourt) internal {
+        Declaration storage t = _t2;
+        (, uint256 severity) = ArkStakeMath.trigger2SeverityBps(
+            t.severityFloor, true, measuredLoss, byCourt ? BPS : uint256(t.severityCeiling)
+        );
+        uint256 total = ArkStakeMath.trigger2DrawTotalBps(t.d0, true, severity);
+        t.z += phi * (total - uint256(t.d0));
+        t.phiOpen -= phi;
+        _drawTo(id, type(uint256).max);
+        _rehold();
+        emit SeveritySettled(measuredLoss, severity, total, byCourt);
+    }
+
+    /**
+     * The severity reading (EC-01, PV-03): the registry's reading recorded at
+     * the boundary `epoch + W_a` of the opening, or the first recorded after
+     * it (`readingFrom`), through `try`. The registry records none while the
+     * breaker holds or the series is silent, so unmeasured is where no reading
+     * stands at or after that boundary, or the registry cannot be read. m_loss
+     * is its fall from `refOpen`, the reading at the opening. The boundary of
+     * the epoch in progress is sent first, where nobody has sent it (the
+     * registry reads each boundary once, whoever sends it; a dead oracle's
+     * revert is caught and reads as no reading).
+     */
+    function _measure() internal returns (bool measured, uint256 loss) {
+        Declaration storage t = _t2;
+        IArkStakeSettlementBook book = IArkStakeSettlementBook(address(REGISTRY));
+        try book.markPremium() {} catch {}
+        try book.readingFrom(uint256(t.epoch) + uint256(t.windowEpochs)) returns (uint256 post, uint256) {
+            if (post == 0) return (false, 0);
+            return ArkStakeMath.measuredLossBps(t.refOpen, post);
+        } catch {
+            return (false, 0);
+        }
+    }
+
+    /**
+     * Take `amount` from the classes, junior to the whole of its exposure
+     * before senior (whitepaper §4.6, `classDrawsOnPrincipal`), queued
+     * principal at its weight (whitepaper §5.3, I26′: "a settlement determined
+     * against it is drawn from it at the same weight its coupon is paid at").
+     * One write per class; every holding, maturity cohort and queue lot
+     * reprices without a touch. No new generation starts here: nothing is
+     * issued after a declaration, and after an escrow loss the next
+     * subscription starts one itself (`_mint`), so the holdings of record keep
+     * their claims.
+     */
+    /**
+     * Take `amount` from the Cushion first, to the whole of its balance, and
+     * the rest from the classes (yellow paper §4.5; the model's
+     * `layerDrawsOnPrincipal`), unless `cushionFirst` is false, the
+     * censorship ground's case (I42). The Cushion's part is paid from its
+     * balance at once: it leaves the pot here and stands behind the
+     * entitlement `_record` writes, which `_serve` authorises from the
+     * balance outside every pot.
+     */
+    function _drawLayers(bytes32 id, uint256 amount, bool cushionFirst)
+        internal
+        returns (uint256 dc, uint256 dj, uint256 ds)
+    {
+        if (cushionFirst) {
+            uint256 c = uint256(_cushion);
+            dc = amount < c ? amount : c;
+            if (dc != 0) {
+                _cushion = uint128(c - dc);
+                emit CushionDrawn(id, dc);
+            }
+        }
+        (dj, ds) = _drawClasses(amount - dc);
+    }
+
+    function _drawClasses(uint256 amount) internal returns (uint256 dj, uint256 ds) {
+        (dj, ds) = ArkStakeMath.classDrawsOnPrincipal(amount, _exposure(JUNIOR), _exposure(SENIOR));
+        uint256[2] memory per;
+        per[JUNIOR] = _drawClass(JUNIOR, dj);
+        per[SENIOR] = _drawClass(SENIOR, ds);
+        if (per[JUNIOR] != 0 || per[SENIOR] != 0) {
+            _reliefs.push(Relief(uint64(ArkEpoch.current()), _cleanClock, _decayNow, _floorNow, per));
+        }
+    }
+
+    /**
+     * Draw `d` from class `c` at the queue's weight. Shares carry one price, so
+     * the class's principal falls uniformly by `d` scaled up from its exposure
+     * to its face, and the part of that fall the queued shares' weight exempts
+     * — `cut - d`, the face less the exposure times the rate — is set aside for
+     * them (`_reliefOwed`), each paid its own share at its next queue draw.
+     * Returns the uniform fall per share, scaled by ACC; zero where no share is
+     * queued. Rounds the fall down, toward the class: the relief never exceeds
+     * what the class gave up.
+     */
+    function _drawClass(uint8 c, uint256 d) internal returns (uint256 perShare) {
+        if (d == 0) return 0;
+        uint256 p = uint256(_principal[c]);
+        uint256 e = _exposure(c);
+        uint256 cut = e == 0 ? d : (d * p) / e;
+        if (cut > p) cut = p;
+        if (cut < d) cut = d;
+        _principal[c] = uint128(p - cut);
+        _ckClass(c);
+        if (cut == d || _queuedShares[c] == 0) return 0;
+        _reliefOwed += cut - d;
+        perShare = (cut * ACC) / uint256(_shares[c]);
+    }
+
+    /// Record a determination's draw as an entitlement, behind every one recorded before it.
+    function _record(bytes32 settlementId, uint8 kind, uint256 total, uint256 base) internal {
+        Settlement storage s = _settlements[settlementId];
+        s.kind = kind;
+        s.epoch = uint64(ArkEpoch.current());
+        s.cumBefore = _u128(_settleTotal);
+        s.total = _u128(total);
+        s.base = base;
+        _settleTotal += total;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Construction                                                        */
+    /* ------------------------------------------------------------------ */
+
+    constructor(address registry_, address params_, address coupon_, address qday_, address attestation_) {
+        if (registry_ == address(0) || params_ == address(0) || coupon_ == address(0)) revert ZeroAddress();
+        if (qday_ == address(0) || attestation_ == address(0)) revert ZeroAddress();
+
+        REGISTRY = IArkStakeBook(registry_);
+        PARAMS = IArkStakeParams(params_);
+        COUPON = IArkBondCoupon(coupon_);
+        QDAY = IQDayOracle(qday_);
+        ATTESTATION = IAttestationVerifier(attestation_);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The epoch boundary                                                  */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Advance the book to the last epoch that has closed. See
+     * `ArkCatBond.closeEpoch` for why it is permissionless and why it runs at
+     * the START of every path that changes outstanding principal.
+     *
+     * Refuses a gap longer than `MAX_CLOSE` by name, as every internal path
+     * does: `closeEpochs` closes it in batches.
+     */
+    function _close() internal virtual {
+        _closeBatch(MAX_CLOSE, true);
+    }
+
+    function _closeBatch(uint256 max, bool strict) internal {
+        uint256 nowEpoch = ArkEpoch.current();
+        uint256 from = uint256(_lastClosed) + 1;
+        if (from >= nowEpoch) return;
+        uint256 to = nowEpoch;
+        if (to - from > max) {
+            if (strict) revert EpochGapTooLong(to - from, max);
+            to = from + max;
+        }
+
+        uint256 out = _nominal();
+        // Read once for the batch, as the gate's own suspension is.
+        bool frozen = QDAY.frozen();
+
+        for (uint256 e = from; e < to; e++) {
+            // The run-off trigger, bound and threat stage in force IN `e`, the
+            // epoch the gate observes (G8, whitepaper §6.5): this close runs in
+            // a later epoch, whose figures a vote may already have moved.
+            // The queue's decay and floor likewise (whitepaper §5.3).
+            (uint16 runoffTriggerBps, uint16 runoffBoundBps, uint8 stage, uint16 decay, uint16 floor) =
+                PARAMS.runoffParamsAt(e);
+
+            // Shares whose cliff lands in `e` join the base before `e`'s base is
+            // fixed: `cliffEpoch` is the first epoch a holding may be paid for.
+            _eligible[JUNIOR] += _cliffEntering[_key(e, JUNIOR)];
+            _eligible[SENIOR] += _cliffEntering[_key(e, SENIOR)];
+            // Queued principal earns the coupon at its weight in `e` (I26′):
+            // the base counts it so, and the coupon account pays it so.
+            _weigh(decay, floor);
+            COUPON.recordBoundary(
+                e,
+                _baseShares(JUNIOR),
+                _baseShares(SENIOR),
+                uint128(_basePrincipal(JUNIOR)),
+                uint128(_basePrincipal(SENIOR)),
+                // The rate in force IN `e`, fixed with its base (G8): this close
+                // runs in a later epoch, whose rate a vote may already have moved.
+                PARAMS.seniorCouponBpsAt(e),
+                (uint256(_cleanClock) << 32) | (uint256(decay) << 16) | uint256(floor)
+            );
+
+            _ring[e % 3] = uint128(out);
+
+            // `(e - 2) % 3` and `(e + 1) % 3` are the same lane, and the second
+            // cannot underflow at e below two.
+            bool ground = ArkStakeMath.runoffGateGround(
+                uint256(stage), out, uint256(_ring[(e + 1) % 3]), uint256(runoffTriggerBps)
+            );
+
+            // The clean-age clock (whitepaper §5.3): it advances at the close of
+            // an epoch during which no advisory, open determination or
+            // protective freeze was active, so the first public signal stops it
+            // and queueing ahead of private knowledge buys at most one decay
+            // step per epoch of foresight. After the base of `e`, whose coupon
+            // is paid at the age that held during it.
+            if (!frozen && _open == 0 && uint256(_detEpoch) < e) _tick();
+
+            if (ground) {
+                _clearEpochs = 0;
+                if (!_gateClosed) {
+                    _gateClosed = true;
+                    // The base the run-off bound is taken on: whitepaper §5.3
+                    // fixes it at the principal outstanding when the gate closed,
+                    // so a whole queue clears in the epochs `runoffDrainEpochs`
+                    // promises. Taken on what remains it would decay
+                    // geometrically and never quite clear, which is the failure
+                    // R10 recorded of the escrow's own queue.
+                    _atGateClose = out;
+                    emit RunoffGateClosed(e, out);
+                }
+            } else {
+                if (_clearEpochs < 2) _clearEpochs += 1;
+                // Whitepaper §5.3: the gate opens at the close of an epoch in
+                // which neither ground has held for two consecutive epochs, and
+                // does not open while a determination is open, a shortfall is
+                // unrecovered or the protective freeze is active.
+                if (_gateClosed && _clearEpochs >= 2 && !_gateOpenSuspended()) {
+                    _gateClosed = false;
+                    emit RunoffGateOpened(e);
+                }
+            }
+
+            // Principal maturing in `e` is due from here on, queued or not.
+            uint128 sJ = _maturing[_key(e, JUNIOR)];
+            uint128 sS = _maturing[_key(e, SENIOR)];
+            _dueShares[JUNIOR] += sJ;
+            _dueShares[SENIOR] += sS;
+
+            // Whitepaper §5.3: principal maturing while the gate is closed is not
+            // returned at maturity and enters a queue. The cohort is opened here,
+            // once, with the nominal total of every cohort ahead of it — which is
+            // what makes the queue run in order of maturity without a cursor —
+            // and with what it is worth now, per class, which is what each
+            // holding's part is measured against for as long as it waits.
+            if (_gateClosed && !_queued[e].opened) {
+                uint256 qJ = _worth(JUNIOR, sJ);
+                uint256 qS = _worth(SENIOR, sS);
+                uint256 due = qJ + qS;
+                if (due != 0) {
+                    Cohort storage co = _queued[e];
+                    co.opened = true;
+                    co.cumBefore = _queueTotal;
+                    co.due = _u128(due);
+                    co.qrl = [_u128(qJ), _u128(qS)];
+                    co.shares = [sJ, sS];
+                    // Its clean age starts at zero now (whitepaper §5.3).
+                    uint256 clock = _cleanClock;
+                    co.clock = uint64(clock);
+                    _bucket[_key(clock, JUNIOR)] += sJ;
+                    _bucket[_key(clock, SENIOR)] += sS;
+                    _queuedShares[JUNIOR] += sJ;
+                    _queuedShares[SENIOR] += sS;
+                    _queueTotal = _u128(uint256(_queueTotal) + due);
+                    emit Queued(e, due, uint256(_queueTotal));
+                }
+            }
+
+            // The queue keeps being served after the gate opens: what entered it
+            // is owed whatever the gate does later.
+            _serveQueue(uint256(runoffBoundBps));
+        }
+
+        // ONE utilisation reading per call, and only by the call that reaches the
+        // latest boundary. The registry's required capital can move inside a gap
+        // without this contract hearing of it, so a reading taken now says
+        // nothing about the epochs the gap skipped; counting it once for each of
+        // them would let a single well-timed call satisfy §5.3's two epochs.
+        //
+        // No reading at all where the valuation oracle does not answer: the
+        // epoch neither counts toward the release nor breaks a run of low
+        // epochs, and - the reason this is a try and not a call - the close
+        // itself goes through. `_close` runs first on every path that moves
+        // principal, so a dead oracle reverting here froze the whole bond:
+        // subscriptions, redemptions, the queue, transfers, loss booking and
+        // the court's calls (audit 2026-09-27, D5). Whitepaper §5.5 holds
+        // settlement under an unavailable reading; it never stops the book.
+        // The queue at its weight now, for the capital requirement the
+        // registry reads through `outstandingPrincipal` (I26′).
+        {
+            (,,, uint16 decayNow, uint16 floorNow) = PARAMS.runoffParamsAt(to);
+            _weigh(decayNow, floorNow);
+        }
+        if (to == nowEpoch) {
+            (bool read, bool below) = _utilisationBelow(out);
+            if (read) {
+                uint256 low = below ? uint256(_belowEpochs) + 1 : 0;
+                _belowEpochs = low > 255 ? 255 : uint8(low);
+            }
+        }
+        _lastClosed = uint64(to - 1);
+    }
+
+    /// The per-epoch maps' key: epoch, the class's CURRENT generation, and the class.
+    function _key(uint256 epoch, uint8 c) internal view returns (uint256) {
+        return (epoch << 24) | (uint256(_gen[c]) << 8) | uint256(c);
+    }
+
+    /**
+     * Advance the clean-age clock one step, and move the bucket that has just
+     * reached `QUEUE_AGES` into the floor bucket, where every age weighs the
+     * floor (whitepaper §5.3).
+     */
+    function _tick() internal {
+        uint256 c = uint256(_cleanClock) + 1;
+        _cleanClock = uint64(c);
+        if (c < QUEUE_AGES) return;
+        for (uint8 k = 0; k < 2; k++) {
+            uint256 key = _key(c - QUEUE_AGES, k);
+            _floorShares[k] += _bucket[key];
+            delete _bucket[key];
+        }
+    }
+
+    /**
+     * The queue of each class at its exposure weight (the model's
+     * `queueExposureBps` and `queuedAtExposure`, I26′), at the clock now and
+     * the decay and floor given. Rounds UP, toward the coupon base, so the
+     * queued holdings, each paid at its own weight, never draw more than the
+     * base their coupon was divided over.
+     */
+    function _weigh(uint256 decay, uint256 floor) internal {
+        uint256 clock = _cleanClock;
+        for (uint8 k = 0; k < 2; k++) {
+            uint256 w = uint256(_floorShares[k]) * floor;
+            for (uint256 a = 0; a < QUEUE_AGES && a <= clock; a++) {
+                w += uint256(_bucket[_key(clock - a, k)]) * ArkStakeMath.queueExposureBps(decay, floor, a);
+            }
+            _weightedShares[k] = uint128((w + BPS - 1) / BPS);
+        }
+        _decayNow = uint16(decay);
+        _floorNow = uint16(floor);
+    }
+
+    /**
+     * Take `b` shares of a queued cohort that entered at `clock` out of the
+     * queue's weights: a draw from the run-off queue. The weighted figure is
+     * reduced at the weight now, and the next close recomputes it exactly.
+     */
+    function _unqueue(uint8 c, uint256 clock, uint256 b) internal {
+        uint256 age = uint256(_cleanClock) - clock;
+        if (age >= QUEUE_AGES) {
+            _floorShares[c] = _sat(_floorShares[c], b);
+        } else {
+            uint256 key = _key(clock, c);
+            _bucket[key] = _sat(_bucket[key], b);
+        }
+        _queuedShares[c] = _sat(_queuedShares[c], b);
+        uint256 w = (b * ArkStakeMath.queueExposureBps(_decayNow, _floorNow, age)) / BPS;
+        _weightedShares[c] = _sat(_weightedShares[c], w);
+    }
+
+    function _sat(uint128 a, uint256 b) internal pure returns (uint128) {
+        return b >= uint256(a) ? 0 : uint128(uint256(a) - b);
+    }
+
+    /**
+     * Shares of `c` in the coupon base: those past their cliff, the queued
+     * among them at their weight (whitepaper §5.3, I26′).
+     */
+    function _baseShares(uint8 c) internal view returns (uint128) {
+        uint256 e = uint256(_eligible[c]);
+        uint256 q = uint256(_queuedShares[c]);
+        uint256 w = uint256(_weightedShares[c]);
+        if (w > q) w = q;
+        return uint128(e > q ? e - q + w : w);
+    }
+
+    /// Principal outstanding at face, queued or not: what the ring, the gate and the ladder measure.
+    function _nominal() internal view returns (uint256) {
+        return uint256(_principal[JUNIOR]) + uint256(_principal[SENIOR]);
+    }
+
+    /// What `s` shares of a class are worth now. Truncates, toward the pool.
+    function _worth(uint8 c, uint256 s) internal view returns (uint256) {
+        uint256 sc = uint256(_shares[c]);
+        return sc == 0 ? 0 : (s * uint256(_principal[c])) / sc;
+    }
+
+    /// A checked narrowing: an explicit `uint128(...)` truncates silently.
+    function _u128(uint256 x) internal pure returns (uint128) {
+        if (x > type(uint128).max) revert AmountTooLarge(x);
+        return uint128(x);
+    }
+
+    /**
+     * Principal standing behind the shares past their cliff, less a balance
+     * held against an unmeasured severity, which whitepaper §4.6 keeps outside
+     * the coupon base: it is neither the class's to earn on nor yet the
+     * positions'. Truncates, toward the pool.
+     */
+    function _basePrincipal(uint8 c) internal view returns (uint256) {
+        uint256 p = _worth(c, uint256(_baseShares(c)));
+        uint256 held = uint256(_t2.heldByClass[c]);
+        return p > held ? p - held : 0;
+    }
+
+    /**
+     * Whether any of the three states that hold a closed gate closed holds.
+     * Whitepaper §5.3. `ArkStakeMath.runoffGateGround` says in its own comment
+     * that the caller owns these, and this is that caller.
+     */
+    function _gateOpenSuspended() internal view returns (bool) {
+        return _open != 0 || _shortfallUnrecovered() || QDAY.frozen();
+    }
+
+    /**
+     * Whether a coupon shortfall is unrecovered (whitepaper §4.7 condition 3,
+     * §5.3): the shortfall carry of a retirement (I34) not yet repaid by the
+     * yield of the retained shares. Read from the ledger through the coupon
+     * account, which holds its address. The coupon account's per-epoch
+     * `shortfall` is not this: senior paid below its stated rate in one epoch
+     * is never carried (whitepaper §4.6) and has nothing to recover.
+     */
+    function _shortfallUnrecovered() internal view returns (bool) {
+        return COUPON.shortfallCarry() != 0;
+    }
+
+    /**
+     * Whether utilisation is at or below the release threshold, and whether it
+     * could be read at all. `read` is false only where the registry's reading
+     * reverted - the valuation oracle paused, out of data or gone - and then
+     * `below` means nothing.
+     *
+     * The registry measures it (`ArkStakeRegistry.utilisationBps`): on the
+     * settlement series at the conversion haircut, with the origin-asset buffer
+     * in the denominator (whitepaper §4.3, I38) - terms it holds or reads and
+     * this contract does not. Its bond term is this contract's
+     * `outstandingPrincipal`, which is `out`. A book requiring nothing reads
+     * zero and is not "below": the release is held back until the book has
+     * closed an epoch inside its operating range.
+     */
+    function _utilisationBelow(uint256 out) internal view returns (bool read, bool below) {
+        if (out == 0) return (true, false);
+        try REGISTRY.utilisationBps() returns (uint256 u) {
+            return (true, u != 0 && u <= RELEASE_UTILISATION_BPS);
+        } catch {
+            return (false, false);
+        }
+    }
+
+    /**
+     * Authorise one epoch's slice of the run-off queue.
+     *
+     * The bound is taken on the principal outstanding when the gate closed and
+     * never on what the queue still holds (whitepaper §5.3), so `_served` is
+     * monotone and reaches `_queueTotal` in exactly `runoffDrainEpochs` epochs.
+     * Queue emptiness is therefore a property of this nominal ledger rather than
+     * of whether every holder came to collect, which is what makes invariant
+     * I26's horizon true by construction.
+     *
+     * Truncates, toward the book: a wei not authorised this epoch is authorised
+     * in the next, and nothing leaves the queue's account.
+     */
+    function _serveQueue(uint256 runoffBoundBps) internal {
+        uint256 remaining = uint256(_queueTotal) - uint256(_served);
+        if (remaining == 0) return;
+        uint256 slice = ArkStakeMath.runoffReleaseQrl(runoffBoundBps, _atGateClose, remaining);
+        if (slice != 0) _served = uint128(uint256(_served) + slice);
+    }
+
+    /**
+     * One truncating division, shared by the two per-share streams this contract
+     * carries: the staking distribution and the conditional release.
+     *
+     * Returns the index step and what the pot must set aside for it. The step
+     * truncates, toward the pot. `paid` rounds UP: a holding settling several
+     * steps at once is paid `floor(s * Σstep)`, which can exceed the sum of the
+     * per-step floors by a wei per step, and a pot funded by those floors would
+     * underflow for its last claimant and freeze that holding's principal. The
+     * ceiling never exceeds `money`, because `step * shares_ <= money * ACC`.
+     */
+    function _perShare(uint256 money, uint256 shares_) internal pure returns (uint256 step, uint256 paid) {
+        if (money == 0 || shares_ == 0) return (0, 0);
+        step = (money * ACC) / shares_;
+        paid = (step * shares_ + ACC - 1) / ACC;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Settlement, shared by `claim` and every exit path                   */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Bring a holding's three cursors up to date.
+     *
+     * The coupon is paid by `COUPON`, which holds it, so this function never
+     * returns a coupon amount and this contract never holds a wei of one. `send`
+     * is false on the one path where value must not move — a transfer settling its
+     * seller — and the coupon account withholds it there for `withdraw`.
+     *
+     * The other two streams are this contract's own: the staking distribution of
+     * whitepaper §3.4 and principal a conditional release has returned. Both are
+     * `rewardDebt` against a running per-share index, which works because neither
+     * carries a cliff.
+     */
+    function _settle(Holding storage h, bool send) internal returns (uint256 coupon, uint256 free, uint256 release) {
+        uint8 c = h.class_;
+        uint256 s = uint256(h.shares);
+        if (s == 0 || h.gen != _gen[c]) return (0, 0, 0);
+
+        // A queued holding is paid the coupon at its weight after its maturity
+        // epoch (I26′): the coupon account reads the clock of each epoch.
+        Cohort storage co = _queued[uint256(h.maturityEpoch)];
+        uint256 queuedAfter = co.opened ? uint256(h.maturityEpoch) : 0;
+        (uint256 paid, uint64 through) =
+            COUPON.payTo(c, uint256(h.claimedThrough), s, h.owner, send, queuedAfter, uint256(co.clock));
+        coupon = paid;
+        // The cursor only moves forward. A settlement inside the cliff finds the
+        // coupon distributed through an epoch BEFORE `cliffEpoch - 1`; writing
+        // that back would later pay this holding for epochs whose base it was
+        // not in, out of the coupon of the holdings that were.
+        if (through > h.claimedThrough) h.claimedThrough = uint32(through);
+
+        uint256 freeAcc = s * _accFree[c];
+        uint32 from = h.freeFrom;
+        if (from != 0) {
+            // Created in `from - 1`: nothing of that epoch's distribution is its
+            // own (whitepaper §3.4, D16). Until the epoch has closed it accrues
+            // nothing; after, it joins at the index the epoch closed on.
+            if (ArkEpoch.current() < uint256(from)) {
+                h.freeDebt = freeAcc;
+            } else {
+                uint256 joined = s * _accClose[_key(uint256(from) - 1, c)];
+                if (joined > h.freeDebt) h.freeDebt = joined;
+                h.freeFrom = 0;
+            }
+        }
+        if (freeAcc > h.freeDebt) free = (freeAcc - h.freeDebt) / ACC;
+        h.freeDebt = freeAcc;
+
+        uint256 relAcc = s * _accRelease[c];
+        if (relAcc > h.releaseDebt) release = (relAcc - h.releaseDebt) / ACC;
+        h.releaseDebt = relAcc;
+
+        // Never more than the pot holds: the pots are funded rounding up
+        // (`_perShare`), so this binds only on a wei the pot keeps.
+        if (free > _freePool) free = _freePool;
+        if (release > _principalOwed) release = _principalOwed;
+        _freePool -= free;
+        _principalOwed -= release;
+    }
+
+    /**
+     * Book a loss the delegation already shows before principal is priced for
+     * a payment or a draw: otherwise a holder who sees a validator come back
+     * short is paid at par first, and the loss falls on the holdings that stay.
+     * `_placed` is only non-zero once a staking contract with a delegation has
+     * taken principal.
+     */
+    function _syncLoss() internal {
+        if (_placed != 0) IArkBondStakingSync(staking).syncLoss();
+    }
+
+    /**
+     * Send QRL, and never more than the contract may part with.
+     *
+     * NOT strict checks-effects-interactions, whatever an earlier comment said:
+     * `_settle` calls `COUPON.payTo`, which sends QRL to the holder, before it
+     * writes the distribution and release cursors (audit 2026-09-27, D18). What
+     * makes that safe is the shared `nonReentrant` guard - `_status` is one slot
+     * across the bond and `ArkCatBondExit` - which every path reaching
+     * `_settle` holds, and which `closeEpoch`/`closeEpochs` hold too, so a
+     * recipient cannot re-enter the boundary between the payment and the writes.
+     */
+    function _send(address to, uint256 amount) internal {
+        if (amount == 0) return;
+        (bool ok,) = to.call{value: amount}("");
+        if (!ok) revert TransferFailed(to, amount);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The balance, as both sides bound payments by it                     */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * The balance outside the two holder pots, the distribution dust and the
+     * settlement entitlements still unpaid (phase C3): principal a trigger
+     * drew belongs to the positions it settles from the draw on, and no
+     * redemption, queue draw or release may be paid out of it.
+     */
+    function _liquid() internal view returns (uint256) {
+        // The Cushion is the fourth pot (I42): never principal to pay or stake.
+        uint256 pots =
+            _freePool + _principalOwed + _freeDust + (_settleTotal - _settlePaid) + _reliefOwed + uint256(_cushion);
+        uint256 bal = address(this).balance;
+        return bal > pots ? bal - pots : 0;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Build 2: the checkpoints of the objection source (GD6)              */
+    /* ------------------------------------------------------------------ */
+
+    /// Record class `c` as it stands now, for the epoch in progress.
+    function _ckClass(uint8 c) internal {
+        ClassCk[] storage a = _classCk[c];
+        uint64 e = uint64(ArkEpoch.current());
+        uint256 n = a.length;
+        if (n == 0 || a[n - 1].epoch != e) {
+            a.push();
+            n += 1;
+        }
+        ClassCk storage k = a[n - 1];
+        k.epoch = e;
+        k.gen = _gen[c];
+        k.shares = _shares[c];
+        k.principal = _principal[c];
+    }
+
+    /**
+     * Move `delta` shares of class `c` into (`add`) or out of `who`'s record
+     * for the epoch in progress. Shares of a generation the class has left
+     * are dropped, as the holdings they belonged to are void.
+     */
+    function _ckHolder(address who, uint8 c, uint256 delta, bool add) internal {
+        HolderCk[] storage a = _holderCk[who][c];
+        uint64 e = uint64(ArkEpoch.current());
+        uint16 g = _gen[c];
+        uint256 n = a.length;
+        uint256 was;
+        if (n != 0 && a[n - 1].gen == g) was = uint256(a[n - 1].shares);
+        if (n == 0 || a[n - 1].epoch != e) {
+            a.push();
+            n += 1;
+        }
+        HolderCk storage k = a[n - 1];
+        k.epoch = e;
+        k.gen = g;
+        k.shares = uint128(add ? was + delta : (was > delta ? was - delta : 0));
+    }
+
+    /**
+     * Fix a holding's shares at the trigger-2 draw before they first move
+     * (whitepaper §5.4: a recovery is divided by holding of record). Until
+     * then its shares are its shares at the draw: nothing is issued after a
+     * declaration and nothing else changes a holding's count.
+     */
+    function _fixDeclShares(Holding storage h) internal {
+        if (_t2.stage != 0 && !h.declFixed) {
+            h.declShares = h.gen == _t2.genAt[h.class_] ? h.shares : 0;
+            h.declFixed = true;
+        }
+    }
+
+    /**
+     * Whether principal of class `c` may leave now (whitepaper §5.3, §4.6).
+     * After a ratified declaration nothing leaves until the trigger-2
+     * settlement has drawn the floor and judged the severity at the close of
+     * the assessment window (D6); after it, principal the draw did not reach
+     * leaves on the terms of its class, except a class with a balance held
+     * against an unmeasured severity, which stays whole until the hold
+     * settles (the model's `heldFreezeOfClassHolding`). The pro-rata part of
+     * PV-11 is withdrawn (re-audit 2026-09-30, BOND-01): a holding that
+     * matured during the hold left with the part above its share and escaped
+     * its part of the severity draw, which the per-share draw then put on the
+     * holdings that could not leave. Principal above the full settlement is
+     * frozen with its class, a disclosed cost.
+     */
+    function _requirePayable(uint8 c) internal view {
+        if (_awaitingT2(T2_HELD)) revert DeclaredPendingSettlement();
+        if (_t2.heldByClass[c] != 0) revert HeldUnderSeverity(c);
+    }
+
+    /**
+     * Whether principal waits for a trigger-2 settlement: a ratified
+     * declaration or a censorship ground found, and the settlement not yet at
+     * `stage` (phase C3b: the draw waits for the claimant record, and nothing
+     * leaves ahead of it) — or a declaration ratified after the censorship
+     * ground settled and not yet opened on its remainder (COURT-04).
+     */
+    function _awaitingT2(uint8 stage) internal view returns (bool) {
+        bool declared = QDAY.declared();
+        if (!declared && _claim.ground == 0) return false;
+        return _t2.stage < stage || (declared && _t2.censorship && !_onRemainder);
+    }
+
+    /**
+     * Principal past its maturity and not yet paid, queued or not, at what it is
+     * worth now — so a loss or a draw on it is reflected without a write.
+     */
+    function _dueQrl() internal view returns (uint256) {
+        return _worth(JUNIOR, _dueShares[JUNIOR]) + _worth(SENIOR, _dueShares[SENIOR]);
+    }
+
+    /**
+     * The balance this contract may still move as principal.
+     *
+     * Everything owed to a holder — the staking distribution, principal a
+     * release has returned, and principal past its maturity whether queued or
+     * not — is outside it. Placing with staking and the conditional release are
+     * bounded by this, so neither can spend what a maturity is owed.
+     */
+    function _unencumbered() internal view returns (uint256) {
+        uint256 liquid = _liquid();
+        uint256 due = _dueQrl();
+        return liquid > due ? liquid - due : 0;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Views both sides read                                               */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Bond principal outstanding, in QRL. What the registry reads.
+     *
+     * Principal held against a claim and principal in the run-off queue are
+     * both inside this figure, which is what whitepaper §5.3 and invariant I26
+     * require: the queue changes the schedule of a return and not the state of
+     * a holding. Queued principal counts at its exposure weight (I26′, phase
+     * C3): it enters the capital requirement, and the trigger-2 pool, as it
+     * enters the coupon base. `_nominal` is the face figure.
+     */
+    function outstandingPrincipal() public view returns (uint256) {
+        return _exposure(JUNIOR) + _exposure(SENIOR);
+    }
+
+    /// A class's principal with its queued shares at their weight. Truncates, toward the pool.
+    function _exposure(uint8 c) internal view returns (uint256) {
+        uint256 s = uint256(_shares[c]);
+        uint256 q = uint256(_queuedShares[c]);
+        uint256 w = uint256(_weightedShares[c]);
+        if (q > s) q = s;
+        if (w > q) w = q;
+        return _worth(c, s - q + w);
+    }
+
+    /// Whether the run-off gate of whitepaper §5.3 is closed. One SLOAD; see `ArkCatBond`'s header.
+    function runoffGateClosed() external view returns (bool) {
+        return _gateClosed;
+    }
+
+    /**
+     * What a holding is worth now: its share of its class's principal. Truncates,
+     * toward the pool. A holding of a void generation is worth nothing — its
+     * shares are not shares of the principal the class now holds.
+     */
+    function principalOf(uint256 id) public view returns (uint256) {
+        Holding storage h = _holdings[id];
+        if (h.gen != _gen[h.class_]) return 0;
+        return _worth(h.class_, uint256(h.shares));
+    }
+}

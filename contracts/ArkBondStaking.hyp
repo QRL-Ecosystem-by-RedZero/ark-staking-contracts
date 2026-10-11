@@ -1,0 +1,262 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/security/ReentrancyGuard.hyp";
+
+import "./interfaces/IStakingVenue.hyp";
+import "./interfaces/IArkCatBond.hyp";
+import "./utils/QuantumErrors.hyp";
+
+/**
+ * Bond principal on its way to QRL staking, and on its way back.
+ *
+ * The one rule this contract exists to enforce: **what comes back from the
+ * staking venue is a return of principal only when this contract asked for
+ * principal, and the staking distribution only when it asked for the gain
+ * above principal; the two are never mixed** (whitepaper §3.4).
+ *
+ * THE VENUE
+ * ---------
+ * Bond principal is a depositor in a staking venue (`IStakingVenue`): today
+ * `ArkStakingPool` on the private network, which runs validators through an
+ * `ArkBondDelegation` of its own; later an adapter over QuantaPool on the
+ * public testnet. The bond does not run validators itself, so a validator of
+ * 40,000 QRL is funded whatever the bond's size, and the bond's position earns
+ * what the venue's validators earn, rewards and slashing alike.
+ *
+ * WHAT COMES BACK, AND AS WHAT
+ * ----------------------------
+ * The position is worth `venue.positionValue(this)`; the bond has placed
+ * `placedWithStaking()`. Above that, the difference is the staking
+ * distribution: `harvest` asks the venue for it and credits it to the holders
+ * when it arrives. Below it, the difference is a loss of principal: `syncLoss`
+ * books it on the bond, pro rata over every holding. When the bond owes
+ * principal it cannot meet from its own balance, `recall` asks the venue for
+ * principal, which `claim` returns as principal. Every request is kept with
+ * what it was for, so the claim that pays it knows which door to use.
+ *
+ * WHY THIS IS NOT PART OF ArkCatBond
+ * ----------------------------------
+ * The venue pays with a raw call, and the bond refuses a bare transfer: value
+ * reaches it only through a function that names what the value is. This
+ * contract is the one door that accepts the venue's call, and it forwards every
+ * wei it receives in the same transaction.
+ */
+/// The one read of the bond's book this contract needs beyond `IArkCatBondPrincipal`.
+interface IArkCatBondBook {
+    function state() external view returns (IArkCatBond.BondState memory);
+}
+
+contract ArkBondStaking is IArkBondStaking, ReentrancyGuard {
+    /// The pool this contract places principal for, and returns it to. Fixed at construction.
+    IArkCatBondPrincipal public immutable BOND;
+
+    /// The venue. One-shot, named after construction so a venue may take this address.
+    IStakingVenue public venue;
+
+    address private immutable _deployer;
+
+    uint8 private constant PRINCIPAL = 1;
+    uint8 private constant DISTRIBUTION = 2;
+
+    /// Venue request id -> what it was asked for (PRINCIPAL or DISTRIBUTION); zero once claimed.
+    mapping(uint256 => uint8) public requestKind;
+    /// Venue request id -> the QRL it was asked for.
+    mapping(uint256 => uint256) public requestAmount;
+
+    /// Principal asked of the venue and not yet claimed.
+    uint256 public principalInFlight;
+    /// The venue shares locked in those principal requests, and per request (OC-LEGB-07).
+    uint256 public principalSharesInFlight;
+    mapping(uint256 => uint256) public requestShares;
+    /// Gain asked of the venue and not yet claimed.
+    uint256 public distributionInFlight;
+
+    /// The kind of the claim in progress, read by `receive`. Set and cleared inside `claim`.
+    uint8 private _claiming;
+
+    event VenueSet(address indexed venue);
+    event Requested(uint256 indexed requestId, uint8 kind, uint256 amount);
+    event Harvested(uint256 indexed requestId, uint256 gain);
+
+    error NothingToHarvest(uint256 value, uint256 basis);
+    error UnknownRequest(uint256 requestId);
+    error OnlyVenue(address caller);
+
+    constructor(address bond_) {
+        if (bond_ == address(0)) revert ZeroAddress();
+        BOND = IArkCatBondPrincipal(bond_);
+        _deployer = msg.sender;
+    }
+
+    /// Name the venue. One-shot, for §7.11's reason: whoever can re-point it can deposit bond principal with themselves.
+    function setVenue(address venue_) external {
+        if (msg.sender != _deployer) revert OnlyDeployer(msg.sender);
+        if (address(venue) != address(0)) revert AlreadySet(address(venue));
+        if (venue_ == address(0)) revert ZeroAddress();
+        venue = IStakingVenue(venue_);
+        emit VenueSet(venue_);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Principal out                                                       */
+    /* ------------------------------------------------------------------ */
+
+    /// @inheritdoc IArkBondStaking
+    function place() external payable nonReentrant {
+        if (msg.sender != address(BOND)) revert OnlyBond(msg.sender);
+        if (msg.value == 0) revert ZeroValue();
+        emit Placed(msg.value);
+        venue.deposit{value: msg.value}();
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The gain and the loss                                               */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * The position's value plus the principal already on its way back: what the
+     * bond's placed principal is set against. The principal on its way back
+     * counts at what its locked shares are worth now, never above what was
+     * asked: they keep bearing the venue's losses until settled, so a loss on
+     * them reaches `syncLoss` before the claim does, and a gain on them is not
+     * harvested as distribution ahead of coming back as principal (OC-LEGB-07).
+     */
+    function _backing() private view returns (uint256) {
+        uint256 inFlight = principalInFlight;
+        if (inFlight != 0) {
+            uint256 worth = venue.valueOfShares(principalSharesInFlight);
+            if (worth < inFlight) inFlight = worth;
+        }
+        return venue.positionValue(address(this)) + inFlight;
+    }
+
+    /**
+     * Ask the venue for the gain above placed principal: the staking
+     * distribution of whitepaper §3.4. Any sender; the destination is the
+     * holders and the caller chooses only when.
+     */
+    function harvest() external nonReentrant returns (uint256 requestId) {
+        uint256 backing = _backing();
+        uint256 placed = BOND.placedWithStaking();
+        if (backing <= placed) revert NothingToHarvest(backing, placed);
+        uint256 gain = backing - placed;
+        uint256 shares = venue.sharesFor(gain);
+        uint256 held = venue.sharesOf(address(this));
+        // The gain is at most the position; a share's rounding may ask one more than is held.
+        if (shares > held) shares = held;
+        requestId = _request(shares, DISTRIBUTION, gain);
+        emit Harvested(requestId, gain);
+    }
+
+    /**
+     * Book a position worth less than the principal placed as a loss of bond
+     * principal, borne pro rata by every holding then outstanding. Any sender,
+     * idempotent: once booked, the difference is zero. The bond calls it
+     * before it prices principal for a payment.
+     */
+    function syncLoss() external returns (uint256 loss) {
+        uint256 backing = _backing();
+        uint256 placed = BOND.placedWithStaking();
+        if (backing >= placed) return 0;
+        loss = placed - backing;
+        emit LossRecorded(loss);
+        BOND.recordLoss(loss);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Principal back                                                      */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Ask the venue for principal the bond owes and cannot meet: principal owed
+     * now, less the bond's own cover and principal already on its way back.
+     * Any sender; the amount is measured, never supplied beyond it.
+     */
+    function recall(uint256 amount) external nonReentrant returns (uint256 requestId) {
+        if (amount == 0) revert ZeroValue();
+        uint256 owed = BOND.principalOwedNow();
+        uint256 cover = _bondCover() + principalInFlight;
+        if (owed <= cover) revert NoShortfall(owed, cover);
+        uint256 short = owed - cover;
+        if (amount > short) amount = short;
+        uint256 shares = venue.sharesFor(amount);
+        uint256 held = venue.sharesOf(address(this));
+        if (shares > held) shares = held;
+        requestId = _request(shares, PRINCIPAL, amount);
+        emit Recalled(requestAmount[requestId]);
+    }
+
+    function _request(uint256 shares, uint8 kind, uint256 amount) private returns (uint256 requestId) {
+        if (shares == 0) revert ZeroValue();
+        requestId = venue.requestWithdrawal(shares);
+        requestKind[requestId] = kind;
+        if (kind == PRINCIPAL) {
+            // Recorded at no more than the shares asked are worth, priced
+            // after the request has converted any pending batch: capped at
+            // what is held, they may be worth less than the shortfall
+            // (OC-LEGB-07).
+            uint256 worth = venue.valueOfShares(shares);
+            if (amount > worth) amount = worth;
+            principalInFlight += amount;
+            principalSharesInFlight += shares;
+            requestShares[requestId] = shares;
+        } else {
+            distributionInFlight += amount;
+        }
+        requestAmount[requestId] = amount;
+        emit Requested(requestId, kind, amount);
+    }
+
+    /**
+     * Claim a settled request and pass it on by what it was for. Any sender.
+     * What arrives may differ from what was asked by the value's move since the
+     * request; the difference is the position's, and `syncLoss` or the next
+     * `harvest` accounts for it.
+     */
+    function claim(uint256 requestId) external nonReentrant returns (uint256 amount) {
+        uint8 kind = requestKind[requestId];
+        if (kind == 0) revert UnknownRequest(requestId);
+        uint256 asked = requestAmount[requestId];
+        delete requestKind[requestId];
+        delete requestAmount[requestId];
+        if (kind == PRINCIPAL) {
+            principalInFlight -= asked;
+            principalSharesInFlight -= requestShares[requestId];
+            delete requestShares[requestId];
+        } else {
+            distributionInFlight -= asked;
+        }
+
+        _claiming = kind;
+        amount = venue.claimWithdrawal(requestId);
+        _claiming = 0;
+    }
+
+    /**
+     * The bond's balance that can meet principal owed: everything it holds
+     * outside the holders' distribution pot.
+     */
+    function _bondCover() private view returns (uint256) {
+        IArkCatBond.BondState memory s = IArkCatBondBook(address(BOND)).state();
+        uint256 bal = address(BOND).balance;
+        return bal > s.freePool ? bal - s.freePool : 0;
+    }
+
+    /**
+     * Accept value from the venue during a claim, and at no other time. It
+     * leaves for the bond in the same call, through the door the request named.
+     */
+    receive() external payable {
+        if (msg.sender != address(venue)) revert OnlyVenue(msg.sender);
+        uint8 kind = _claiming;
+        if (kind == PRINCIPAL) {
+            BOND.returnPrincipal{value: msg.value}();
+        } else if (kind == DISTRIBUTION) {
+            emit Distributed(msg.value);
+            BOND.creditDistribution{value: msg.value}();
+        } else {
+            revert OnlyVenue(msg.sender);
+        }
+    }
+}

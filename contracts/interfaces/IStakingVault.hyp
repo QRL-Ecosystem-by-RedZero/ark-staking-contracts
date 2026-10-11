@@ -1,0 +1,149 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./IArkTiers.hyp";
+
+/**
+ * Tier-scoped underwriting and jury stake.
+ *
+ * THE ONE RULE THIS CONTRACT EXISTS TO ENFORCE
+ * --------------------------------------------
+ * Stake is scoped to a single insurance tier, and jurors for a dispute in tier
+ * N are drawn ONLY from the pool of tier N. The people who decide a Citadel
+ * claim are exactly the people whose capital is slashed if they decide it
+ * wrongly. Nobody votes on a risk they do not carry.
+ *
+ * A global stake pool would break this: holders with no Citadel exposure would
+ * decide Citadel claims, and the cheapest vote would always be the one that
+ * protects the pool they are actually in.
+ *
+ * DELEGATION IS NOT RISK-FREE YIELD
+ * ---------------------------------
+ * A delegator picks a tier (choosing a risk/return point) and an operator (who
+ * actually votes). The delegator earns the operator's residual yield and
+ * SHARES THE OPERATOR'S SLASHING pro rata. This must be stated plainly in the
+ * user-facing documentation; a protocol that markets delegation as free yield
+ * gets a confidence crisis at its first slash.
+ *
+ * UNBONDING OUTLASTS DISPUTES
+ * ---------------------------
+ * Unbonding takes 21 days, deliberately longer than the longest possible
+ * dispute cycle (a 7-day challenge window plus up to three appeal rounds). A
+ * shorter unbonding period would let a juror who knows the verdict is going
+ * against them exit before the slash lands, which would make slashing — and
+ * therefore the whole incentive structure of the court — unenforceable.
+ */
+interface IStakingVault {
+    /// A delegation from one account to one operator inside one tier.
+    struct Delegation {
+        uint256 amount;
+        address operator;
+        IArkTiers.InsuranceTier tier;
+        uint64 unbondingEnd;
+    }
+
+    event Staked(
+        address indexed delegator,
+        address indexed operator,
+        IArkTiers.InsuranceTier indexed tier,
+        uint256 amount
+    );
+    event UnbondingStarted(address indexed delegator, uint256 amount, uint64 releaseTime);
+    event Withdrawn(address indexed delegator, uint256 amount);
+    event OperatorRegistered(address indexed operator, IArkTiers.InsuranceTier indexed tier, uint16 commissionBps);
+    event RewardsDistributed(IArkTiers.InsuranceTier indexed tier, uint256 amount);
+    event Slashed(address indexed operator, IArkTiers.InsuranceTier indexed tier, uint256 amount, bytes32 indexed caseId);
+
+    /// Only the dispute court may slash. No governance path reaches this.
+    error OnlyDisputeCourt(address caller);
+
+    /// The operator is not registered for the requested tier.
+    error UnknownOperator(address operator, uint8 tier);
+
+    /// Stake is still unbonding and cannot be withdrawn yet.
+    error StillUnbonding(uint64 releaseTime, uint64 currentTime);
+
+    /// No unbonding request is in flight for this delegator.
+    error NotUnbonding(address delegator);
+
+    /// Commission is outside the permitted band.
+    error CommissionOutOfRange(uint16 requested, uint16 maximum);
+
+    /// The stake requested for slashing exceeds what the operator's pool holds.
+    error SlashExceedsStake(uint256 available, uint256 requested);
+
+    /// Fixed unbonding delay, in seconds. Longer than the longest dispute cycle.
+    function UNBONDING_PERIOD() external view returns (uint64);
+
+    /**
+     * Stakes ARK into one tier under one operator.
+     *
+     * @param tier The insurance tier whose risk and yield the delegator accepts.
+     * @param operator The operator that will vote as a juror with this weight.
+     * @param amount ARK to stake, transferred from the caller.
+     */
+    function stake(IArkTiers.InsuranceTier tier, address operator, uint256 amount) external;
+
+    /// @notice Starts the 21-day unbonding clock for `amount`. Weight is removed immediately.
+    function beginUnbonding(uint256 amount) external;
+
+    /// @notice Withdraws stake whose unbonding period has elapsed.
+    function withdraw() external;
+
+    /// @notice Moves stake to a different operator inside the same tier, without unbonding.
+    function redelegate(address newOperator) external;
+
+    /**
+     * Registers the caller as an operator for one tier.
+     *
+     * @param tier The tier this operator will judge and underwrite.
+     * @param commissionBps The operator's cut of delegator rewards, in bps.
+     */
+    function registerOperator(IArkTiers.InsuranceTier tier, uint16 commissionBps) external;
+
+    /**
+     * Credits a tier pool with its share of premium revenue.
+     *
+     * @dev Called by ICapitalPool with the 15% underwriter slice. Rewards are
+     *      accounted with a cumulative-index model, never by iterating holders.
+     * @param tier The tier being credited.
+     */
+    function distributeRewards(IArkTiers.InsuranceTier tier) external payable;
+
+    /// @notice Claims accrued QRL rewards for the caller.
+    function claimRewards() external returns (uint256 amount);
+
+    /**
+     * Slashes an operator and, pro rata, everyone delegated to it.
+     *
+     * @dev Callable only by IDisputeCourt. Slashed ARK is routed to the capital
+     *      pool and to the successful challenger, never burned: burning would
+     *      destroy value that the harmed party is owed.
+     * @param operator The operator being penalised.
+     * @param amount ARK to slash.
+     * @param caseId The dispute that authorised this slash.
+     */
+    function slash(address operator, uint256 amount, bytes32 caseId) external;
+
+    /// @param tier The tier being queried.
+    /// @return Total ARK bonded in that tier's pool.
+    function totalStaked(IArkTiers.InsuranceTier tier) external view returns (uint256);
+
+    /// @param delegator The account being queried.
+    /// @return That account's delegation record.
+    function delegationOf(address delegator) external view returns (Delegation memory);
+
+    /**
+     * Jury draw weight of a candidate inside one tier.
+     *
+     * @dev Combines tier stake with veARK, then applies a per-address cap so a
+     *      single whale cannot take a majority of any jury.
+     * @param candidate The account being considered.
+     * @param tier The tier of the dispute being judged.
+     * @return The capped draw weight; zero if the candidate has no stake in that tier.
+     */
+    function drawWeight(address candidate, IArkTiers.InsuranceTier tier)
+        external
+        view
+        returns (uint256);
+}

@@ -1,0 +1,30 @@
+{
+  "name": "hoodi-vps-legacy",
+  "chainId": 560048,
+  "profile": "testnet",
+  "evmVersion": "shanghai",
+  "qrlOwnerLength": 20,
+  "finality": "finalized",
+  "confirmations": 64,
+  "deliveryMarginSeconds": 120,
+  "deployedFromBlock": 3659379,
+  "assets": [
+    {
+      "symbol": "stETH",
+      "address": "0x3508A952176b3c15387C97BE809eaffB1982176a",
+      "source": "lido",
+      "rebasing": true,
+      "correlationGroup": "group:lido-like",
+      "exitBoundBps": 2500,
+      "escrow": "0x33E36f8ED46EC6Be892759Df1C911842a95f9c2E",
+      "seedMinimum": "10000000000000000",
+      "admissionYieldBps": 300
+    }
+  ],
+  "addresses": {
+    "relay": "0xA3AB8C3D689E3149D74a2426d1807CFC2BD0e75c",
+    "operationsDestination": "0x6086b810C9D266F937c0304f043a9ba9ed9E6a78"
+  },
+  "logChunkBlocks": 500,
+  "note": "The hoodi-vps relay and stETH escrow before the 2026-09-25 redeploy. Bytecode older than this tree: settlePremium, no claimPremium. Kept so the positions still in the escrow can be released; run its relayer only while releasing, from the host HOODI_VPS_LEGACY_RELAYER_HOST names."
+}

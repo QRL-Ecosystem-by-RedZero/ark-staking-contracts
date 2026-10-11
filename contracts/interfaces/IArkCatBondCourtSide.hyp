@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * The calls the product's dispute court makes on the bond (whitepaper §5.1,
+ * §5.4, §6.2; yellow paper §1.4, §4.3). The bond accepts each from the account
+ * it names as its court (`setCourt`, one-shot) and refuses it unless its own
+ * record admits it — a finding with `IArkCatBond.FindingRefused(cause)`, the
+ * one revert the court records as a refusal (re-audit 2026-09-30, COURT-02).
+ *
+ * The first two are build 1's: a determination is open, and when it opened,
+ * which suspends issuance and holds a maturity inside the dispute cycle
+ * (whitepaper §5.3). The four after them are the findings build 2 (phase C3)
+ * settles on: a trigger-1 finding with each affected position's loss in
+ * units of the origin asset, the censorship ground with its qualifying
+ * transit, the m_loss of a held trigger-2 balance, and a recovery's realised
+ * escrow on an admitted successor with the anchored base the positions' part
+ * divides over. `ArkStakeCourt` makes these calls on a verdict (phase C4);
+ * `MockDisputeCourt` states them in the unit suite.
+ *
+ * `value` (OC-COURT-01) is V of the case as the court admitted and bounded
+ * it at the assertion (I24, G8), in QRL: the most bond principal the
+ * finding moves. A trigger-1 finding draws no more than it, and a censorship
+ * slice's V bounds the floor draw its upheld part makes at the opening.
+ */
+interface IArkCatBondCourtSide {
+    function openDetermination(bytes32 determinationId) external;
+    function closeDetermination(bytes32 determinationId) external;
+    function determineLoss(bytes32 determinationId, bytes32[] calldata ids, uint256[] calldata lossUnits, uint256 value)
+        external;
+    function determineCensorship(bytes32 determinationId, uint256 transitUnits, uint256 value) external;
+    function fixSeverity(uint256 measuredLossBps) external;
+    /// A finding heard as `n` value slices (whitepaper §6.2, EC-04): the censorship ground (kind 2) or a held balance (kind 3).
+    function openSlices(bytes32 group, uint8 kind, uint8 n) external;
+    /**
+     * Slice `i` of `group` on its verdict; `payload` is the finding's (the
+     * transit, or m_loss) and is read only where upheld. Every slice of the
+     * group closes (re-audit 2026-09-30, BOND-07): `applied` is false for an
+     * upheld slice the bond's record no longer admits, which closes as
+     * rejected, so the group always completes.
+     */
+    function closeSlice(bytes32 group, uint8 i, bool upheld, bytes calldata payload, uint256 value)
+        external
+        returns (bool applied);
+    function openRecovery(
+        bytes32 recoveryId,
+        uint256 chainId,
+        bytes32 successorId,
+        address escrow,
+        uint256 realisedUnits,
+        uint256 anchoredBase
+    ) external;
+}

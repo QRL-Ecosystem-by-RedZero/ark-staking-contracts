@@ -1,0 +1,368 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/token/ERC20/IERC20.hyp";
+import "./lib/openzeppelin/security/ReentrancyGuard.hyp";
+
+import "./interfaces/IVeArk.hyp";
+import "./utils/QuantumErrors.hyp";
+
+/**
+ * veARK — non-transferable, time-locked ARK.
+ *
+ * See IVeArk for why locking is mandatory for governance. This contract adds
+ * the arithmetic and one deliberate approximation, described below.
+ *
+ * WEIGHT CURVE
+ * ------------
+ *     multiplier = 10000 + 30000 * remaining / MAX_LOCK, capped at 40000
+ *     weight     = amount * multiplier / 10000
+ *
+ * A lock at maximum duration counts 4x; one at expiry counts 1x. Note the floor:
+ * weight decays to the amount locked, never to zero. An expired lock is still
+ * ARK the holder chose not to sell, and stripping it of all say would push
+ * people to withdraw and re-lock on a treadmill that produces nothing.
+ *
+ * WHY THERE IS NO `transfer`
+ * --------------------------
+ * Not "transfers revert" — the functions do not exist. A transferable lock is a
+ * tradable vote with extra steps, and it re-creates the vote market that
+ * locking exists to close.
+ *
+ * TWO MEASURES OF WEIGHT, AND WHY BOTH EXIST
+ * ------------------------------------------
+ * `weightOf` is the live figure, computed from the clock on read, and always
+ * exact. `unitsOf` is the same figure as of that account's last SYNC, and it is
+ * what dividends and the quorum denominator are actually measured in.
+ *
+ * The split exists because weight decays with the clock while storage only
+ * changes with a transaction. Anything that must add up across all accounts —
+ * a dividend index, a quorum total — has to be denominated in something that
+ * only moves when someone writes to it. Units are that something, and
+ * `totalWeightAt` is exactly their sum, so the aggregate and the parts can
+ * never disagree.
+ *
+ * The cost is that a lock nobody touches keeps its opening weight and quietly
+ * over-earns. `syncWeight` corrects that and is permissionless, because the
+ * incentive already points the right way: syncing a stale account down raises
+ * every other locker's share, so the people who benefit are the people who can
+ * act. Settling before the resync means the stale account keeps what it really
+ * accrued; only its future share is corrected.
+ *
+ * THE DIVIDEND IS PAID IN QRL
+ * ---------------------------
+ * `distributeDividend` receives the 5% premium slice the tokenomics assigns to
+ * lockers. It is native QRL, not freshly minted ARK: the value accruing to a
+ * locker is a share of real revenue, not dilution of everyone else.
+ */
+contract VeArk is IVeArk, ReentrancyGuard {
+    /// Shortest permitted lock.
+    uint64 public constant MIN_LOCK = 7 days;
+
+    /// Longest permitted lock, and the duration that earns the maximum boost.
+    uint64 public constant MAX_LOCK = 4 * 365 days;
+
+    /// Weight multiplier at maximum lock, in bps.
+    uint16 public constant MAX_BOOST_BPS = 40000;
+
+    /// Weight multiplier at expiry, in bps.
+    uint16 public constant MIN_BOOST_BPS = 10000;
+
+    uint16 private constant BPS = 10000;
+
+    /// Fixed-point precision for the dividend index.
+    uint256 public constant ACC = 1e18;
+
+    IERC20 public immutable ark;
+
+    mapping(address => Lock) private _locks;
+
+    /// Checkpointed aggregate weight; see the approximation note in the header.
+    struct Checkpoint {
+        uint32 fromBlock;
+        uint224 weight;
+    }
+
+    Checkpoint[] private _totalCheckpoints;
+    uint256 private _totalWeight;
+
+    /// Weight as of each account's last sync. The aggregate above is their sum.
+    mapping(address => uint256) private _units;
+
+    /// Cumulative QRL paid per unit of weight, scaled by ACC.
+    uint256 private _accQrlPerUnit;
+    mapping(address => uint256) private _rewardDebt;
+    mapping(address => uint256) private _credited;
+
+    /// Remainder of the last index division, carried into the next distribution.
+    uint256 private _dust;
+
+    constructor(address ark_) {
+        if (ark_ == address(0)) revert ZeroAddress();
+        ark = IERC20(ark_);
+    }
+
+    function createLock(uint256 amount, uint64 unlockTime) external nonReentrant {
+        if (amount == 0) revert ZeroValue();
+        if (_locks[msg.sender].amount != 0) revert LockAlreadyExists(msg.sender);
+
+        uint64 nowTs = uint64(block.timestamp);
+        _checkDuration(nowTs, unlockTime);
+
+        _locks[msg.sender] = Lock({amount: amount, start: nowTs, end: unlockTime});
+        _resync(msg.sender);
+
+        if (!ark.transferFrom(msg.sender, address(this), amount)) {
+            revert TransferFailed(address(this), amount);
+        }
+
+        emit LockCreated(msg.sender, amount, unlockTime);
+    }
+
+    function increaseAmount(uint256 amount) external nonReentrant {
+        if (amount == 0) revert ZeroValue();
+
+        Lock storage lock = _locks[msg.sender];
+        if (lock.amount == 0) revert NoLock(msg.sender);
+
+        uint64 nowTs = uint64(block.timestamp);
+        if (lock.end <= nowTs) revert LockNotExpired(lock.end, nowTs);
+
+        _settle(msg.sender);
+        lock.amount += amount;
+        _resync(msg.sender);
+
+        if (!ark.transferFrom(msg.sender, address(this), amount)) {
+            revert TransferFailed(address(this), amount);
+        }
+
+        emit LockIncreased(msg.sender, amount, lock.amount);
+    }
+
+    /**
+     * Extends a lock. Shortening is impossible: there is no branch for it.
+     *
+     * @dev Being able to shorten would let a holder vote at 4x and then cut the
+     *      lock to a week the moment the vote lands, which is precisely the
+     *      short-horizon behaviour locking is meant to price out.
+     */
+    function extendLock(uint64 newUnlockTime) external {
+        Lock storage lock = _locks[msg.sender];
+        if (lock.amount == 0) revert NoLock(msg.sender);
+        if (newUnlockTime <= lock.end) revert LockCannotShorten(lock.end, newUnlockTime);
+
+        uint64 nowTs = uint64(block.timestamp);
+        _checkDuration(nowTs, newUnlockTime);
+
+        _settle(msg.sender);
+        uint64 previous = lock.end;
+        lock.end = newUnlockTime;
+        _resync(msg.sender);
+
+        emit LockExtended(msg.sender, previous, newUnlockTime);
+    }
+
+    /**
+     * Withdraws a matured lock in full.
+     *
+     * @dev There is no partial or early exit. A penalised early exit would put a
+     *      price on abandoning the long horizon, and anyone bribing a vote would
+     *      simply pay it.
+     */
+    function withdraw() external nonReentrant {
+        Lock storage lock = _locks[msg.sender];
+        if (lock.amount == 0) revert NoLock(msg.sender);
+
+        uint64 nowTs = uint64(block.timestamp);
+        if (nowTs < lock.end) revert LockNotExpired(lock.end, nowTs);
+
+        uint256 amount = lock.amount;
+        _settle(msg.sender);
+        delete _locks[msg.sender];
+        _resync(msg.sender);
+
+        if (!ark.transfer(msg.sender, amount)) revert TransferFailed(msg.sender, amount);
+
+        emit Withdrawn(msg.sender, amount);
+    }
+
+    function lockOf(address account) external view returns (Lock memory) {
+        return _locks[account];
+    }
+
+    function weightOf(address account) public view returns (uint256) {
+        Lock storage lock = _locks[account];
+        if (lock.amount == 0) return 0;
+        return _weight(lock.amount, lock.end, uint64(block.timestamp));
+    }
+
+    /**
+     * Jury draw weight contributed by veARK.
+     *
+     * @dev Equal to governance weight, but read separately on purpose: this is
+     *      only ONE FACTOR of the draw. IStakingVault multiplies it by
+     *      tier-scoped stake, so a large veARK position with nothing staked in a
+     *      tier still cannot judge that tier — it would have nothing to lose.
+     */
+    function juryWeightOf(address account) external view returns (uint256) {
+        return weightOf(account);
+    }
+
+    function totalWeightAt(uint256 blockNumber) external view returns (uint256) {
+        if (blockNumber >= block.number) revert FutureLookup(blockNumber, block.number);
+
+        uint256 high = _totalCheckpoints.length;
+        uint256 low = 0;
+        while (low < high) {
+            uint256 mid = (low + high) / 2;
+            if (_totalCheckpoints[mid].fromBlock > blockNumber) high = mid;
+            else low = mid + 1;
+        }
+        return low == 0 ? 0 : _totalCheckpoints[low - 1].weight;
+    }
+
+    /// @return The aggregate weight as of the last mutation; see the header note.
+    function totalWeight() external view returns (uint256) {
+        return _totalWeight;
+    }
+
+    /// @notice Current boost multiplier for an account, in bps. 10000 = 1x.
+    function boostBpsOf(address account) external view returns (uint16) {
+        Lock storage lock = _locks[account];
+        if (lock.amount == 0) return 0;
+        return _boostBps(lock.end, uint64(block.timestamp));
+    }
+
+    function _checkDuration(uint64 nowTs, uint64 unlockTime) private pure {
+        if (unlockTime <= nowTs) revert LockDurationOutOfRange(0, MIN_LOCK, MAX_LOCK);
+        uint64 duration = unlockTime - nowTs;
+        if (duration < MIN_LOCK || duration > MAX_LOCK) {
+            revert LockDurationOutOfRange(duration, MIN_LOCK, MAX_LOCK);
+        }
+    }
+
+    function _boostBps(uint64 end, uint64 nowTs) private pure returns (uint16) {
+        if (end <= nowTs) return MIN_BOOST_BPS;
+        uint256 remaining = end - nowTs;
+        if (remaining > MAX_LOCK) remaining = MAX_LOCK;
+        // Multiply before dividing; the reverse truncates every sub-year lock to
+        // a flat 1x.
+        return uint16(MIN_BOOST_BPS + ((MAX_BOOST_BPS - MIN_BOOST_BPS) * remaining) / MAX_LOCK);
+    }
+
+    function _weight(uint256 amount, uint64 end, uint64 nowTs) private pure returns (uint256) {
+        return (amount * _boostBps(end, nowTs)) / BPS;
+    }
+
+    /**
+     * Pays the veARK dividend slice into the contract.
+     *
+     * @dev The 5% of every premium that the tokenomics assigns to lockers,
+     *      settled in QRL rather than in fresh ARK. Callable by anyone; in
+     *      production it is ICapitalPool, and only after the solvency-first rule
+     *      has decided this slice is payable at all.
+     *
+     *      Reverts when nobody holds a lock. Silently swallowing the value would
+     *      strand it here with no owner and no way out.
+     */
+    function distributeDividend() external payable {
+        if (msg.value == 0) revert ZeroValue();
+        if (_totalWeight == 0) revert NoLockedWeight();
+
+        // Integer division always leaves a remainder. Carrying it into the next
+        // round is what makes "nothing is stranded" true rather than merely
+        // nearly true: dust accumulates until it is large enough to distribute,
+        // instead of being quietly abandoned a few wei at a time forever.
+        uint256 amount = msg.value + _dust;
+        uint256 delta = (amount * ACC) / _totalWeight;
+        _accQrlPerUnit += delta;
+        _dust = amount - (delta * _totalWeight) / ACC;
+
+        emit DividendDistributed(amount - _dust, _accQrlPerUnit, _totalWeight);
+    }
+
+    /// @return Remainder held back from the last division, paid out in a later round.
+    function carriedDust() external view returns (uint256) {
+        return _dust;
+    }
+
+    /// @notice Pays out everything accrued to the caller.
+    function claimDividend() external nonReentrant returns (uint256 amount) {
+        _settle(msg.sender);
+
+        amount = _credited[msg.sender];
+        if (amount == 0) revert NothingToClaim(msg.sender);
+        _credited[msg.sender] = 0;
+
+        (bool ok,) = msg.sender.call{value: amount}("");
+        if (!ok) revert TransferFailed(msg.sender, amount);
+
+        emit DividendClaimed(msg.sender, amount);
+    }
+
+    /// @param account The locker being queried.
+    /// @return QRL claimable right now.
+    function pendingDividend(address account) external view returns (uint256) {
+        uint256 accrued = (_units[account] * _accQrlPerUnit) / ACC;
+        uint256 debt = _rewardDebt[account];
+        return _credited[account] + (accrued > debt ? accrued - debt : 0);
+    }
+
+    /**
+     * Brings an account's weight units in line with its decayed live weight.
+     *
+     * @dev Dividends and the quorum denominator are both measured in UNITS,
+     *      which only move when a transaction touches the lock. A lock nobody
+     *      touches therefore keeps its opening weight and quietly over-earns.
+     *
+     *      The correction is permissionless rather than automatic because the
+     *      incentive already points the right way: every OTHER locker gains when
+     *      a stale account is synced down, so the people motivated to call this
+     *      are exactly the people it pays. Settling first means the stale account
+     *      keeps what it genuinely accrued up to this moment; only its future
+     *      share is corrected.
+     * @param account The locker to refresh.
+     */
+    function syncWeight(address account) public {
+        uint256 previous = _units[account];
+        _settle(account);
+        _resync(account);
+        if (previous != _units[account]) emit WeightSynced(account, previous, _units[account]);
+    }
+
+    /// @param account The locker being queried.
+    /// @return Weight as of that account's last sync, the unit dividends are paid on.
+    function unitsOf(address account) external view returns (uint256) {
+        return _units[account];
+    }
+
+    /// Credits what an account has earned on its CURRENT units, then freezes the debt.
+    function _settle(address account) private {
+        uint256 accrued = (_units[account] * _accQrlPerUnit) / ACC;
+        uint256 debt = _rewardDebt[account];
+        if (accrued > debt) _credited[account] += accrued - debt;
+        _rewardDebt[account] = accrued;
+    }
+
+    /// Recomputes an account's units from its live weight and rebases the aggregate.
+    function _resync(address account) private {
+        uint256 previous = _units[account];
+        uint256 current = weightOf(account);
+        _units[account] = current;
+        _rewardDebt[account] = (current * _accQrlPerUnit) / ACC;
+        _bumpTotal(previous, current);
+    }
+
+    function _bumpTotal(uint256 previous, uint256 current) private {
+        _totalWeight = _totalWeight + current - previous;
+
+        uint256 len = _totalCheckpoints.length;
+        if (len > 0 && _totalCheckpoints[len - 1].fromBlock == uint32(block.number)) {
+            _totalCheckpoints[len - 1].weight = uint224(_totalWeight);
+        } else {
+            _totalCheckpoints.push(
+                Checkpoint({fromBlock: uint32(block.number), weight: uint224(_totalWeight)})
+            );
+        }
+    }
+}

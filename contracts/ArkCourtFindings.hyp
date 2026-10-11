@@ -1,0 +1,598 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./interfaces/IArkStakeCourt.hyp";
+import "./interfaces/IArkCatBondCourtSide.hyp";
+import "./interfaces/IArkCatBond.hyp";
+import "./interfaces/IArkStakeParams.hyp";
+import "./interfaces/IArkStakeExternal.hyp";
+import "./interfaces/IArkStakeRegistry.hyp";
+import "./interfaces/IArkJurorPool.hyp";
+import "./utils/ArkStakeMath.hyp";
+import "./utils/ArkEpoch.hyp";
+
+/// What the court reads of the registry: the settlement price a loss is valued on, the valuation oracle, and V_max's terms.
+interface IArkCourtBook {
+    function settlementPrice() external view returns (uint256);
+    function priceOracle() external view returns (address);
+    function requiredCapital() external view returns (uint256);
+    function effectiveAttachmentBps() external view returns (uint256);
+    function censorshipNotionalMax() external view returns (uint256);
+    function carriedPrice() external view returns (uint256 carried, uint64 epoch, uint64 firedPlusOne);
+    function deadOracleOpeningPrice() external view returns (uint256);
+    function anchorOf(bytes32 id) external view returns (IArkStakeRegistry.Anchor memory);
+}
+
+/// What the court reads of the bond besides the calls it makes on it.
+interface IArkCourtBond {
+    /// `ArkCatBondStore.Declaration`, field for field (the ABI is the layout).
+    struct Declaration {
+        uint8 stage;
+        bool censorship;
+        uint16 d0;
+        uint16 severityFloor;
+        uint16 windowEpochs;
+        uint64 epoch;
+        uint64 declaredAt;
+        uint256 price;
+        uint256 base;
+        uint256 pool;
+        uint256 drawn;
+        uint256 held;
+        uint128[2] drawnByClass;
+        uint128[2] heldByClass;
+        uint128[2] sharesAt;
+        uint16[2] genAt;
+        uint256 weight;
+        uint256 fullSettlement;
+        uint256 refOpen;
+        uint16 severityCeiling;
+        uint256 capUnits;
+        uint256 z;
+        uint256 phiOpen;
+    }
+
+    function outstandingPrincipal() external view returns (uint256);
+    function declaration() external view returns (Declaration memory);
+    /// `P_rem` of one escrow, in origin units at the declaration's price (`ArkCatBondRecovery`, at the bond's address).
+    function recoveryResidual(uint256 chainId, address escrow)
+        external
+        view
+        returns (uint256 residual, uint256 juniorRemaining, uint256 seniorRemaining);
+}
+
+/**
+ * The four findings of `ArkStakeCourt`, by kind: what each can move (V, and
+ * the seat that bounds it), and its delivery to the bond (whitepaper §5.1,
+ * §5.4, §6.2; yellow paper §4.1, §4.3).
+ *
+ * THE ONE RULE
+ * ------------
+ * **A finding is valued before it is heard and delivered as it was asserted.**
+ * `quote` fixes V and the seat at the opening (G8, I24′); `deliver` hands the
+ * payload the verdict upheld to the bond, and a refusal there is recorded,
+ * never retried with other figures — and the asserter's deposit is forfeited
+ * for it (audit 2026-09-29, QL-20). A refusal is the bond's one refusal
+ * error, `FindingRefused`, and nothing else: any other revert, a call starved
+ * of gas included (QL-22), reverts `finalize`, which is sent again (re-audit
+ * 2026-09-30, COURT-02).
+ *
+ * WHY A SECOND BODY OF CODE
+ * -------------------------
+ * The court's v3 runtime was 146 bytes under EIP-170 with this inside it. The
+ * court's constructor creates this contract and fixes its address; the court
+ * reads `quote` by a plain call and runs `deliver` by `delegatecall`, so the
+ * bond sees the court as its caller (`onlyCourt`). This contract holds no
+ * value and refuses `deliver` outside the delegatecall (`SELF`). The pattern
+ * is `ArkCatBondExit`'s. Its one slot, the carried ARK price (OC-ORC-03), is
+ * written by plain calls alone (`quoteFor`, `carryArkPrice`); `deliver` runs
+ * on the court's storage and never reads or writes it.
+ */
+contract ArkCourtFindings {
+    uint256 private constant BPS = 10_000;
+    uint256 private constant PRICE_SCALE = 1e18;
+
+    /// ceil(7 / 2): the first panel's deciding majority, in seats.
+    uint256 private constant FIRST_MAJORITY = 4;
+
+    uint8 private constant LOSS = 1;
+    uint8 private constant CENSORSHIP = 2;
+    uint8 private constant SEVERITY = 3;
+    uint8 private constant RECOVERY = 4;
+
+    /// `ArkCatBondStore.T2_HELD`: a trigger-2 balance held under a silent series.
+    uint8 private constant T2_HELD = 2;
+
+    IArkCatBondCourtSide public immutable BOND;
+    IArkCourtBook public immutable REGISTRY;
+    IArkStakeParams public immutable PARAMS;
+    address public immutable ARK;
+    /// The constructor floor of the minimum juror stake (whitepaper §6.4); the seat in force is indexed on V_max (`seatNow`).
+    uint256 public immutable MIN_STAKE;
+    /// The juror pool, read by the S3 readiness view and the concurrency cap.
+    IArkJurorPool public immutable POOL;
+    /**
+     * `base_orig`, the court's deposit base in base units of the origin asset
+     * (yellow paper §5.1; technical reference §3.4, 2026-10-06; 1e16, 0.01 of
+     * the asset, at the reference deployment): the smallest loss heard,
+     * compared before any conversion, and, at the settlement price at the
+     * assertion, the base of the first deposit. Replaces a base in QRL, which
+     * moved the smallest loss heard with the rate.
+     */
+    uint256 public immutable DEPOSIT_BASE_ORIG;
+    /// The least first deposit, seven juror fees, in QRL (yellow paper §5.1; technical reference §3.4).
+    uint256 public immutable MIN_DEPOSIT;
+    address private immutable SELF;
+
+    /// The last ARK price the valuation oracle gave, valuing the seat while it gives none (OC-ORC-03); zero until one is read.
+    uint256 public carriedArkPrice;
+
+    /// The assertion deposit as a share of V, above its base (reference value, not calibrated).
+    uint256 public constant DEPOSIT_RATE_BPS = 100;
+
+    /// The first panel of a case: seven seats.
+    uint256 private constant FIRST_PANEL = 7;
+
+    /// The distinct jurors one case can seat through its retrial, 7 + 14 + 28 (the model's `COURT_SEATS_THROUGH_RETRIAL`).
+    uint256 public constant SEATS_THROUGH_RETRIAL = 49;
+
+    event FindingApplied(bytes32 indexed caseId, uint8 kind);
+    event FindingRefused(bytes32 indexed caseId, uint8 kind, bytes reason);
+
+    error BadKind(uint8 kind);
+    error BadPayload();
+    error ClaimAboveBound(uint256 claimArk, uint256 boundArk);
+    /// No ARK price from the valuation oracle, and none carried from an earlier reading (OC-ORC-03).
+    error ArkUnpriced();
+    error SeverityNotOpen(uint256 opensAtEpoch);
+    /// A single fact worth more than MAX_SLICES slices at the seat in force (whitepaper §6.2, EC-04).
+    error TooManySlices(uint256 slices);
+    /// A loss names a position the registry does not know (OC-COURT-02).
+    error NotAnchored(bytes32 id);
+    /// A loss below `DEPOSIT_BASE_ORIG` is not heard (OC-COURT-02; yellow paper §5.1): both in origin units, the loss capped at K.
+    error LossBelowFloor(uint256 value, uint256 floor);
+
+    /// The most value slices one finding opens: the bond's group masks are sixteen bits.
+    uint256 public constant MAX_SLICES = 16;
+
+    constructor(
+        address bond_,
+        address registry_,
+        address params_,
+        address ark_,
+        uint256 minStake_,
+        address pool_,
+        uint256 depositBaseOrig_,
+        uint256 minDeposit_
+    ) {
+        BOND = IArkCatBondCourtSide(bond_);
+        REGISTRY = IArkCourtBook(registry_);
+        PARAMS = IArkStakeParams(params_);
+        ARK = ark_;
+        MIN_STAKE = minStake_;
+        POOL = IArkJurorPool(pool_);
+        DEPOSIT_BASE_ORIG = depositBaseOrig_;
+        MIN_DEPOSIT = minDeposit_;
+        SELF = address(this);
+    }
+
+    /// Determinations at the seat in force heard at once: `floor(S_pool / (7 * s_min))`, s_min indexed on V_max (PV-07).
+    function concurrencyCap() external view returns (uint256) {
+        return POOL.poolStake() / (FIRST_PANEL * seatNow());
+    }
+
+    /**
+     * V_max, the largest value one finding can move, in QRL (whitepaper §6.2,
+     * PV-07 of 2026-09-30; the model's `findingValueMax`): the greater of the
+     * occurrence limit K and D_0 of the capital requirement on the widest
+     * claimant base of the censorship ground, att_eff * (N_A + N_T,max), at
+     * the settlement price. Rounds up, toward a larger seat.
+     */
+    function valueMax() public view returns (uint256) {
+        (uint16 d0,,,) = PARAMS.trigger2Params();
+        uint256 units = ArkStakeMath.findingValueMax(d0, REGISTRY.requiredCapital(), _censorshipCapUnits());
+        return _qrlOf(units, _priceNow());
+    }
+
+    /**
+     * K_T on the widest claimant base of the censorship ground, in origin
+     * units: `att_eff * (N_A + N_T,max) / BPS`, truncating. It bounds S_full
+     * of the ground at any T (PV-07), since K_T is the requirement on the
+     * claimants' recorded principal and that principal is within N_A + N_T,max.
+     */
+    function _censorshipCapUnits() private view returns (uint256) {
+        return (REGISTRY.effectiveAttachmentBps() * REGISTRY.censorshipNotionalMax()) / BPS;
+    }
+
+    /**
+     * The settlement price, or the carried one where the series is silent:
+     * the seat must be readable when the oracle is not, since the severity of
+     * a held balance is put to the court exactly then. The registry's
+     * `settlementPrice` already strikes at the carried price under silence
+     * (I40); where the registry itself cannot be read, the carried price, or
+     * min(carried, floor_k) after a firing (`deadOracleOpeningPrice`, yellow
+     * paper §5.2), and the mark alone where that fails too.
+     */
+    function _priceNow() private view returns (uint256 price) {
+        try REGISTRY.settlementPrice() returns (uint256 p) {
+            price = p;
+        } catch {}
+        if (price != 0) return price;
+        try REGISTRY.deadOracleOpeningPrice() returns (uint256 p) {
+            price = p;
+        } catch {}
+        if (price == 0) (price,,) = REGISTRY.carriedPrice();
+    }
+
+    /// Origin units valued in QRL at `price`. Rounds up, toward a larger V and seat.
+    function _qrlOf(uint256 units, uint256 price) private pure returns (uint256) {
+        return (units * price + PRICE_SCALE - 1) / PRICE_SCALE;
+    }
+
+    /**
+     * The minimum juror stake in force, in ARK (whitepaper §6.4, EC-04, PV-07;
+     * the model's `indexedMinimumJurorStakeArk`): the greater of the
+     * constructor floor and one eighth of V_max, recomputed at every call.
+     * A case takes it at its assertion and keeps it for every round
+     * (re-audit 2026-09-30, COURT-01).
+     */
+    function seatNow() public view returns (uint256) {
+        return ArkStakeMath.indexedMinimumJurorStake(MIN_STAKE, _toArk(valueMax(), _arkPrice()), 0);
+    }
+
+    /**
+     * The juror-pool condition of stage S3 (whitepaper §3.7; EC-04 as revised
+     * by PV-01 and PV-07; the model's `s3JurorPoolSufficient`): the pool seats
+     * the first round of every slice of the largest finding at once,
+     * `S_pool >= 7 * s_min * slices(V_max)`, and at least forty-nine jurors
+     * hold free stake of at least the seat, so one case can seat its retrial.
+     */
+    function s3Ready()
+        external
+        view
+        returns (bool ready, uint256 seat, uint256 slices, uint256 eligible, uint256 poolStake)
+    {
+        (uint16 cover, uint16 slash,,,,,) = PARAMS.courtParams();
+        uint256 price = _arkPrice();
+        seat = ArkStakeMath.indexedMinimumJurorStake(MIN_STAKE, _toArk(valueMax(), price), 0);
+        slices = ArkStakeMath.findingSlices(_toArk(valueMax(), price), seat, slash, cover);
+        if (slices == 0) slices = 1;
+        eligible = POOL.eligibleCount(seat);
+        poolStake = POOL.poolStake();
+        ready = ArkStakeMath.courtCaseCapacity(poolStake, seat) >= slices && eligible >= SEATS_THROUGH_RETRIAL;
+    }
+
+    /**
+     * p_ARK, the ARK reference price of yellow paper §5.1 (2026-10-05): the
+     * reference value p^ref_ARK governance sets on the valuation oracle
+     * (`arkReferencePrice`, technical reference §3.7) while no ARK market is
+     * admitted; once one is, the lesser of p^ref_ARK and that market's
+     * bounded thirty-day series at `(0, ARK)`, and where that series is
+     * silent the value last read (`carriedArkPrice`), never above p^ref_ARK.
+     * A market print above the reference cannot lower the stake a verdict
+     * needs. The reference is a stored value, so the court route is open
+     * under any state of the oracle (OC-ORC-03); refused only where neither
+     * a reference nor a carried market price can be read.
+     */
+    function _arkPrice() private view returns (uint256 price) {
+        price = _arkLive();
+        if (price == 0) price = carriedArkPrice;
+        uint256 ref;
+        try IReferencePriceOracle(REGISTRY.priceOracle()).arkReferencePrice() returns (uint256 r) {
+            ref = r;
+        } catch {}
+        if (ref != 0 && (price == 0 || price > ref)) price = ref;
+        if (price == 0) revert ArkUnpriced();
+    }
+
+    /// The ARK price the valuation oracle gives now; zero where it reverts.
+    function _arkLive() private view returns (uint256 price) {
+        try IReferencePriceOracle(REGISTRY.priceOracle()).observe(0, ARK) returns (uint256, uint256 p, uint256) {
+            price = p;
+        } catch {}
+    }
+
+    /**
+     * Carry the ARK price the oracle gives now, where it gives one (OC-ORC-03).
+     * Every assertion does (`quoteFor`); any sender may, so that a price is
+     * carried before the first case.
+     */
+    function carryArkPrice() public {
+        uint256 price = _arkLive();
+        if (price != 0) carriedArkPrice = price;
+    }
+
+    /// QRL valued in ARK at `price`. Rounds up, against the claim: the bound is compared with no less than V.
+    function _toArk(uint256 qrl, uint256 price) private pure returns (uint256) {
+        return (qrl * PRICE_SCALE + price - 1) / price;
+    }
+
+    /**
+     * V, V in ARK, the seat and the slices of an assertion of `kind` under κ
+     * `cover` and the slash `slash` (see `ArkStakeCourt`'s header for each
+     * kind). Every case sits at the seat in force. A loss above the bound on
+     * it is refused (its pieces are the asserter's to split); a single fact
+     * above it is heard in `findingSlices(V_ark, seat, slash, κ)` value
+     * slices, each its own case at that seat (whitepaper §6.2, EC-04 of
+     * 2026-09-30, which replaced raising the seat until the bound covered V:
+     * at about 1.25 V a juror, no pool could seat it). One slice otherwise.
+     */
+    function quote(uint8 kind, bytes calldata payload)
+        external
+        view
+        returns (uint256 value, uint256 valueArk, uint256 seat, uint256 deposit, uint256 slices)
+    {
+        (value, valueArk, seat, deposit, slices,) = _quoteFor(kind, payload, msg.sender);
+    }
+
+    /**
+     * `quote` for an assertion sent by `asserter` (the court passes its
+     * caller), and whether it is an outsider's loss: a loss on a position
+     * whose bound beneficiary is not the asserter (audit 2026-10-03,
+     * OC-COURT-02). An outsider's loss posts the deposit of V_max, the
+     * largest finding the book can see, whatever its own V: the suspension a
+     * loss opens holds the whole book's issuance, conditional release and
+     * seed returns, whatever it claims, so its bond is scaled to that, not to
+     * the claim. The court hears one outsider's loss per asserter at a time.
+     *
+     * Not a view: it carries the ARK price first (OC-ORC-03), so every
+     * assertion records the price a later quote falls back on.
+     */
+    function quoteFor(uint8 kind, bytes calldata payload, address asserter)
+        external
+        returns (uint256 value, uint256 valueArk, uint256 seat, uint256 deposit, uint256 slices, bool outsider)
+    {
+        carryArkPrice();
+        return _quoteFor(kind, payload, asserter);
+    }
+
+    function _quoteFor(uint8 kind, bytes calldata payload, address asserter)
+        private
+        view
+        returns (uint256 value, uint256 valueArk, uint256 seat, uint256 deposit, uint256 slices, bool outsider)
+    {
+        (value, outsider) = _valueOf(kind, payload, asserter);
+        (valueArk, seat, slices) = _seatOf(kind, value);
+        // The floor of D_1 (yellow paper §5.1): base_orig at refPrice_a, the
+        // price V is valued at (settlement, dead-oracle opening, carried), and
+        // never below seven juror fees, so a zero price leaves a deposit.
+        // Read once here; `Case.deposit` fixes it for every later round.
+        uint256 floor = _qrlOf(DEPOSIT_BASE_ORIG, _priceNow());
+        if (floor < MIN_DEPOSIT) floor = MIN_DEPOSIT;
+        deposit = _depositOf(value, slices, floor);
+        if (outsider) {
+            uint256 d = _depositOf(valueMax(), 1, floor);
+            if (d > deposit) deposit = d;
+        }
+    }
+
+    /**
+     * V in ARK, the seat and the slices of a finding of `kind` valued at
+     * `value`. A recovery above the bound on the seat in force is heard at the
+     * seat whose bound covers it (OC-COURT-05): it is one escrow's realisation
+     * at one successor slot, which no position split can divide and the bond
+     * opens no value slices for.
+     */
+    function _seatOf(uint8 kind, uint256 value) private view returns (uint256 valueArk, uint256 seat, uint256 slices) {
+        slices = 1;
+        seat = MIN_STAKE;
+        if (value == 0) return (0, seat, slices);
+        (uint16 cover, uint16 slash,,,,,) = PARAMS.courtParams();
+        uint256 price = _arkPrice();
+        // The seat in force: indexed on V_max since 2026-09-30 (PV-07).
+        seat = ArkStakeMath.indexedMinimumJurorStake(MIN_STAKE, _toArk(valueMax(), price), 0);
+        valueArk = _toArk(value, price);
+        uint256 bound = boundOf(seat, slash, cover);
+        if (valueArk <= bound) return (valueArk, seat, slices);
+        if (kind == LOSS) revert ClaimAboveBound(valueArk, bound);
+        if (kind == RECOVERY) {
+            // The least seat s with floor(κ * 4s * slash / BPS^2) >= V_ark.
+            uint256 per = FIRST_MAJORITY * uint256(cover) * (slash > BPS ? BPS : slash);
+            if (per == 0) revert ClaimAboveBound(valueArk, bound);
+            seat = (valueArk * BPS * BPS + per - 1) / per;
+            return (valueArk, seat, slices);
+        }
+        slices = ArkStakeMath.findingSlices(valueArk, seat, slash, cover);
+        if (slices > MAX_SLICES) revert TooManySlices(slices);
+    }
+
+    /// D_1 of each case: proportional to V above `floor`, a slice's on its part V / n (yellow paper §5.1); rounds up, against the asserter.
+    function _depositOf(uint256 value, uint256 slices, uint256 floor) private pure returns (uint256) {
+        uint256 proportional = ((value + slices - 1) / slices * DEPOSIT_RATE_BPS + BPS - 1) / BPS;
+        return proportional > floor ? proportional : floor;
+    }
+
+    /// The bound on one determination: κ of the stake the first panel's majority forfeits, in ARK (I24′).
+    function boundOf(uint256 seat, uint256 slash, uint256 cover) public pure returns (uint256) {
+        return ArkStakeMath.verdictBound(FIRST_MAJORITY * seat, slash, cover);
+    }
+
+    /// The pieces a trigger-1 claim of `valueArk` is heard as under the parameters in force, at the seat in force (whitepaper §6.2).
+    function piecesFor(uint256 valueArk) external view returns (uint256) {
+        (uint16 cover, uint16 slash,,,,,) = PARAMS.courtParams();
+        return ArkStakeMath.determinationsFor(valueArk, boundOf(seatNow(), slash, cover));
+    }
+
+    /**
+     * Hand the upheld finding to the bond. Delegatecall from the court only,
+     * so the bond's caller is the court. A refusal there — the bond's own
+     * record no longer admits the finding (a declaration settled meanwhile, a
+     * series that resumed, an id it does not know), raised as the bond's one
+     * refusal error `FindingRefused(cause)` — closes nothing here: it is
+     * recorded, the case ends all the same, and `applied` is false, on which
+     * the court forfeits the asserter's deposit (QL-20). Any other revert is
+     * raised again, byte for byte, and `finalize` is retried (re-audit
+     * 2026-09-30, COURT-02; QL-22): the bond's shared guard held by a payout
+     * that re-entered the court, an epoch gap, a call starved of gas. Read as
+     * refusals they let a holder drop any finding for good and forfeit an
+     * honest asserter's deposit, and they stranded a slice group.
+     *
+     * `value` is the case's V as admitted and bounded at the assertion
+     * (OC-COURT-01, I24, G8): the bond draws no more than it at delivery,
+     * whatever the occurrence limit, the price or the book became since.
+     */
+    function deliver(
+        bytes32 caseId,
+        uint8 kind,
+        bytes32 group,
+        uint8 slice,
+        bool sliced,
+        bool upheld,
+        bytes calldata payload,
+        uint256 value
+    ) external returns (bool ok) {
+        if (address(this) == SELF) revert BadPayload();
+        bytes memory reason;
+        if (sliced) {
+            // One value slice's verdict (whitepaper §6.2, EC-04): a rejection
+            // as well as an upheld finding, since a rejected slice settles its
+            // fraction too; the bond reads the payload only where upheld. The
+            // bond closes every slice, and says whether an upheld one applied
+            // (BOND-07): one it could not apply closes as rejected.
+            try BOND.closeSlice(group, slice, upheld, payload, value) returns (bool applied) {
+                ok = applied || !upheld;
+            } catch (bytes memory e) {
+                reason = _refusal(e);
+            }
+        } else if (kind == LOSS) {
+            (bytes32[] memory ids, uint256[] memory losses) = abi.decode(payload, (bytes32[], uint256[]));
+            try BOND.determineLoss(caseId, ids, losses, value) {
+                ok = true;
+            } catch (bytes memory e) {
+                reason = _refusal(e);
+            }
+        } else if (kind == CENSORSHIP) {
+            try BOND.determineCensorship(caseId, abi.decode(payload, (uint256)), value) {
+                ok = true;
+            } catch (bytes memory e) {
+                reason = _refusal(e);
+            }
+        } else if (kind == SEVERITY) {
+            try BOND.fixSeverity(abi.decode(payload, (uint256))) {
+                ok = true;
+            } catch (bytes memory e) {
+                reason = _refusal(e);
+            }
+        } else {
+            (ok, reason) = _deliverRecovery(caseId, payload);
+        }
+        if (ok) emit FindingApplied(caseId, kind);
+        else emit FindingRefused(caseId, kind, reason);
+    }
+
+    /**
+     * A revert of the bond, returned where it is the bond's one refusal error
+     * and raised again byte for byte where it is anything else. The payload of
+     * `bytes memory` is one native word past the pointer: 32 bytes on the v2
+     * line, 64 under QIP-55 (`shl(256, 1)` is zero only on a 256-bit word).
+     */
+    function _refusal(bytes memory e) private pure returns (bytes memory) {
+        if (e.length >= 4 && bytes4(e) == IArkCatBond.FindingRefused.selector) return e;
+        /// @hyperion memory-safe-assembly
+        assembly {
+            let word := 0x20
+            if iszero(iszero(shl(256, 1))) { word := 0x40 }
+            revert(add(e, word), mload(e))
+        }
+    }
+
+    /// A recovery finding to the bond (`openRecovery`), apart for the legacy code generator's stack.
+    function _deliverRecovery(bytes32 caseId, bytes calldata payload) private returns (bool ok, bytes memory reason) {
+        (uint256 chainId, bytes32 successorId, address escrow, uint256 realised, uint256 base) =
+            abi.decode(payload, (uint256, bytes32, address, uint256, uint256));
+        try BOND.openRecovery(caseId, chainId, successorId, escrow, realised, base) {
+            ok = true;
+        } catch (bytes memory e) {
+            reason = _refusal(e);
+        }
+    }
+
+    /**
+     * V of whitepaper §6.2: the bond principal the finding can move, in QRL;
+     * and, for a loss, whether `asserter` is an outsider to any position it
+     * names (not its bound beneficiary; OC-COURT-02).
+     */
+    function _valueOf(uint8 kind, bytes calldata payload, address asserter)
+        private
+        view
+        returns (uint256 value, bool outsider)
+    {
+        if (kind == LOSS) {
+            (bytes32[] memory ids, uint256[] memory losses) = abi.decode(payload, (bytes32[], uint256[]));
+            if (ids.length == 0 || ids.length != losses.length) revert BadPayload();
+            uint256 sum;
+            for (uint256 i = 0; i < losses.length; i++) {
+                // Only a position the registry knows (OC-COURT-02): an unknown
+                // id used to open the bond's determination and be refused only
+                // at delivery, after the suspension had run.
+                IArkStakeRegistry.Anchor memory a = REGISTRY.anchorOf(ids[i]);
+                if (a.status == 0) revert NotAnchored(ids[i]);
+                if (a.boundQrlOwner != asserter) outsider = true;
+                sum += losses[i];
+            }
+            // Capped at the occurrence limit K, the most trigger 1 draws for
+            // one event (PV-07; the model's `lossFindingValue`): a loss
+            // asserted above it moves no more, so it is heard at the limit.
+            sum = ArkStakeMath.lossFindingValue(sum, REGISTRY.requiredCapital());
+            // The floor of a loss (OC-COURT-02; yellow paper §5.1, 2026-10-06):
+            // the capped loss below base_orig is not heard, compared in origin
+            // units before any conversion, so no move of the price changes the
+            // smallest loss heard. Valued at a few wei, a loss opened the
+            // bond's determination, suspending the book for its challenge
+            // window at no cost, since an applied finding returns its deposit.
+            if (sum < DEPOSIT_BASE_ORIG) revert LossBelowFloor(sum, DEPOSIT_BASE_ORIG);
+            // The claim's upper bound: the buffer pays first and the indemnity
+            // and vesting only reduce it. At the settlement price the bond
+            // converts at (whitepaper §5.5; phase C3b). Rounds up, against the claim.
+            // While the series is silent, V and the conversion use the
+            // settlement price of §5.2, the carried price (yellow paper §5.1;
+            // OC-ORC-05): a zero or a revert no longer refuses every loss.
+            value = _qrlOf(sum, _priceNow());
+        } else if (kind == CENSORSHIP) {
+            abi.decode(payload, (uint256));
+            // D_0 of the full settlement (item 25b; whitepaper §6.2, PV-07;
+            // re-audit 2026-09-30, COURT-03): S_full <= min(pool, K_T), and
+            // K_T is bounded by the requirement on the widest claimant base,
+            // so V never exceeds the censorship term of V_max. Taken on the
+            // whole outstanding principal it did on an over-covered book, and
+            // the ground needed more slices than a finding opens.
+            (uint16 d0,,,) = PARAMS.trigger2Params();
+            uint256 full = _qrlOf(_censorshipCapUnits(), _priceNow());
+            uint256 pool = IArkCourtBond(address(BOND)).outstandingPrincipal();
+            if (pool < full) full = pool;
+            value = (full * d0 + BPS - 1) / BPS;
+        } else if (kind == SEVERITY) {
+            abi.decode(payload, (uint256));
+            IArkCourtBond.Declaration memory d = IArkCourtBond(address(BOND)).declaration();
+            // Held, and 2 x W_a epochs past the window's close (the model's
+            // `holdDeterminationOpen`); the bond refuses again at the finding
+            // if the series has resumed meanwhile.
+            uint256 opens = uint256(d.epoch) + 3 * uint256(d.windowEpochs);
+            if (d.stage != T2_HELD || ArkEpoch.current() < opens) revert SeverityNotOpen(opens);
+            // The held balance, whatever m_loss is asserted (QL-23): the finding
+            // decides all of it, the part it draws for the positions and the
+            // part it releases to the classes. Valued one way — on the draw
+            // above what is drawn — a low m_loss was worth nothing, sat on the
+            // minimum seat and released the whole balance (C-8).
+            value = d.held;
+        } else if (kind == RECOVERY) {
+            // A finding that the successor does not realise the escrow is a
+            // realisation of zero (whitepaper §5.4) and states no base.
+            (uint256 chainId,, address escrow, uint256 realised, uint256 base) =
+                abi.decode(payload, (uint256, bytes32, address, uint256, uint256));
+            if (escrow == address(0) || (base == 0 && realised != 0)) revert BadPayload();
+            // Valued at the escrow's residual P_rem (audit 2026-10-03,
+            // OC-COURT-05): the finding fixes its slot's realisation for good,
+            // and the bond takes min(R, P_rem) of it, so a false R moves up to
+            // P_rem of the bond's subrogation whichever way it errs: an
+            // inflated R at most P_rem, an understated one (zero included) up
+            // to P_rem away. `min(R, P_rem)` would value a false zero at zero.
+            // In QRL at the price the declaration's draw was taken at, the
+            // price P is carried in. Rounds up, toward a larger seat.
+            (uint256 residual,,) = IArkCourtBond(address(BOND)).recoveryResidual(chainId, escrow);
+            if (residual != 0) value = _qrlOf(residual, IArkCourtBond(address(BOND)).declaration().price);
+        } else {
+            revert BadKind(kind);
+        }
+    }
+}

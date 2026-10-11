@@ -1,0 +1,77 @@
+{
+  "name": "rehearsal-v3",
+  "chainId": 31337,
+  "profile": "rapid",
+  "evmVersion": "shanghai",
+  "qrlOwnerLength": 64,
+  "rootSigners": {
+    "threshold": 2,
+    "signers": 3
+  },
+  "court": "real",
+  "qday": "MockQDayOracle",
+  "finality": "confirmations",
+  "confirmations": 1,
+  "deliveryMarginSeconds": 10,
+  "deployedFromBlock": 529,
+  "assets": [
+    {
+      "symbol": "mREB",
+      "mock": "MockRebasingAsset",
+      "address": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+      "rebasing": true,
+      "correlationGroup": "group:lido-like",
+      "exitBoundBps": 2500,
+      "escrow": "0xB0D4afd8879eD9F52b28595d31B441D079B2Ca07"
+    },
+    {
+      "symbol": "mUNIT",
+      "mock": "MockAsset",
+      "address": "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512",
+      "rebasing": false,
+      "correlationGroup": "group:mock-units",
+      "exitBoundBps": 2500,
+      "escrow": "0x162A433068F51e18b7d13932F27e66a3f99E6890"
+    }
+  ],
+  "addresses": {
+    "relay": "0x1429859428C0aBc9C2C47C8Ee9FBaf82cFA0F20f",
+    "operationsDestination": "0x00000000000000000000000000000000000E2e01"
+  },
+  "bondPrincipal": "80000000000000000000000",
+  "note": "OC audit 2026-10-03: the QRL leg on the v3 devnet enclave at the rapid profile (7-minute epochs), the origin leg on a local Hardhat node (ecdsa-stakings/rehearsal-v3/hardhat.config.cjs, port 8548). Replaces `rehearsal`, whose origin leg on the enclave cannot run on QRVM. No governance stack: core governance has no rapid build (one profile hour is 2.5 s), so the Q-Day oracle is the double and governance runs in rehearsal-v3-gov at the testnet profile. Signs with its own QRL key (ARK_SIGNER=REHEARSAL) so it never races the VPS relayer's nonce.",
+  "authority": {
+    "threshold": 2,
+    "signers": 3,
+    "treeHeight": 11,
+    "generations": [
+      [
+        "0xe79976b55eb759ce67709cf431278ce628f61ac93e71a901eedc01a9695ce151",
+        "0x10b1d6ab0ccc8dc3a5f402b90b156ebbe3ac32b1239d901e7173e5773ca61c9b",
+        "0x27f35c2bf7cae6e328eb8eec02d7d8de17392e1e30aa7697b3a5fb858a73ee3d"
+      ],
+      [
+        "0x7148c92550ecc60336f07b034aa3546b2a3b05734b1f579f97db8386bb9ca392",
+        "0x56e680374791b6448befc431fd90b4f704276def7b0d35e551a1f170e710810b",
+        "0xa527a6e8abf705ff6c0579d39264372471a8a9870d786ed0220611c2c52f5e6e"
+      ],
+      [
+        "0xebade8c8eec83e32efdbf19cee6faf75cb67b8b45be05f003222b45c4a700a56",
+        "0x08918deb9641d0cc1b644c9b1648a2c2e0ec9a5e25badd8364df8632f7b88141",
+        "0xa9824b8ba87adb7e4a9d71a46955d1a45916ee30beeac396714d8ab84f4301d8"
+      ],
+      [
+        "0xa2b2ea9cc014fa1d6473e3b7d5d0597784cb62c754512a84a4e5fa4588562119",
+        "0xcfcbac96ed83c23d6c8b151e9a834910aade52c46bda5070b79232b48dd04f58",
+        "0xcca290fb7d7afc0b98d21bed7675059b56601a4362f829a03ae45ea65192ffc4"
+      ]
+    ],
+    "commits": [
+      "0x011dd4ad74ce97a7eb190eeed216a708646bf2549fffe8ec9a0619e99c347d34",
+      "0x05ce9bcb8c1cd3563715fc3670c9ed3a3d03711c04ee2511e4346c65abdce5cd",
+      "0x611e624872e841fde927554a384c2190adfb25e0977e22b8a0505934a6926827",
+      "0x290decd9548b62a8d60345a988386fc84ba6bc95484008f6362f93160ef3e563"
+    ]
+  },
+  "shared": false
+}

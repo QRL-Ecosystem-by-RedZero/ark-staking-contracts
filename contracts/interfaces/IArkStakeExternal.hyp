@@ -1,0 +1,159 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * The contracts Ark Staking depends on but does not own.
+ *
+ * Five pieces of protocol machinery are bound by this product rather than
+ * restated (whitepaper §3.1, yellow paper §1.3): the declaration procedure, the
+ * dispute court, the proportional settlement rule, the vesting function, and
+ * the attestation and epoch-root contracts. Two of them are read here — the
+ * attestation verifier and the Q-Day oracle — together with the valuation
+ * oracle and the bond. They are declared as interfaces so this tree compiles
+ * and tests against a shape it does not implement, and so that a change on the
+ * other side is a compile error rather than a silent divergence.
+ *
+ * A test double for `IAttestationVerifier` must verify a real Merkle proof. One
+ * that accepts any root makes every domain-separation test vacuous, and domain
+ * separation is the property that keeps a root sealed to record an anchoring
+ * from also authorising an insurance indemnity payment. Whitepaper §3.5.
+ */
+
+/// Epoch roots and membership proofs. Implemented in the insurance repository.
+interface IAttestationVerifier {
+    /// The sealed root for an epoch, or zero if none has been accepted.
+    function rootOf(uint256 epoch) external view returns (bytes32);
+
+    /// Membership of a leaf in an accepted epoch root.
+    function verify(uint256 epoch, bytes32 leaf, bytes32[] calldata proof)
+        external
+        view
+        returns (bool);
+}
+
+/**
+ * The protective freeze and the declaration. Read here and never written
+ * (yellow paper §1.3).
+ *
+ * The asymmetry between the two is the protocol's: a freeze suspends without
+ * settling anything and is available to a small quorum acting immediately,
+ * while every path that moves value needs a window in which it can be
+ * contested.
+ */
+interface IQDayOracle {
+    /// True once Q-Day has been declared and ratified. Release instructions then close permanently.
+    function declared() external view returns (bool);
+
+    /// True while the protective freeze holds: no release settles and no principal matures.
+    function frozen() external view returns (bool);
+
+    /// The timestamp of the declaration, or zero.
+    function declaredAt() external view returns (uint64);
+}
+
+/**
+ * The protocol's valuation oracle, as this product reads it. Prices are QRL per
+ * unit of the origin asset, scaled by 1e18.
+ *
+ * Three readings of one price series, because the exposures differ (whitepaper
+ * §5.5): the premium swap's reserve reads the average over one epoch, the
+ * interval the premium is swept and exchanged over; capacity, utilisation,
+ * cover and a settlement read the thirty-day average, bounded per epoch by
+ * m_epoch (I38) — `twap30d` is that bounded series, the oracle's to deliver
+ * (whitepaper §2 states it as an assumption on the oracle); and the conversion
+ * haircut of §4.3 is the largest drawdown of the value of QRL in origin-asset
+ * terms over a longer window. The caps on the haircut and the breaker's
+ * emergency floor are applied by the consumer.
+ *
+ * `realisedYieldBps` is the origin yield an admitted asset produced over the
+ * trailing window. It is what the admission condition of §3.2 is re-evaluated
+ * against each epoch, and it is external for the reason §2.3 gives: the
+ * protocol neither sets nor guarantees it.
+ *
+ * SILENCE (yellow paper §6.1, technical reference §1.4, I40; 2026-10-05)
+ * ---------------------------------------------------------------------
+ * A key is silent while a pause is in force, while accepted rounds cover less
+ * than thirty days and twenty-four hours, or more than the heartbeat after its
+ * last accepted round; a consumer also reads a revert or a zero as silence.
+ * `observe` and `epochAverage` revert `OracleSilent(updatedAt)` then, and
+ * every other read answers. No consumer reads a silent series as a price:
+ * each reads through `try` and applies the rule of silence of §6.1.
+ * The production implementation is `ArkReferenceOracle`; `MockPriceOracle`
+ * is the harness double.
+ */
+interface IReferencePriceOracle {
+    /// A read of `observe` or `epochAverage` while the key is silent; `updatedAt` is its last accepted round.
+    error OracleSilent(uint64 updatedAt);
+
+    /// The average over the epoch in progress, the bounded thirty-day series, and that series as of 24h ago. Reverts `OracleSilent` while silent.
+    function observe(uint256 chainId, address asset)
+        external
+        view
+        returns (uint256 twapEpoch, uint256 twap30d, uint256 twap30d24hAgo);
+
+    /// The last accepted round: its id, time, observation and whether the step limit clamped it.
+    function latestRound(uint256 chainId, address asset)
+        external
+        view
+        returns (uint64 roundId, uint64 updatedAt, uint256 observation, bool clamped);
+
+    /// The bounded thirty-day series as at the last accepted round: the carried price under silence (yellow paper §5.2).
+    function lastAccepted(uint256 chainId, address asset) external view returns (uint256 twap30d, uint64 updatedAt);
+
+    /// P_e, the average over the closed epoch `epoch` from the cumulative sums at its boundaries. Reverts `OracleSilent` while silent.
+    function epochAverage(uint256 chainId, address asset, uint64 epoch) external view returns (uint256);
+
+    /// Whether the series of the key is silent under yellow paper §6.1.
+    function silent(uint256 chainId, address asset) external view returns (bool);
+
+    /// The circuit breaker of yellow paper §6.1, computed from the cumulative sums, and when it fired (zero: not active).
+    function breakerActive(uint256 chainId, address asset) external view returns (bool active, uint64 firedAt);
+
+    /// p^ref_ARK, the ARK reference value in QRL that governance sets (technical reference §3.7); a stored value.
+    function arkReferencePrice() external view returns (uint256);
+
+    /**
+     * The emergency valuation `twap_e` of yellow paper §4.2: an average over a
+     * window of at least one epoch, taken after the circuit breaker fired and
+     * therefore inside the decline. Read by the registry's `settlementPrice`
+     * only while the breaker holds, which clamps it between the emergency
+     * floor and the carried price (whitepaper §5.5); zero where the oracle has
+     * no such window yet, which the clamp reads as the floor. Added
+     * 2026-09-28 (phase C3b): the one reading the settlement price needs that
+     * `observe` does not carry.
+     */
+    function emergencyValuation(uint256 chainId, address asset) external view returns (uint256);
+
+    /// The largest fall in the value of QRL in origin-asset terms within the window, in bps.
+    function maxDrawdownBps(uint256 chainId, address asset, uint256 windowSeconds)
+        external
+        view
+        returns (uint256);
+
+    /// The realised origin yield of an asset over the trailing window, per annum, in bps.
+    function realisedYieldBps(uint256 chainId, address asset) external view returns (uint256);
+}
+
+/// What the registry reads from the bond. Implemented by ArkCatBond in this tree.
+/**
+ * The bond's claimant record and an escrow's subrogation ledger, the prefix
+ * of each the registry reads to hold a censorship-ground claimant in the
+ * book (OC-LEGA-01): the record's ground and T, and the ledger's cursor,
+ * past slot 0 once the origin chain's recovery is applied. Prefixes of
+ * `ArkCatBondRecovery.claimants()` and `escrowLedger`, which return the
+ * whole static structs; a decoder reads the words it names.
+ */
+interface IArkBondClaimants {
+    function claimants() external view returns (uint256, uint256);
+
+    /// The ledger's first seven words; the seventh is the cursor.
+    function escrowLedger(uint256 chainId, address escrow) external view returns (uint256[7] memory);
+}
+
+interface IArkCatBondView {
+    /// Bond principal outstanding, in QRL, including principal held and queued (whitepaper §5.3).
+    function outstandingPrincipal() external view returns (uint256);
+
+    /// Whether the run-off gate of whitepaper §5.3 is closed, which raises the ceiling to the surge value.
+    function runoffGateClosed() external view returns (bool);
+}

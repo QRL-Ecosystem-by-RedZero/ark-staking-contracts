@@ -1,0 +1,37 @@
+{
+  "name": "rehearsal",
+  "chainId": 3151908,
+  "profile": "rapid",
+  "client": "qrl",
+  "evmVersion": "shanghai",
+  "qrlOwnerLength": 20,
+  "finality": "confirmations",
+  "confirmations": 1,
+  "deliveryMarginSeconds": 10,
+  "deployedFromBlock": 3189,
+  "assets": [
+    {
+      "symbol": "mREB",
+      "mock": "MockRebasingAsset",
+      "address": "0x6971219B85694bCde5118562b0B4D4006D79a6c1",
+      "rebasing": true,
+      "correlationGroup": "group:lido-like",
+      "exitBoundBps": 2500,
+      "escrow": "0x7fC3e77d4263380BC6E7545874A4e57604F53092"
+    },
+    {
+      "symbol": "mUNIT",
+      "mock": "MockAsset",
+      "address": "0xaD5cBD398376DCed77f92668Bd87491DeB8C2542",
+      "rebasing": false,
+      "correlationGroup": "group:mock-units",
+      "exitBoundBps": 2500,
+      "escrow": "0x437695e6f982256bf5789176484Efe118E237F12"
+    }
+  ],
+  "addresses": {
+    "relay": "0x8d880b83629F5502d17c1D5BeB62201E2474C8c2",
+    "operationsDestination": "0x13dddf8e563da852A6491e6Dff68a68C8Be94fB0"
+  },
+  "bondPrincipal": "80000000000000000000000"
+}

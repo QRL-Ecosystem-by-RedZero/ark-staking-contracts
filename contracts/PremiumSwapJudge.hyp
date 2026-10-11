@@ -1,0 +1,251 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./PremiumSwapStore.hyp";
+import "./utils/ArkStakeMath.hyp";
+
+/**
+ * The judgement of the premium swap's offerings, the retirement of unsold
+ * quantity and the release of the retained stock's yield (whitepaper §4.7,
+ * yellow paper §4.6, I34), executed in `PremiumSwap`'s storage by a
+ * delegatecall from its `_judgePrevious` (audit OC 2026-10-03, OC-ORC-04;
+ * staking CLAUDE.md item 123).
+ *
+ * WHY THIS CONTRACT EXISTS
+ * ------------------------
+ * The rule of yellow paper §4.6 on suspended pricing needs the quote to
+ * record its refusal and the judgement to carry the offering it touched,
+ * and the swap had 20 bytes of v3 room. The judgement and the retirement
+ * are run once per offering, at its first quote or its selection, so the
+ * delegatecall's indirection costs once per offering and nowhere else.
+ * `ArkCatBondDeterminations`'s pattern: the swap's constructor creates this
+ * contract and fixes its address in an immutable, `JUDGE_MODULE`; no
+ * setter, no admin, not a proxy. It inherits `PremiumSwapStore`, the one
+ * declaration of the swap's storage layout. Called directly it acts on its
+ * own empty storage, and `judge` refuses that (`SELF`). It holds no value:
+ * the retirement moves none, and a delegatecall carries no `msg.value` of
+ * its own.
+ *
+ * Events are declared here with the signatures `IPremiumSwap` declares, and
+ * a log emitted under the delegatecall is the swap's, at the swap's address,
+ * decoded with the swap's ABI.
+ *
+ * SUSPENDED PRICING (yellow paper §4.6)
+ * -------------------------------------
+ *  > "Where the series is silent (section 6.1) or the circuit breaker is
+ *  > active when a quote is made, the quote is refused and the refusal
+ *  > recorded. An offering in whose window a quote was refused, and which
+ *  > selects no lot, is carried whole to the next epoch: $k_t$ and the count
+ *  > toward the retention period do not advance, and its coupon is paid with
+ *  > the offering epoch's to that epoch's holders. An offering whose reserve
+ *  > was fixed before the suspension runs to its close at that reserve. A
+ *  > retirement reads the epoch-average price of the retired epoch and,
+ *  > where the series is silent, waits on the next priced epoch. The bound of
+ *  > four epochs on batching does not apply to a carry for suspended
+ *  > pricing."
+ *
+ *  - The refusal and its record are `PremiumSwap.quote`'s
+ *    (`_quoteRefused`, `QuoteRefused`); the reserve fixed before a
+ *    suspension is the offering's `reserveNum`, which `quote` and the
+ *    selection never read again from the oracle.
+ *  - Carried whole: `failedOfferings`, which is both $k_t$ and the count
+ *    toward the retention period here, is left as it stood — neither
+ *    stepped nor reset — and nothing retires (`OfferingSuspended`). The
+ *    quantity stays in the escrow's pot, so the next offer's snapshot holds
+ *    it, and the lots that sell it deliver to the epoch of that offering.
+ *  - A carry for suspended pricing is an offering that opened and is not
+ *    counted, not a batching carry: `_batch`'s four-epoch bound and its
+ *    `Carry` record never see it.
+ *  - The retirement reads P_e of the retired epoch e from the oracle,
+ *    `epochAverage`, and d_last from the realised yield and the coupon at
+ *    exact cover, each through `try`: a silent or failing read defers the
+ *    retirement (the failure counts, the quantity stays on offer), and the
+ *    next failure, the next priced epoch's offering, retires what that one
+ *    left. Before item 123 the retirement read `epochPrice` through `try`
+ *    and then d_last through `_reserveRatio` without it: a yield or coupon
+ *    read failing after the price answered reverted the selection, and an
+ *    offering no quote had priced read `epochPrice` a second time, untried.
+ */
+contract PremiumSwapJudge is PremiumSwapStore {
+    /// This module's own address: under the swap's delegatecall `address(this)` is the swap's.
+    address private immutable SELF;
+
+    /// A retirement of unsold premium recorded a shortfall carry, in QRL (I34). As `IPremiumSwap`.
+    event ShortfallCarried(bytes32 indexed key, uint256 indexed epoch, uint256 retiredShares, uint256 carry);
+
+    /// The yield of retained shares was added to an offering, to repay the carry (I34). As `IPremiumSwap`.
+    event RetainedYieldOffered(bytes32 indexed key, uint256 indexed epoch, uint256 shares);
+
+    /// An offering whose window refused a quote for suspended pricing and that selected no lot was carried whole: no failure counted (yellow paper §4.6). As `IPremiumSwap`.
+    event OfferingSuspended(bytes32 indexed key, uint256 indexed epoch, uint256 shares);
+
+    constructor(address registry_, address params_, address ledger_, address attestation_, address feePool_)
+        PremiumSwapStore(registry_, params_, ledger_, attestation_, feePool_)
+    {
+        SELF = address(this);
+    }
+
+    /**
+     * Judge the offering recorded before `epoch`'s, then release into
+     * `epoch`'s the retained shares its retained units no longer need. The
+     * swap runs this once per offering, at its first quote or its selection
+     * (`PremiumSwap._judgePrevious`, which marks the offering judged).
+     * Only under the swap's delegatecall.
+     *
+     * PAYABLE, AND WHY: a delegatecall carries the calling frame's
+     * `msg.value`, and `quote` is payable, so a non-payable entry here
+     * reverted every first quote that sent its lot's QRL. Nothing here reads
+     * or moves value.
+     */
+    function judge(bytes32 key, uint256 epoch) external payable {
+        if (address(this) == SELF) revert ZeroAddress();
+        IPremiumSwap.Offering storage o = _offerings[key][epoch];
+        // The offering recorded before this one, whatever epoch it was: an
+        // epoch carried under the batching threshold records none (2026-09-30).
+        uint256 pe = uint256(o.prevPlusOne);
+        if (pe != 0) _judge(key, pe - 1);
+        _releaseRetainedYield(key, epoch, o.offered, o.units);
+    }
+
+    /**
+     * One that sold below the clearing floor of what it could sell steps the
+     * reserve down, one that did not resets the count, and the
+     * `unsoldEpochs`-th failure retires what that offering left unclaimed and
+     * records its carry (I34). The floor and the period are the judged
+     * offering's own (G8). Judged on the lots selected, not on those claimed
+     * (OC-SWAP-06): a selected lot left unclaimed pays its bond, and is not
+     * also a failure that steps the next offering's reserve down for the
+     * solver that walked away. An offering carried for suspended pricing is
+     * not judged at all (yellow paper §4.6; see the header).
+     */
+    function _judge(bytes32 key, uint256 e) private {
+        IPremiumSwap.Offering storage prev = _offerings[key][e];
+        uint256 avail = prev.selected ? prev.available : _available(key, e);
+        if (avail == 0) return;
+        // "An offering in whose window a quote was refused, and which selects
+        // no lot, is carried whole to the next epoch: $k_t$ and the count
+        // toward the retention period do not advance" (yellow paper §4.6).
+        if (prev.sold == 0 && _quoteRefused[key][e]) {
+            emit OfferingSuspended(key, e, avail);
+            return;
+        }
+        if (prev.sold * ArkStakeMath.BPS >= avail * uint256(prev.clearingFloorBps)) {
+            _failedOfferings[key] = 0;
+            return;
+        }
+        uint256 k = _failedOfferings[key] + 1;
+        // A silent oracle defers the retirement (OC-ORC-04): the failure
+        // counts, the quantity stays on offer, and the next failure retires.
+        if (k >= uint256(prev.unsoldEpochs) && _retire(key, e, prev, avail - prev.claimed)) k = 0;
+        _failedOfferings[key] = k;
+    }
+
+    /**
+     * Retain `unsold` shares as buffer and record the carry of the part that
+     * had never been retained before (I34): shares released from the retained
+     * stock's yield and not sold go back to that stock and add nothing to the
+     * carry they were offered to repay. Valued at the offering's own rate and
+     * reserve floor, at the epoch-average price of the retired epoch;
+     * truncating, so the carry never overstates the claim. False, and nothing
+     * written, where the price or d_last cannot be read: "where the series is
+     * silent, waits on the next priced epoch" (yellow paper §4.6).
+     */
+    function _retire(bytes32 key, uint256 e, IPremiumSwap.Offering storage prev, uint256 unsold)
+        private
+        returns (bool)
+    {
+        (bool priced, uint256 price, uint256 coupon) = _pricedAt(e);
+        if (!priced) return false;
+        _retain(key, e, prev, unsold, price, _dLast(key, prev, coupon));
+        return true;
+    }
+
+    /**
+     * d_last, the discount the retiring offering was priced at, the lowest
+     * price the swap asked for the quantity: the reserve floor, or the
+     * delivered-coupon bound d_cap where that binds first (whitepaper §4.7,
+     * I34; SP-07 of 2026-09-30), on the offering's own ladder (G8).
+     * `failedOfferings` still holds the count that offering was priced at.
+     */
+    function _dLast(bytes32 key, IPremiumSwap.Offering storage prev, uint256 coupon) private view returns (uint256) {
+        return ArkStakeMath.admittedDiscountBps(
+            prev.maxEpochMoveBps,
+            prev.firstReserveDiscountBps,
+            prev.reserveStepBps,
+            prev.reserveFloorBps,
+            prev.tailPremiumFloorBps,
+            coupon,
+            _failedOfferings[key]
+        );
+    }
+
+    /// The retirement's writes, once priced: the retained stock, its units, and the carry here and in the ledger.
+    function _retain(
+        bytes32 key,
+        uint256 e,
+        IPremiumSwap.Offering storage prev,
+        uint256 unsold,
+        uint256 price,
+        uint256 dLast
+    ) private {
+        uint256 pending = _carryShares[key];
+        uint256 fromCarry = pending < unsold ? pending : unsold;
+        _carryShares[key] = pending - fromCarry;
+        _retainedShares[key] += unsold;
+        _retainedUnits[key] += (unsold * prev.units) / prev.offered;
+        uint256 carry = ArkStakeMath.shortfallCarryQrl(((unsold - fromCarry) * prev.units) / prev.offered, price, dLast);
+        if (carry != 0) {
+            _shortfallCarry[key] += carry;
+            LEDGER.carryShortfall(carry);
+        }
+        emit ShortfallCarried(key, e, unsold, carry);
+    }
+
+    /**
+     * P_e of the retired epoch `e` (yellow paper §4.6, §6.1: the average
+     * over the closed epoch from the oracle's cumulative sums) and the
+     * coupon at exact cover the reserve's d_cap is read from, each through
+     * `try`; `priced` false where either read fails (a silent series, an
+     * unavailable oracle, no oracle at all).
+     */
+    function _pricedAt(uint256 e) private view returns (bool priced, uint256 price, uint256 coupon) {
+        IReferencePriceOracle oracle = IReferencePriceOracle(REGISTRY.priceOracle());
+        if (address(oracle) == address(0)) return (false, 0, 0);
+        try oracle.epochAverage(0, address(0), uint64(e)) returns (uint256 p) {
+            price = p;
+        } catch {
+            return (false, 0, 0);
+        }
+        uint256 yieldBps;
+        try oracle.realisedYieldBps(0, address(0)) returns (uint256 y) {
+            yieldBps = y;
+        } catch {
+            return (false, 0, 0);
+        }
+        try REGISTRY.couponAtExactCoverBps(yieldBps) returns (uint256 c) {
+            coupon = c;
+        } catch {
+            return (false, 0, 0);
+        }
+        priced = true;
+    }
+
+    /**
+     * While the asset carries a shortfall, release into this offering the
+     * retained shares its retained units no longer need at the offer's rate
+     * — their rebase yield — rather than letting it compound as buffer (I34).
+     * The shares kept round up, so the retained units never fall. Run once
+     * the previous offering is judged, so a retirement there never counts a
+     * share released for this one.
+     */
+    function _releaseRetainedYield(bytes32 key, uint256 epoch, uint256 shares, uint256 units) private {
+        uint256 held = _retainedShares[key];
+        if (_shortfallCarry[key] == 0 || held == 0) return;
+        uint256 need = (_retainedUnits[key] * shares + units - 1) / units;
+        if (need >= held) return;
+        uint256 released = held - need;
+        _retainedShares[key] = need;
+        _carryShares[key] += released;
+        emit RetainedYieldOffered(key, epoch, released);
+    }
+}

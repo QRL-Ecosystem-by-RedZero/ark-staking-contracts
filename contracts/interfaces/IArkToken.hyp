@@ -1,0 +1,108 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "../lib/openzeppelin/token/ERC20/IERC20.hyp";
+
+/**
+ * ARK — the Quantum Ark governance and security-bond token.
+ *
+ * WHAT ARK IS NOT
+ * ---------------
+ * ARK is deliberately NOT the unit premiums are priced in, NOT the asset claims
+ * are paid in, and NOT counted towards the solvency invariant enforced by
+ * ICapitalPool. Premiums and indemnities are denominated and settled in native
+ * QRL.
+ *
+ * The reason is reflexivity. If the claim-paying reserve were backed by the
+ * protocol's own governance token, then at the exact moment a systemic event
+ * becomes likely the market prices that in, ARK collapses, and the reserve
+ * evaporates precisely when it must pay. ARK therefore sits at the BOTTOM of
+ * the loss waterfall (layer 6, auctioned for QRL under a per-epoch cap and a
+ * governance vote), never at the top.
+ *
+ * WHAT ARK IS
+ * -----------
+ *   - A slashable bond posted by attesters, appraisers and jurors.
+ *   - The right to be drawn as a juror, scoped to the tier pool it is staked in.
+ *   - Governance weight, once locked into veARK.
+ *   - A claim on a share of protocol revenue, paid out in QRL, not in inflation.
+ *
+ * NO `permit`, AND WHY
+ * --------------------
+ * There is no ERC-2612 `permit` and there never will be. Hyperion does not
+ * expose `ecrecover`, so a signature-based approval cannot be verified on this
+ * chain at all. Every approval and every delegation is an ordinary transaction,
+ * which Zond has already authenticated with ML-DSA-87. The cost is gas; the
+ * benefit is that no off-chain signature layer exists to be phished or, in the
+ * long run, forged by an adversary with a quantum computer.
+ *
+ * Voting weight is tracked with block checkpoints, which work normally here;
+ * only the signature-based half of the usual ERC20Votes design is unavailable.
+ */
+interface IArkToken is IERC20 {
+    /// Emitted when `delegator` moves its voting weight to `toDelegate`.
+    event DelegateChanged(address indexed delegator, address indexed fromDelegate, address indexed toDelegate);
+
+    /// Emitted when a delegate's checkpointed voting weight changes.
+    event DelegateVotesChanged(address indexed delegate, uint256 previousVotes, uint256 newVotes);
+
+    /// A transfer or burn was attempted for more than the holder owns.
+    error InsufficientBalance(address account, uint256 balance, uint256 needed);
+
+    /// A spender tried to move more than it was approved for.
+    error InsufficientAllowance(address spender, uint256 allowance, uint256 needed);
+
+    /// Voting weight was queried for a block that has not been mined yet.
+    error FutureLookup(uint256 requestedBlock, uint256 currentBlock);
+
+    /// Unvested allocations hold no governance weight; see `vestedBalanceOf`.
+    error VotingWeightNotVested(address account, uint256 unvested);
+
+    /**
+     * The portion of `account`'s balance that has vested.
+     *
+     * Contributor and backer allocations vest over four years with a one-year
+     * cliff, and unvested tokens carry NO voting weight. Without that rule the
+     * team plus early backers would control 30% of governance from day one and
+     * the DAO would be decorative.
+     *
+     * @param account The holder being queried.
+     * @return The vested, governance-eligible balance.
+     */
+    function vestedBalanceOf(address account) external view returns (uint256);
+
+    /**
+     * Assigns the caller's voting weight to `delegatee`.
+     *
+     * @dev This is a transaction, not a signed message. Delegation is revocable
+     *      at any time, which is what keeps a bought vote from staying bought:
+     *      a briber cannot hold delegated weight against the delegator's will.
+     * @param delegatee The account that will vote with this weight.
+     */
+    function delegate(address delegatee) external;
+
+    /// @param account The account whose delegate is queried.
+    /// @return The address currently voting with `account`'s weight.
+    function delegates(address account) external view returns (address);
+
+    /// @param account The delegate being queried.
+    /// @return Voting weight currently delegated to `account`.
+    function getVotes(address account) external view returns (uint256);
+
+    /**
+     * Historical voting weight, for proposals that snapshot at a past block.
+     *
+     * @param account The delegate being queried.
+     * @param blockNumber A block that has already been mined.
+     * @return The weight `account` held at `blockNumber`.
+     */
+    function getPastVotes(address account, uint256 blockNumber) external view returns (uint256);
+
+    /**
+     * Historical total governance-eligible supply, used to evaluate quorum.
+     *
+     * @param blockNumber A block that has already been mined.
+     * @return Total vested, delegated supply at `blockNumber`.
+     */
+    function getPastTotalSupply(uint256 blockNumber) external view returns (uint256);
+}

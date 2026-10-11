@@ -1,0 +1,518 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/security/ReentrancyGuard.hyp";
+
+import "./interfaces/IStakingVenue.hyp";
+import "./interfaces/IArkBondDelegation.hyp";
+import "./utils/ArkEpoch.hyp";
+import "./utils/QuantumErrors.hyp";
+
+/**
+ * Pooled native QRL staking: many depositors, one set of validators, one value
+ * per share.
+ *
+ * The one rule this contract exists to enforce: **a share is worth exactly its
+ * part of what the pool holds — principal at the validators, less what reports
+ * show was lost, plus every reward and forfeited bond the validators paid in —
+ * and nothing else.** No oracle states a rate: the rate is the pool's own
+ * balance sheet.
+ *
+ * WHY IT EXISTS
+ * -------------
+ * A QRL validator takes 40,000 QRL. Bond principal delegated directly may put
+ * no more than 1,000 bps of itself on one validator (whitepaper §3.4), so it
+ * stakes nothing below 400,000 QRL. A pool stakes 40,000 from whoever deposits
+ * it, and the bond is one depositor among them (`ArkBondStaking` through
+ * `IStakingVenue`). It is the private network's stand-in for a public liquid
+ * staking venue — QuantaPool on the public testnet — with the same shape, so
+ * swapping one for the other is an adapter, not a change to the bond.
+ *
+ * WHAT IT REUSES
+ * --------------
+ * The validators are an `ArkBondDelegation` whose counterparty (`BOND`) is this
+ * pool, deployed with a concentration bound of 10,000 bps: the delegation's
+ * admission behind an operator bond, credentials pinned to itself, the deposit
+ * check, the exit on request, the quorum's reconciliation report behind the
+ * challenge window and the reward cap of I32 all apply unchanged. What this
+ * contract adds is the book: shares, their value, and a withdrawal queue.
+ *
+ * THE VALUE OF A SHARE
+ * --------------------
+ *   value = delegation.principal() + balance here - settled, unclaimed withdrawals
+ *
+ * `principal()` falls when a cleared report shows a validator returned short,
+ * which is the loss; rewards reach this balance by `delegation.distribute` or
+ * `distributeProvisional`, which is the gain. A return of principal moves value
+ * from the first term to the second and changes nothing. Shares are priced
+ * against virtual shares (`OFFSET`) and one virtual wei, so a first depositor
+ * cannot inflate the price of a share against the next.
+ *
+ * A DEPOSIT JOINS THE DISTRIBUTION AT THE NEXT EPOCH
+ * --------------------------------------------------
+ * A staking distribution accrues only to the holdings recorded at the opening
+ * of the epoch it is received in (whitepaper §3.4). Both distribution calls of
+ * the delegation are permissionless, so a deposit priced at once could be
+ * placed, followed by a distribution it called itself, and withdrawn — taking
+ * a reward its principal did not earn (audit 2026-09-27, D16). A deposit is
+ * therefore held as `pendingValue`, outside the value shares are priced on,
+ * and the epoch's deposits are converted together at the first touch of a
+ * later epoch — before any distribution of that epoch counts, since every
+ * distribution arrives through `receive` and `receive` converts first. The
+ * depositor claims its part of the batch's shares lazily.
+ *
+ * Pending is held out of the GAINS and not out of the losses: a loss arrives
+ * without running code here (a cleared report lowers `principal()`), so the
+ * pool keeps `_book`, the value it last wrote, and any fall below it found at
+ * the next touch is shared between the shares and the pending batch in
+ * proportion to their value, the batch's part rounded up. A deposit placed
+ * in the epoch of a loss therefore bears its part of it at once, as a share
+ * would, and a principal return (`returnIdle`) is not mistaken for one.
+ *
+ * THE WITHDRAWAL QUEUE
+ * --------------------
+ * A request locks shares; they keep earning and keep bearing loss until the
+ * queue reaches them (`settle`), in order of request, whole. Settlement prices
+ * them at the value then, burns them, and sets the QRL aside for the claim. It
+ * draws on this balance first and then on the delegation's idle principal;
+ * where that is short by half a validator's stake or more, anyone may ask the
+ * delegation to exit its oldest validator, and only then (`requestExit`;
+ * OC-LEGB-04). While the delegation holds a slashed validator's forfeited bond
+ * against a loss not yet booked (`slashedOpen`), nothing settles: requests
+ * wait, still bearing loss, until the loss and the forfeit land together
+ * (OC-LEGB-03, "bunker").
+ *
+ * No owner, no fee, no setter but the one-shot wiring of the delegation, whose
+ * constructor takes this address, and of the loss listener (`setLossListener`).
+ */
+contract ArkStakingPool is IStakingVenue, ReentrancyGuard {
+    /**
+     * Virtual shares beside the real ones, and one virtual wei of value: the
+     * guard against a first depositor inflating the price of a share. On the
+     * value side only one wei, so a share's value is off by at most a wei
+     * however far the pool falls.
+     */
+    uint256 public constant OFFSET = 1e6;
+
+    /**
+     * The least shortfall an exit is asked for: half of the delegation's
+     * VALIDATOR_STAKE (40,000 QRL). Below it a dust request could force a
+     * whole validator out (OC-LEGB-04); the request waits for idle principal.
+     */
+    uint256 public constant EXIT_SHORTFALL = 20_000 * 10 ** 18; // `* 10 ** 18`: v2 says `ether`, v3 `quanta`
+
+    IArkBondDelegation public delegation;
+    address private immutable _deployer;
+
+    /**
+     * The holder that books a loss of its own when the pool's value falls —
+     * the bond's staking contract — told by `syncLoss` (OC-LEGB-13). Zero:
+     * none. One-shot, the deployer's.
+     */
+    address public lossListener;
+
+    uint256 public totalShares;
+    mapping(address => uint256) private _shares;
+
+    /// Shares locked in requests not yet settled. Part of `totalShares`.
+    uint256 public lockedShares;
+
+    struct Request {
+        address account;
+        uint256 shares;
+        uint256 amount;
+        bool settled;
+        bool claimed;
+    }
+
+    mapping(uint256 => Request) private _requests;
+    uint256 public nextRequest;
+    /// The first request not yet settled.
+    uint256 public queueHead;
+    /// Settled and not yet claimed: set aside, and no longer the pool's.
+    uint256 public reserved;
+
+    /**
+     * What the deposits of `pendingEpoch` are worth now — what was sent, less
+     * their part of any loss since — and not yet converted: outside
+     * `totalValue`. `pendingDeposits` is what was sent, the base each
+     * depositor's part of the batch is taken on.
+     */
+    uint256 public pendingValue;
+    uint256 public pendingDeposits;
+    uint256 public pendingEpoch;
+
+    struct Pending {
+        uint128 amount;
+        uint64 epoch;
+    }
+
+    mapping(address => Pending) private _pending;
+
+    /**
+     * One epoch's deposits, as converted: what was sent and the shares minted
+     * for it. Full words: after a near-total loss a batch mints more than
+     * 2^128 shares, which a narrower field truncated silently (OC-LEGB-10,
+     * OC-PS-01).
+     */
+    struct Batch {
+        uint256 deposits;
+        uint256 shares;
+    }
+
+    mapping(uint256 => Batch) private _batches;
+
+    /// The book — principal, balance, less `reserved` — as last written. See the header.
+    uint256 private _book;
+
+    /// True while `returnIdle` pays principal back: `receive` must not read that as value.
+    bool private _returning;
+
+    event DelegationSet(address indexed delegation);
+    event DepositsConverted(uint256 indexed epoch, uint256 deposits, uint256 value, uint256 shares);
+
+    error OnlyDelegation(address caller);
+    error OnlyDeployer(address caller);
+    error AlreadySet(address current);
+    error NotRequester(uint256 requestId, address caller);
+    error NotSettled(uint256 requestId);
+    error InsufficientShares(uint256 wanted, uint256 held);
+    error NoShortfall(uint256 owed, uint256 cover);
+
+    constructor() {
+        _deployer = msg.sender;
+    }
+
+    /// Name the delegation. One-shot: it takes this pool as its counterparty immutable.
+    function setDelegation(address delegation_) external {
+        if (msg.sender != _deployer) revert OnlyDeployer(msg.sender);
+        if (address(delegation) != address(0)) revert AlreadySet(address(delegation));
+        if (delegation_ == address(0)) revert ZeroAddress();
+        delegation = IArkBondDelegation(delegation_);
+        emit DelegationSet(delegation_);
+    }
+
+    /// Name the loss listener. One-shot, the deployer's (OC-LEGB-13).
+    function setLossListener(address listener) external {
+        if (msg.sender != _deployer) revert OnlyDeployer(msg.sender);
+        if (lossListener != address(0)) revert AlreadySet(lossListener);
+        if (listener == address(0)) revert ZeroAddress();
+        lossListener = listener;
+    }
+
+    /**
+     * Pass a loss the delegation booked on to the listener, so the bond's
+     * position is written down in the same transaction (OC-LEGB-13): the
+     * delegation tells its counterparty, which is this pool. Any sender; the
+     * listener's `syncLoss` is idempotent, and its failure is ignored.
+     */
+    function syncLoss() external {
+        address l = lossListener;
+        if (l == address(0)) return;
+        (bool ok,) = l.call(abi.encodeWithSignature("syncLoss()"));
+        ok;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The book                                                            */
+    /* ------------------------------------------------------------------ */
+
+    /// Principal at the delegation and the balance here, less what is set aside.
+    function _held() private view returns (uint256) {
+        uint256 held = delegation.principal() + address(this).balance;
+        return held > reserved ? held - reserved : 0;
+    }
+
+    /**
+     * What the pending batch is worth now, given `arriving` QRL already in the
+     * balance and not yet the book's: its part of any fall of the book below
+     * `_book`, in proportion to value, rounded up against the batch.
+     */
+    function _pendingNow(uint256 arriving) private view returns (uint256) {
+        uint256 pending = pendingValue;
+        uint256 book = _book;
+        if (pending == 0 || book == 0) return pending;
+        uint256 held = _held();
+        held = held > arriving ? held - arriving : 0;
+        if (held >= book) return pending;
+        uint256 cut = ((book - held) * pending + book - 1) / book;
+        return cut >= pending ? 0 : pending - cut;
+    }
+
+    /// Record the batch's part of any loss since the book was last written, and write it.
+    function _sync(uint256 arriving) private {
+        pendingValue = _pendingNow(arriving);
+        uint256 held = _held();
+        _book = held > arriving ? held - arriving : 0;
+    }
+
+    /// Everything the shares own: the book less the pending batch.
+    function totalValue() public view returns (uint256) {
+        uint256 held = _held();
+        uint256 pending = _pendingNow(0);
+        return held > pending ? held - pending : 0;
+    }
+
+    /// Shares, the converted part of a deposit included. A deposit of the epoch in progress has none yet.
+    function sharesOf(address account) external view returns (uint256) {
+        return _shares[account] + _pendingShares(account);
+    }
+
+    /// What the account holds: its shares at their value, and a deposit not yet converted at its part of the batch.
+    function positionValue(address account) external view returns (uint256) {
+        Pending memory p = _pending[account];
+        uint256 open;
+        if (p.amount != 0 && uint256(p.epoch) == ArkEpoch.current() && pendingDeposits != 0) {
+            // Truncates, toward the pool.
+            open = (uint256(p.amount) * _pendingNow(0)) / pendingDeposits;
+        }
+        return _valueOf(_shares[account] + _pendingShares(account), totalValue()) + open;
+    }
+
+    /// The shares a past deposit converts to: its batch's, or what converting now would give.
+    function _pendingShares(address account) private view returns (uint256) {
+        Pending memory p = _pending[account];
+        uint256 e = uint256(p.epoch);
+        if (p.amount == 0 || e == ArkEpoch.current()) return 0;
+        Batch memory b = _batches[e];
+        if (b.deposits != 0) return _part(uint256(p.amount), b.shares, b.deposits);
+        if (pendingDeposits == 0) return 0;
+        uint256 worth = (uint256(p.amount) * _pendingNow(0)) / pendingDeposits;
+        return (worth * (totalShares + OFFSET)) / (totalValue() + 1);
+    }
+
+    /**
+     * Convert the pending batch, once its epoch has passed, at the value that
+     * stands now less `arriving` — QRL already in the balance that the batch
+     * must not be priced on: a distribution in `receive`, a deposit in
+     * `deposit`. After `_sync`. Truncates, toward the pool.
+     */
+    function _roll(uint256 arriving) private {
+        uint256 deposits = pendingDeposits;
+        uint256 e = pendingEpoch;
+        if (deposits == 0 || e == ArkEpoch.current()) return;
+        uint256 worth = pendingValue;
+        uint256 value = totalValue();
+        value = value > arriving ? value - arriving : 0;
+        uint256 minted = (worth * (totalShares + OFFSET)) / (value + 1);
+        pendingValue = 0;
+        pendingDeposits = 0;
+        totalShares += minted;
+        _batches[e] = Batch({deposits: deposits, shares: minted});
+        emit DepositsConverted(e, deposits, worth, minted);
+    }
+
+    /// Move an account's converted deposit into its shares. After `_roll`. The truncation's residue is the pool's.
+    function _claimPending(address account) private {
+        Pending memory p = _pending[account];
+        if (p.amount == 0 || uint256(p.epoch) == ArkEpoch.current()) return;
+        Batch memory b = _batches[uint256(p.epoch)];
+        _shares[account] += _part(uint256(p.amount), b.shares, b.deposits);
+        delete _pending[account];
+    }
+
+    /**
+     * `amount * shares / deposits`, truncated, without the product: `shares`
+     * may pass 2^128 after a near-total loss (OC-PS-01), and `amount` is a
+     * part of `deposits`, so every term stays inside a word.
+     */
+    function _part(uint256 amount, uint256 shares, uint256 deposits) private pure returns (uint256) {
+        return (shares / deposits) * amount + ((shares % deposits) * amount) / deposits;
+    }
+
+    /// The start of every path: the loss since the last write, then the batch.
+    function _touch(uint256 arriving) private {
+        _sync(arriving);
+        _roll(arriving);
+    }
+
+    /// Shares to QRL at `value`. Truncates, toward the pool.
+    function _valueOf(uint256 shares, uint256 value) private view returns (uint256) {
+        return (shares * (value + 1)) / (totalShares + OFFSET);
+    }
+
+    /// What `shares` are worth now. Truncates, toward the pool.
+    function valueOfShares(uint256 shares) external view returns (uint256) {
+        return _valueOf(shares, totalValue());
+    }
+
+    function sharesFor(uint256 amount) external view returns (uint256) {
+        uint256 value = totalValue();
+        // Rounds up, so the shares named are worth at least `amount`.
+        return (amount * (totalShares + OFFSET) + value) / (value + 1);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* In                                                                  */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Stake the QRL sent. It joins the book at the next epoch (see the
+     * header): held outside the value until then and converted with the
+     * epoch's other deposits, so it returns no shares now. The QRL goes to the
+     * delegation at once, past whatever the queue is still owed, and earns for
+     * the book from there.
+     */
+    function deposit() external payable nonReentrant returns (uint256 shares) {
+        if (msg.value == 0) revert ZeroValue();
+        _touch(msg.value);
+        _claimPending(msg.sender);
+        uint256 nowEpoch = ArkEpoch.current();
+        Pending storage p = _pending[msg.sender];
+        p.amount += uint128(msg.value);
+        p.epoch = uint64(nowEpoch);
+        pendingValue += msg.value;
+        pendingDeposits += msg.value;
+        pendingEpoch = nowEpoch;
+        _book += msg.value;
+        emit Deposited(msg.sender, msg.value, 0);
+        _settle(8);
+        _stake();
+        return 0;
+    }
+
+    /**
+     * Move the balance not set aside and not owed to the queue to the
+     * delegation, where validators can be funded from it. Any sender.
+     */
+    function stake() external nonReentrant {
+        _touch(0);
+        _stake();
+    }
+
+    /// Convert the last epoch's deposits and move the caller's into its shares. Any sender.
+    function roll() external nonReentrant {
+        _touch(0);
+        _claimPending(msg.sender);
+    }
+
+    function _stake() private {
+        uint256 free = address(this).balance > reserved ? address(this).balance - reserved : 0;
+        uint256 owed = _unsettledValue();
+        if (free <= owed) return;
+        delegation.fund{value: free - owed}();
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Out                                                                 */
+    /* ------------------------------------------------------------------ */
+
+    function requestWithdrawal(uint256 shares) external nonReentrant returns (uint256 requestId) {
+        _touch(0);
+        _claimPending(msg.sender);
+        uint256 held = _shares[msg.sender];
+        if (shares == 0) revert ZeroValue();
+        if (shares > held) revert InsufficientShares(shares, held);
+        _shares[msg.sender] = held - shares;
+        lockedShares += shares;
+        requestId = nextRequest++;
+        _requests[requestId] = Request({account: msg.sender, shares: shares, amount: 0, settled: false, claimed: false});
+        emit WithdrawalRequested(requestId, msg.sender, shares);
+        _settle(8);
+    }
+
+    /// Settle what the queue can pay, in order, at most `maxEntries`. Any sender.
+    function settle(uint256 maxEntries) external nonReentrant returns (uint256 settled) {
+        _touch(0);
+        return _settle(maxEntries);
+    }
+
+    /**
+     * Settle the head of the queue while this balance, topped up from the
+     * delegation's idle principal, covers it. Each request is priced at the
+     * value when it is reached and paid whole; a request the pool cannot yet
+     * cover stops the walk, and the requests behind it wait with it.
+     *
+     * What a settlement sets aside leaves the book with it, so `_book` falls
+     * by the same amount: left standing, the next touch would read the payout
+     * as a loss and charge part of it to the pending batch.
+     *
+     * Nothing settles while the delegation holds a slashed validator open
+     * (OC-LEGB-03): its loss is not booked yet, so a price taken now would
+     * hand a leaving holder the forfeit and leave the loss to those who stay.
+     */
+    function _settle(uint256 maxEntries) private returns (uint256 settled) {
+        if (delegation.slashedOpen() != 0) return 0;
+        uint256 head = queueHead;
+        uint256 tail = nextRequest;
+        while (head < tail && settled < maxEntries) {
+            Request storage r = _requests[head];
+            uint256 amount = _valueOf(r.shares, totalValue());
+            uint256 free = address(this).balance > reserved ? address(this).balance - reserved : 0;
+            if (free < amount) {
+                uint256 idle = delegation.idle();
+                uint256 need = amount - free;
+                if (idle < need) break;
+                _returning = true;
+                delegation.returnIdle(need);
+                _returning = false;
+            }
+            totalShares -= r.shares;
+            lockedShares -= r.shares;
+            r.amount = amount;
+            r.settled = true;
+            reserved += amount;
+            _book = _book > amount ? _book - amount : 0;
+            emit WithdrawalSettled(head, amount);
+            ++head;
+            ++settled;
+        }
+        queueHead = head;
+    }
+
+    function withdrawalAmount(uint256 requestId) external view returns (uint256) {
+        Request storage r = _requests[requestId];
+        return r.settled && !r.claimed ? r.amount : 0;
+    }
+
+    function requestOf(uint256 requestId) external view returns (Request memory) {
+        return _requests[requestId];
+    }
+
+    /// Pay a settled request to the account that made it. That account only, so a payee cannot be substituted.
+    function claimWithdrawal(uint256 requestId) external nonReentrant returns (uint256 amount) {
+        Request storage r = _requests[requestId];
+        if (r.account != msg.sender) revert NotRequester(requestId, msg.sender);
+        if (!r.settled || r.claimed) revert NotSettled(requestId);
+        r.claimed = true;
+        amount = r.amount;
+        reserved -= amount;
+        emit WithdrawalClaimed(requestId, msg.sender, amount);
+        (bool ok,) = msg.sender.call{value: amount}("");
+        if (!ok) revert TransferFailed(msg.sender, amount);
+    }
+
+    /**
+     * Ask the delegation to exit a validator, where the queue is owed at least
+     * `EXIT_SHORTFALL` more than this balance, the idle principal and the
+     * exits already asked for can cover. Any sender; the shortfall is
+     * measured, and the delegation picks the validator: its oldest
+     * (OC-LEGB-04).
+     */
+    function requestExit() external nonReentrant returns (bytes32) {
+        uint256 owed = _unsettledValue();
+        uint256 free = address(this).balance > reserved ? address(this).balance - reserved : 0;
+        uint256 cover = free + delegation.idle() + delegation.exitsPending();
+        if (owed < cover + EXIT_SHORTFALL) revert NoShortfall(owed, cover);
+        return delegation.requestExit();
+    }
+
+    /// What the unsettled requests are worth now.
+    function _unsettledValue() private view returns (uint256) {
+        return lockedShares == 0 ? 0 : _valueOf(lockedShares, totalValue());
+    }
+
+    /**
+     * Value from the delegation and from nowhere else: a return of idle
+     * principal, a staking distribution, a forfeited operator bond. A return
+     * moves value between the two terms of the book and is left alone; the
+     * rest is a gain of the shares of record, so the epoch's deposits convert
+     * before it counts and the book takes it in after (whitepaper §3.4, D16).
+     */
+    receive() external payable {
+        if (msg.sender != address(delegation)) revert OnlyDelegation(msg.sender);
+        if (_returning) return;
+        _touch(msg.value);
+        _book += msg.value;
+    }
+}

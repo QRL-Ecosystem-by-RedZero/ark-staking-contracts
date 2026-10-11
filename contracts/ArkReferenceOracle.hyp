@@ -1,0 +1,913 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./interfaces/IArkStakeExternal.hyp";
+import "./interfaces/IArkStakeGovernable.hyp";
+import "./interfaces/IArkStakeParams.hyp";
+import "./interfaces/IGovernanceHandover.hyp";
+import "./utils/ArkEpoch.hyp";
+import "./utils/QuantumErrors.hyp";
+
+/// The guardian and the proposer of the timelock that governs the oracle (core's ArkTimelock).
+interface IArkOracleTimelock {
+    function guardian() external view returns (address);
+    function proposer() external view returns (address);
+}
+
+/**
+ * The valuation oracle of yellow paper §6.1: the series every consumer of
+ * the price reads, computed on QRL from the spot observations a quorum of
+ * reporters posts. Technical reference §1.4 (interface), §3.4 (constants),
+ * §3.7 (parameters); invariants I38, I40 and I41. Written 2026-10-05 against
+ * the papers as amended for the on-chain audit (OC-ORC-01, -02, -08).
+ *
+ * The one rule this contract exists to enforce: **no account posts a price
+ * (I41).** A reporter posts one spot observation per round; a round is
+ * accepted only where `k_o` of its reports lie within `d_rep` of the median of
+ * all its reports, at the median of those, clamped to `s_obs` of the last
+ * accepted observation; and every series a consumer reads is computed here
+ * from the accepted rounds. No entry other than `submit` changes an
+ * observation, governance included.
+ *
+ * THE SERIES (yellow paper §6.1)
+ * ------------------------------
+ *   C(t)    = C(t_r) + p_r (t - t_r)                the cumulative sum
+ *   R(t)    = (C(t) - C(t - 30d)) / 30d              the unbounded thirty-day average
+ *   B_e     = clamp(R(t_e), B_{e-1} (1 -/+ m))       the mark at boundary t_e
+ *   P30(t)  = clamp(R(t), B_e (1 -/+ m))             the bounded series (I38)
+ *   P_e     = (C(t_{e+1}) - C(t_e)) / EPOCH          the epoch average
+ *   A24(t)  = (C(t) - C(t - 24h)) / 24h               the breaker's input
+ *   breaker <=> A24(t) BPS <= A24(t - 24h) (BPS - 5,000)
+ *   twap_e  = (C(t) - C(t_f)) / (t - t_f), t - t_f >= EPOCH
+ *   mdd     = max over marks i < j inside W_fx of 1 - B_i / B_j
+ * m is m_epoch, read from the parameter contract (G8): ArkStakeParams moves
+ * a value only at an epoch boundary, so the value read in an epoch is the one
+ * in force at its opening boundary.
+ *
+ * Each accepted round writes a checkpoint `(t, p, C(t))` into a ring of
+ * `RING` per key, sized to the thirty days and the twenty-four hours before
+ * them at the least round interval (technical reference §3.4), and the mark
+ * of every boundary crossed since the last round, each computed in turn from
+ * the last. A boundary crossed since the last round is computed by the views
+ * the same way, so a mark written later equals the one read before it.
+ *
+ * SILENCE (yellow paper §6.1, I40)
+ * --------------------------------
+ * A key is silent while a pause is in force, until accepted rounds cover
+ * thirty days and twenty-four hours (the warm-up), more than `T_hb` after
+ * its last accepted round, or where the epoch in progress has no mark (the
+ * first epoch after the warm-up, so the series is never read unbounded).
+ * `observe` and `epochAverage` revert `OracleSilent(updatedAt)` then; every
+ * other read answers.
+ *
+ * GOVERNANCE (technical reference §3.3, §3.7)
+ * -------------------------------------------
+ * Every parameter is held here, behind `governance` — the timelock from
+ * stage S1, the interim account at S0 — and moved inside its range by a keyed
+ * compare-and-swap diff (`setParamsDiff`, keccak256 of the field name, the
+ * timelock's own payload), the reporter set by `addReporter`/`removeReporter`.
+ * `arkReferencePrice` moves at most 2,500 bps of the value in force per
+ * operation. core's ArkTimelock checks the same relative step against the
+ * operation's `expected` (`RELATIVE | 2500`, 2026-10-05), and it is checked
+ * here too, against the value in force; under compare-and-swap the two agree.
+ * The guardian of the governing timelock may pause the oracle for
+ * `pauseMaxEpochs`; only the timelock renews a pause in force; a guardian
+ * renounced (stage S3) leaves no pause.
+ *
+ * DEPARTURES, RECORDED
+ * --------------------
+ *  - A round that stood `tau_o` without a quorum lapses: a report naming the
+ *    next round id opens it (the papers state no rule for a round that never
+ *    reaches a quorum; without one, a split report set would silence the key
+ *    for good).
+ *  - The freeze venue list is in force from the protective freeze on, and
+ *    for good once a declaration is ratified: the papers' "until its trigger-2
+ *    settlement" would need the bond's state here, and a list of off-chain
+ *    venues is the safe direction after a declaration.
+ *  - `firedAt` is the round that first saw the breaker; where the views see it
+ *    before any round has (the windows slide between rounds), the last
+ *    accepted round.
+ *  - A gap of more than `MAX_CATCHUP` boundaries writes the last
+ *    `MAX_CATCHUP` marks, the first clamped once against the last mark.
+ *  - The realised yield is the median of the first `k_o` reporters' figures
+ *    for the epoch just closed, and the last figure accepted is read until a
+ *    later one is (the papers leave the yield's silence open).
+ *  - A reporter key is refused where it is governance, the timelock's
+ *    guardian or proposer, or a role key named at construction (the relayer,
+ *    the attestation sealer, the deployer); the origin chain's root signers
+ *    and the Q-Day attesters are not readable here and are the deployment's
+ *    to keep apart.
+ */
+contract ArkReferenceOracle is IReferencePriceOracle, IGovernanceHandover {
+    uint256 private constant BPS = 10000;
+
+    /// The breaker: a fall of the 24-hour average of 5,000 bps (technical reference §3.4).
+    uint256 public constant BREAKER_BPS = 5000;
+
+    uint256 internal constant EPOCH = ArkEpoch.EPOCH_LENGTH;
+    uint256 internal constant WINDOW = 30 days;
+    uint256 internal constant DAY = 24 hours;
+    uint256 internal constant WARM_UP = 31 days;
+
+    /// True on a time-compressed build: the windows scale with the epoch, the round interval and the heartbeat do not.
+    bool internal constant COMPRESSED = 1 days != 86400;
+
+    /// Checkpoints kept per key: 4,096; 512 on the compressed profile (technical reference §3.4).
+    uint256 public constant RING = COMPRESSED ? 512 : 4096;
+
+    /// The most boundaries one accepted round, or one read, computes in turn.
+    uint256 internal constant MAX_CATCHUP = 64;
+
+    /// The admissible ranges of technical reference §3.7. Seconds are written bare: they do not scale.
+    uint256 internal constant MIN_REPORTERS = 3;
+    uint256 internal constant MAX_REPORTERS = 9;
+    uint256 internal constant MIN_INTERVAL = COMPRESSED ? 60 : 900;
+    uint256 internal constant MAX_INTERVAL = COMPRESSED ? 600 : 14400;
+    uint256 internal constant MIN_HEARTBEAT = COMPRESSED ? 180 : 3600;
+    uint256 internal constant MAX_HEARTBEAT = 86400;
+
+    /// The relative step of `arkReferencePrice` per operation (technical reference §3.3).
+    uint256 internal constant ARK_STEP_BPS = 2500;
+
+    bytes32 internal constant K_QUORUM = keccak256("reporterQuorum");
+    bytes32 internal constant K_INTERVAL = keccak256("roundIntervalSeconds");
+    bytes32 internal constant K_HEARTBEAT = keccak256("heartbeatSeconds");
+    bytes32 internal constant K_STEP = keccak256("maxStepBps");
+    bytes32 internal constant K_DISPERSION = keccak256("maxDispersionBps");
+    bytes32 internal constant K_ALARM = keccak256("deviationAlarmBps");
+    bytes32 internal constant K_VENUES = keccak256("venueListHash");
+    bytes32 internal constant K_FREEZE_VENUES = keccak256("freezeVenueListHash");
+    bytes32 internal constant K_ARK_REFERENCE = keccak256("arkReferencePrice");
+    bytes32 internal constant K_PAUSE_MAX = keccak256("pauseMaxEpochs");
+
+    /// The governed values of technical reference §3.7.
+    struct Settings {
+        uint16 reporterQuorum;
+        uint32 roundIntervalSeconds;
+        uint32 heartbeatSeconds;
+        uint16 maxStepBps;
+        uint16 maxDispersionBps;
+        uint16 deviationAlarmBps;
+        uint16 pauseMaxEpochs;
+        bytes32 venueListHash;
+        bytes32 freezeVenueListHash;
+        uint256 arkReferencePrice;
+    }
+
+    /// One key's feed. `count` checkpoints written; marks stored for epochs below `markEpochPlusOne`.
+    struct Feed {
+        uint64 firstAt;
+        uint64 updatedAt;
+        uint64 lastRound;
+        uint64 openRound;
+        uint64 openedAt;
+        uint64 count;
+        uint64 firedAt;
+        uint64 markEpochPlusOne;
+        bool clamped;
+        uint256 last;
+        uint256 cum;
+        uint256 cumAtFire;
+        uint256 lastSeries;
+    }
+
+    struct Checkpoint {
+        uint64 t;
+        uint192 obs;
+        uint256 cum;
+    }
+
+    /// The cumulative sum at boundary t_e, and B_e (zero where R(t_e) was undefined).
+    struct Mark {
+        uint256 cum;
+        uint256 bound;
+    }
+
+    address public governance;
+    address public pendingGovernance;
+
+    /// The parameter contract m_epoch is read from (G8).
+    IArkStakeParams public immutable PARAMS;
+    /// The protective freeze and the declaration, which put the freeze venue list in force.
+    IQDayOracle public immutable QDAY;
+
+    Settings private _settings;
+    uint256 public reporterCount;
+    // Private behind an explicit view: hypc's QRVM auto-getter cleans a
+    // mapping key as uint256 before hashing, so a 64-byte address or a
+    // left-aligned bytes32 key reads another slot (OC-V3-02).
+    mapping(address => bool) private _isReporter;
+    mapping(address => bool) private _roleKey;
+
+    /// The end of the pause in force; none once past.
+    uint64 public pausedUntil;
+
+    mapping(bytes32 => Feed) private _feeds;
+    mapping(bytes32 => mapping(uint256 => Checkpoint)) private _ring;
+    mapping(bytes32 => mapping(uint256 => Mark)) private _marks;
+    mapping(bytes32 => mapping(uint256 => uint256[])) private _reports;
+    mapping(bytes32 => bool) private _reported;
+
+    mapping(bytes32 => mapping(uint256 => uint256[])) private _yieldReports;
+    mapping(bytes32 => uint256) private _yieldBps;
+    mapping(bytes32 => uint256) private _yieldEpoch;
+
+    error OnlyGovernance(address caller);
+    error NotReporter(address caller);
+    error ReporterHoldsRole(address reporter);
+    error ReporterKnown(address reporter);
+    error ReporterSetSize(uint256 reporters, uint256 quorum);
+    error NotOpenRound(uint64 roundId, uint64 open);
+    error AlreadyReported(uint64 roundId);
+    error RoundTooSoon(uint256 opensAt);
+    error WrongVenueList(bytes32 named, bytes32 inForce);
+    error EpochOpen(uint64 epoch);
+    error EpochUnpriced(uint64 epoch);
+    error YieldEpoch(uint64 epoch, uint256 expected);
+    error ParameterOutOfRange(bytes32 key, uint256 value);
+    error UnknownParameter(bytes32 key);
+    error StaleParameter(bytes32 key, uint256 expected, uint256 current);
+    error DuplicateParameter(bytes32 key);
+    error ParameterStepTooLarge(bytes32 key, uint256 current, uint256 value);
+    error EmptyDiff();
+    error NoPause();
+    error NotGuardian(address caller);
+    error PauseInForce(uint64 until);
+
+    event ReportSubmitted(uint64 indexed roundId, address indexed reporter, uint256 spot);
+    event RoundAccepted(
+        uint64 indexed roundId, uint256 chainId, address indexed asset, uint256 observation, bool clamped, uint64 updatedAt
+    );
+    event YieldReported(uint64 indexed epoch, address indexed reporter, uint256 chainId, address asset, uint256 bps);
+    event YieldAccepted(uint64 indexed epoch, uint256 chainId, address asset, uint256 bps);
+    event ParamChanged(bytes32 indexed key, uint256 previous, uint256 value);
+    event ReporterAdded(address indexed reporter);
+    event ReporterRemoved(address indexed reporter);
+    event Paused(address indexed by, uint64 until);
+
+    constructor(
+        address governance_,
+        address params_,
+        address qday_,
+        address[] memory reporters_,
+        address[] memory roleKeys_,
+        Settings memory settings_
+    ) {
+        if (governance_ == address(0) || params_ == address(0) || qday_ == address(0)) revert ZeroAddress();
+        governance = governance_;
+        PARAMS = IArkStakeParams(params_);
+        QDAY = IQDayOracle(qday_);
+        for (uint256 i = 0; i < roleKeys_.length; i++) {
+            _roleKey[roleKeys_[i]] = true;
+        }
+        _roleKey[governance_] = true;
+        for (uint256 i = 0; i < reporters_.length; i++) {
+            _admit(reporters_[i]);
+        }
+        _check(settings_, reporters_.length);
+        _settings = settings_;
+    }
+
+    modifier onlyGovernance() {
+        if (msg.sender != governance) revert OnlyGovernance(msg.sender);
+        _;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Rounds                                                              */
+    /* ------------------------------------------------------------------ */
+
+    /// The key of a series: `(chainId, asset)`; the book reads `(0, address(0))`, the court ARK at `(0, ARK)`.
+    function keyOf(uint256 chainId, address asset) public pure returns (bytes32) {
+        return keccak256(abi.encode(chainId, asset));
+    }
+
+    /// The venue list a report must name now: the freeze list under the freeze or after a declaration (yellow paper §6.1).
+    function venueListInForce() public view returns (bytes32) {
+        if (QDAY.frozen() || QDAY.declared()) return _settings.freezeVenueListHash;
+        return _settings.venueListHash;
+    }
+
+    /**
+     * One spot observation for round `roundId` of `(chainId, asset)`, formed
+     * under the venue list `venueList` (technical reference §1.4). The round
+     * is accepted at the first report after which `k_o` of its reports lie
+     * within `d_rep` of the median of all of them: at the median of those,
+     * clamped to `s_obs` of the last accepted observation.
+     */
+    function submit(uint64 roundId, uint256 chainId, address asset, uint256 spot, bytes32 venueList) external {
+        if (!_isReporter[msg.sender]) revert NotReporter(msg.sender);
+        if (spot == 0 || spot > type(uint192).max) revert ZeroValue();
+        {
+            bytes32 inForce = venueListInForce();
+            if (venueList != inForce) revert WrongVenueList(venueList, inForce);
+        }
+        bytes32 key = keyOf(chainId, asset);
+        Feed storage f = _feeds[key];
+        uint256 interval = uint256(_settings.roundIntervalSeconds);
+        if (f.updatedAt != 0 && block.timestamp < uint256(f.updatedAt) + interval) {
+            revert RoundTooSoon(uint256(f.updatedAt) + interval);
+        }
+        uint64 open = f.openRound == 0 ? 1 : f.openRound;
+        // A round that stood one round interval without a quorum lapses: the next id opens.
+        if (roundId == open + 1 && f.openedAt != 0 && block.timestamp >= uint256(f.openedAt) + interval) {
+            open = roundId;
+            f.openedAt = 0;
+        }
+        if (roundId != open) revert NotOpenRound(roundId, open);
+        f.openRound = open;
+        bytes32 seen = keccak256(abi.encode(key, roundId, msg.sender));
+        if (_reported[seen]) revert AlreadyReported(roundId);
+        _reported[seen] = true;
+        if (f.openedAt == 0) f.openedAt = uint64(block.timestamp);
+        uint256[] storage reports = _reports[key][roundId];
+        reports.push(spot);
+        emit ReportSubmitted(roundId, msg.sender, spot);
+
+        (bool ok, uint256 observation) = _quorum(reports);
+        if (!ok) return;
+        bool clamped;
+        (observation, clamped) = _step(f, observation);
+        _accept(key, f, observation);
+        f.lastRound = roundId;
+        f.openRound = roundId + 1;
+        f.openedAt = 0;
+        f.clamped = clamped;
+        emit RoundAccepted(roundId, chainId, asset, observation, clamped, uint64(block.timestamp));
+    }
+
+    /**
+     * Whether `k_o` of the reports lie within `d_rep` of the median of all of
+     * them, and the median of those. The reports of a round number at most
+     * the reporter set, nine.
+     */
+    function _quorum(uint256[] storage reports) private view returns (bool, uint256) {
+        uint256 n = reports.length;
+        uint256 k = uint256(_settings.reporterQuorum);
+        if (n < k) return (false, 0);
+        uint256[] memory v = new uint256[](n);
+        for (uint256 i = 0; i < n; i++) {
+            uint256 x = reports[i];
+            uint256 j = i;
+            while (j > 0 && v[j - 1] > x) {
+                v[j] = v[j - 1];
+                j--;
+            }
+            v[j] = x;
+        }
+        uint256 median = _median(v, 0, n);
+        uint256 d = uint256(_settings.maxDispersionBps);
+        // The reports within d_rep of the median are contiguous in the sorted list.
+        uint256 lo = n;
+        uint256 hi = 0;
+        for (uint256 i = 0; i < n; i++) {
+            uint256 gap = v[i] > median ? v[i] - median : median - v[i];
+            if (gap * BPS <= d * median) {
+                if (lo == n) lo = i;
+                hi = i + 1;
+            }
+        }
+        if (lo == n || hi - lo < k) return (false, 0);
+        return (true, _median(v, lo, hi));
+    }
+
+    /// The median of the sorted `v[lo..hi)`; the mean of the middle two of an even count, truncating.
+    function _median(uint256[] memory v, uint256 lo, uint256 hi) private pure returns (uint256) {
+        uint256 n = hi - lo;
+        uint256 mid = lo + n / 2;
+        if (n % 2 == 1) return v[mid];
+        return (v[mid - 1] + v[mid]) / 2;
+    }
+
+    /// The step limit s_obs against the last accepted observation (yellow paper §6.1 step 3).
+    function _step(Feed storage f, uint256 obs) private view returns (uint256, bool) {
+        if (f.updatedAt == 0) return (obs, false);
+        uint256 last = f.last;
+        uint256 s = uint256(_settings.maxStepBps);
+        uint256 low = (last * (BPS - s)) / BPS;
+        uint256 high = (last * (BPS + s)) / BPS;
+        if (obs < low) return (low, true);
+        if (obs > high) return (high, true);
+        return (obs, false);
+    }
+
+    /**
+     * Step 4: the marks of every boundary crossed since the last round, the
+     * cumulative sum advanced by the last observation over the time since it,
+     * a checkpoint, the bounded series as at this round, and the breaker.
+     */
+    function _accept(bytes32 key, Feed storage f, uint256 obs) private {
+        uint256 t = block.timestamp;
+        uint256 cum;
+        if (f.updatedAt == 0) {
+            f.firstAt = uint64(t);
+        } else {
+            _markCrossed(key, f, t);
+            cum = f.cum + f.last * (t - uint256(f.updatedAt));
+        }
+        f.cum = cum;
+        f.last = obs;
+        f.updatedAt = uint64(t);
+        _ring[key][uint256(f.count) % RING] = Checkpoint(uint64(t), uint192(obs), cum);
+        f.count += 1;
+        f.lastSeries = _seriesAt(key, f, t);
+
+        bool active = _breakerAt(key, f, t);
+        if (!active) {
+            f.firedAt = 0;
+        } else if (f.firedAt == 0) {
+            f.firedAt = uint64(t);
+            f.cumAtFire = cum;
+        }
+    }
+
+    /// The marks of the boundaries in (updatedAt, t], each from the last; called before the sum advances.
+    function _markCrossed(bytes32 key, Feed storage f, uint256 t) private {
+        uint256 from = uint256(f.updatedAt) / EPOCH + 1;
+        uint256 to = t / EPOCH;
+        if (to < from) return;
+        if (to - from >= MAX_CATCHUP) from = to - MAX_CATCHUP + 1;
+        uint256 s = uint256(f.markEpochPlusOne);
+        uint256 b = s == 0 ? 0 : _marks[key][s - 1].bound;
+        uint256 m = _mEpoch();
+        for (uint256 e = from; e <= to; e++) {
+            uint256 te = e * EPOCH;
+            b = _nextBound(b, _raw(key, f, te), m);
+            _marks[key][e] = Mark(f.cum + f.last * (te - uint256(f.updatedAt)), b);
+        }
+        f.markEpochPlusOne = uint64(to + 1);
+    }
+
+    /// B_e from B_{e-1} and R(t_e): the first defined boundary is unbounded, an undefined one resets.
+    function _nextBound(uint256 prev, uint256 r, uint256 m) private pure returns (uint256) {
+        if (r == 0) return 0;
+        if (prev == 0) return r;
+        return _clamp(r, prev, m);
+    }
+
+    function _clamp(uint256 x, uint256 centre, uint256 m) private pure returns (uint256) {
+        uint256 low = (centre * (BPS - m)) / BPS;
+        uint256 high = (centre * (BPS + m)) / BPS;
+        if (x < low) return low;
+        if (x > high) return high;
+        return x;
+    }
+
+    function _mEpoch() private view returns (uint256 m) {
+        (,,, uint16 move) = PARAMS.trigger2Params();
+        m = move;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The series                                                          */
+    /* ------------------------------------------------------------------ */
+
+    /// C(t), and whether the accepted rounds reach it: from the first round, through the ring.
+    function _cumAt(bytes32 key, Feed storage f, uint256 t) private view returns (bool, uint256) {
+        uint256 n = uint256(f.count);
+        if (n == 0 || t < uint256(f.firstAt)) return (false, 0);
+        if (t >= uint256(f.updatedAt)) return (true, f.cum + f.last * (t - uint256(f.updatedAt)));
+        uint256 lo = n > RING ? n - RING : 0;
+        uint256 hi = n - 1;
+        if (t < uint256(_ring[key][lo % RING].t)) return (false, 0);
+        while (lo < hi) {
+            uint256 mid = (lo + hi + 1) / 2;
+            if (uint256(_ring[key][mid % RING].t) <= t) lo = mid;
+            else hi = mid - 1;
+        }
+        Checkpoint storage c = _ring[key][lo % RING];
+        return (true, c.cum + uint256(c.obs) * (t - uint256(c.t)));
+    }
+
+    /// The average over [a, b), zero where the rounds do not reach a.
+    function _average(bytes32 key, Feed storage f, uint256 a, uint256 b) private view returns (uint256) {
+        if (b <= a) return 0;
+        (bool okA, uint256 ca) = _cumAt(key, f, a);
+        (bool okB, uint256 cb) = _cumAt(key, f, b);
+        if (!okA || !okB) return 0;
+        return (cb - ca) / (b - a);
+    }
+
+    /// R(t), the unbounded thirty-day average; zero before the rounds cover the window.
+    function _raw(bytes32 key, Feed storage f, uint256 t) private view returns (uint256) {
+        if (t < WINDOW) return 0;
+        return _average(key, f, t - WINDOW, t);
+    }
+
+    /// B_e: stored, or computed in turn from the last stored mark; zero where undefined.
+    function _bound(bytes32 key, Feed storage f, uint256 e) private view returns (uint256 b) {
+        uint256 s = uint256(f.markEpochPlusOne);
+        if (e < s) return _marks[key][e].bound;
+        if (f.count == 0) return 0;
+        uint256 x = s;
+        if (s != 0) b = _marks[key][s - 1].bound;
+        else x = uint256(f.firstAt) / EPOCH + 1;
+        if (e < x || e - x >= MAX_CATCHUP) return 0;
+        uint256 m = _mEpoch();
+        for (; x <= e; x++) {
+            b = _nextBound(b, _raw(key, f, x * EPOCH), m);
+        }
+    }
+
+    /// P30(t), the bounded series of yellow paper §6.1; zero where R(t) or B_e is undefined.
+    function _seriesAt(bytes32 key, Feed storage f, uint256 t) private view returns (uint256) {
+        uint256 r = _raw(key, f, t);
+        if (r == 0) return 0;
+        uint256 b = _bound(key, f, t / EPOCH);
+        if (b == 0) return 0;
+        return _clamp(r, b, _mEpoch());
+    }
+
+    /// The breaker at t: the 24-hour average 5,000 bps or more below the one ending 24 hours earlier; never in the warm-up.
+    function _breakerAt(bytes32 key, Feed storage f, uint256 t) private view returns (bool) {
+        if (t < uint256(f.firstAt) + WARM_UP) return false;
+        uint256 prev = _average(key, f, t - 2 * DAY, t - DAY);
+        if (prev == 0) return false;
+        return _average(key, f, t - DAY, t) * BPS <= prev * (BPS - BREAKER_BPS);
+    }
+
+    function _silent(bytes32 key, Feed storage f) private view returns (bool) {
+        uint256 t = block.timestamp;
+        if (t < uint256(pausedUntil)) return true;
+        if (f.firstAt == 0 || t < uint256(f.firstAt) + WARM_UP) return true;
+        if (t > uint256(f.updatedAt) + uint256(_settings.heartbeatSeconds)) return true;
+        return _seriesAt(key, f, t) == 0;
+    }
+
+    function _live(uint256 chainId, address asset) private view returns (bytes32 key, Feed storage f) {
+        key = keyOf(chainId, asset);
+        f = _feeds[key];
+        if (_silent(key, f)) revert OracleSilent(f.updatedAt);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Reads (technical reference §1.4)                                    */
+    /* ------------------------------------------------------------------ */
+
+    /// @inheritdoc IReferencePriceOracle
+    function observe(uint256 chainId, address asset)
+        external
+        view
+        returns (uint256 twapEpoch, uint256 twap30d, uint256 twap30d24hAgo)
+    {
+        (bytes32 key, Feed storage f) = _live(chainId, asset);
+        uint256 t = block.timestamp;
+        uint256 opened = (t / EPOCH) * EPOCH;
+        twapEpoch = t > opened ? _average(key, f, opened, t) : f.last;
+        twap30d = _seriesAt(key, f, t);
+        twap30d24hAgo = _seriesAt(key, f, t - DAY);
+    }
+
+    /// @inheritdoc IReferencePriceOracle
+    function latestRound(uint256 chainId, address asset)
+        external
+        view
+        returns (uint64 roundId, uint64 updatedAt, uint256 observation, bool clamped)
+    {
+        Feed storage f = _feeds[keyOf(chainId, asset)];
+        return (f.lastRound, f.updatedAt, f.last, f.clamped);
+    }
+
+    /// @inheritdoc IReferencePriceOracle
+    function lastAccepted(uint256 chainId, address asset) external view returns (uint256 twap30d, uint64 updatedAt) {
+        Feed storage f = _feeds[keyOf(chainId, asset)];
+        return (f.lastSeries, f.updatedAt);
+    }
+
+    /// @inheritdoc IReferencePriceOracle
+    function epochAverage(uint256 chainId, address asset, uint64 epoch) external view returns (uint256) {
+        (bytes32 key, Feed storage f) = _live(chainId, asset);
+        uint256 e = uint256(epoch);
+        if (e >= block.timestamp / EPOCH) revert EpochOpen(epoch);
+        (bool okA, uint256 ca) = _cumAtBoundary(key, f, e);
+        (bool okB, uint256 cb) = _cumAtBoundary(key, f, e + 1);
+        if (!okA || !okB) revert EpochUnpriced(epoch);
+        return (cb - ca) / EPOCH;
+    }
+
+    /// C(t_e) from the stored mark where one was written past the ring, else through the ring.
+    function _cumAtBoundary(bytes32 key, Feed storage f, uint256 e) private view returns (bool, uint256) {
+        uint256 c = _marks[key][e].cum;
+        if (c != 0) return (true, c);
+        return _cumAt(key, f, e * EPOCH);
+    }
+
+    /// @inheritdoc IReferencePriceOracle
+    function silent(uint256 chainId, address asset) external view returns (bool) {
+        bytes32 key = keyOf(chainId, asset);
+        return _silent(key, _feeds[key]);
+    }
+
+    function isReporter(address reporter) external view returns (bool) {
+        return _isReporter[reporter];
+    }
+
+    /// @inheritdoc IReferencePriceOracle
+    function breakerActive(uint256 chainId, address asset) public view returns (bool active, uint64 firedAt) {
+        bytes32 key = keyOf(chainId, asset);
+        Feed storage f = _feeds[key];
+        if (f.count == 0 || !_breakerAt(key, f, block.timestamp)) return (false, 0);
+        return (true, f.firedAt != 0 ? f.firedAt : f.updatedAt);
+    }
+
+    /// @inheritdoc IReferencePriceOracle
+    function arkReferencePrice() external view returns (uint256) {
+        return _settings.arkReferencePrice;
+    }
+
+    /**
+     * twap_e: the average since the breaker fired, once that window spans an
+     * epoch; zero otherwise, which the registry reads as the floor.
+     */
+    function emergencyValuation(uint256 chainId, address asset) external view returns (uint256) {
+        (bool active, uint64 firedAt) = breakerActive(chainId, asset);
+        uint256 t = block.timestamp;
+        uint256 tf = uint256(firedAt);
+        if (!active || t < tf + EPOCH) return 0;
+        bytes32 key = keyOf(chainId, asset);
+        Feed storage f = _feeds[key];
+        (bool okF, uint256 cf) = _cumAt(key, f, tf);
+        if (firedAt == f.firedAt) (okF, cf) = (true, f.cumAtFire);
+        (, uint256 cn) = _cumAt(key, f, t);
+        if (!okF) return 0;
+        return (cn - cf) / (t - tf);
+    }
+
+    /**
+     * The largest drawdown of the value of QRL in the origin asset, a rise of
+     * P, over the ceil(window / EPOCH) epoch marks of the bounded series that
+     * end with the epoch in progress (yellow paper §4.3, §6.1). Undefined
+     * marks are passed over.
+     */
+    function maxDrawdownBps(uint256 chainId, address asset, uint256 windowSeconds) external view returns (uint256 mdd) {
+        bytes32 key = keyOf(chainId, asset);
+        Feed storage f = _feeds[key];
+        uint256 n = (windowSeconds + EPOCH - 1) / EPOCH;
+        uint256 cur = block.timestamp / EPOCH;
+        if (n == 0) return 0;
+        uint256 first = cur + 1 > n ? cur + 1 - n : 0;
+        uint256 low;
+        for (uint256 e = first; e <= cur; e++) {
+            uint256 b = _bound(key, f, e);
+            if (b == 0) continue;
+            if (low != 0 && b > low) {
+                uint256 dd = ((b - low) * BPS) / b;
+                if (dd > mdd) mdd = dd;
+            }
+            if (low == 0 || b < low) low = b;
+        }
+    }
+
+    /// The realised yield the reporters' median gave for the last epoch accepted (yellow paper §6.1).
+    function realisedYieldBps(uint256 chainId, address asset) external view returns (uint256) {
+        return _yieldBps[keyOf(chainId, asset)];
+    }
+
+    /// B_e, the mark of the bounded series at the opening boundary of `epoch`; zero where undefined.
+    function boundOf(uint256 chainId, address asset, uint64 epoch) external view returns (uint256) {
+        bytes32 key = keyOf(chainId, asset);
+        return _bound(key, _feeds[key], uint256(epoch));
+    }
+
+    /// The governed values in force.
+    function settings() external view returns (Settings memory) {
+        return _settings;
+    }
+
+    /**
+     * Whether a clearing price strays from P_t of `epoch` by more than the
+     * deviation alarm (yellow paper §6.1): an alarm for the watcher, which
+     * changes no quantity. False while silent or unpriced.
+     */
+    function deviates(uint256 chainId, address asset, uint64 epoch, uint256 clearingPrice) external view returns (bool) {
+        try this.epochAverage(chainId, asset, epoch) returns (uint256 p) {
+            uint256 gap = clearingPrice > p ? clearingPrice - p : p - clearingPrice;
+            return gap * BPS > uint256(_settings.deviationAlarmBps) * p;
+        } catch {
+            return false;
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The realised yield                                                  */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * A reporter's figure for the realised yield of `(chainId, asset)` over the
+     * trailing window closed at the last boundary, the epoch just closed. The
+     * figure of the epoch is the median of the first `k_o` reports.
+     */
+    function submitYield(uint64 epoch, uint256 chainId, address asset, uint256 bps) external {
+        if (!_isReporter[msg.sender]) revert NotReporter(msg.sender);
+        uint256 closed = block.timestamp / EPOCH - 1;
+        if (uint256(epoch) != closed) revert YieldEpoch(epoch, closed);
+        bytes32 key = keyOf(chainId, asset);
+        bytes32 seen = keccak256(abi.encode(key, "yield", epoch, msg.sender));
+        if (_reported[seen]) revert AlreadyReported(epoch);
+        _reported[seen] = true;
+        emit YieldReported(epoch, msg.sender, chainId, asset, bps);
+        if (_yieldEpoch[key] == closed + 1) return;
+        uint256[] storage r = _yieldReports[key][closed];
+        r.push(bps);
+        uint256 k = uint256(_settings.reporterQuorum);
+        if (r.length < k) return;
+        uint256[] memory v = new uint256[](k);
+        for (uint256 i = 0; i < k; i++) {
+            uint256 x = r[i];
+            uint256 j = i;
+            while (j > 0 && v[j - 1] > x) {
+                v[j] = v[j - 1];
+                j--;
+            }
+            v[j] = x;
+        }
+        uint256 figure = _median(v, 0, k);
+        _yieldBps[key] = figure;
+        _yieldEpoch[key] = closed + 1;
+        emit YieldAccepted(epoch, chainId, asset, figure);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Governance                                                          */
+    /* ------------------------------------------------------------------ */
+
+    /// @inheritdoc IGovernanceHandover
+    function proposeGovernance(address next) external onlyGovernance {
+        pendingGovernance = next;
+        emit GovernanceProposed(governance, next);
+    }
+
+    /// @inheritdoc IGovernanceHandover
+    function acceptGovernance() external {
+        address next = pendingGovernance;
+        if (msg.sender != next) revert NotPendingGovernance(msg.sender);
+        if (_isReporter[next]) revert ReporterHoldsRole(next);
+        emit GovernanceTransferred(governance, next);
+        governance = next;
+        pendingGovernance = address(0);
+        _roleKey[next] = true;
+    }
+
+    /**
+     * A keyed diff, compare-and-swap on each key, checked on the draft against
+     * every range and relation of technical reference §3.7 and applied at
+     * once. The selector is the parameter contract's, so the timelock decodes
+     * it and applies its delays (technical reference §3.3).
+     */
+    function setParamsDiff(IArkStakeGovernable.ParamChange[] calldata changes) external onlyGovernance {
+        uint256 n = changes.length;
+        if (n == 0) revert EmptyDiff();
+        Settings memory d = _settings;
+        for (uint256 i = 0; i < n; i++) {
+            bytes32 k = changes[i].key;
+            for (uint256 j = 0; j < i; j++) {
+                if (changes[j].key == k) revert DuplicateParameter(k);
+            }
+            uint256 value = changes[i].value;
+            uint256 old = _swap(d, k, value);
+            if (old != changes[i].expected) revert StaleParameter(k, changes[i].expected, old);
+            if (k == K_ARK_REFERENCE) {
+                uint256 moved = value > old ? value - old : old - value;
+                if (moved * BPS > old * ARK_STEP_BPS) revert ParameterStepTooLarge(k, old, value);
+            }
+            emit ParamChanged(k, old, value);
+        }
+        _check(d, reporterCount);
+        _settings = d;
+    }
+
+    /// Writes `value` at `k` in `d` and returns the value it replaced; the narrowing is refused, not truncated.
+    function _swap(Settings memory d, bytes32 k, uint256 value) private pure returns (uint256 old) {
+        if (k == K_VENUES) {
+            old = uint256(d.venueListHash);
+            d.venueListHash = bytes32(value);
+            return old;
+        }
+        if (k == K_FREEZE_VENUES) {
+            old = uint256(d.freezeVenueListHash);
+            d.freezeVenueListHash = bytes32(value);
+            return old;
+        }
+        if (k == K_ARK_REFERENCE) {
+            old = d.arkReferencePrice;
+            d.arkReferencePrice = value;
+            return old;
+        }
+        if (value > type(uint32).max) revert ParameterOutOfRange(k, value);
+        if (k == K_INTERVAL) {
+            old = d.roundIntervalSeconds;
+            d.roundIntervalSeconds = uint32(value);
+            return old;
+        }
+        if (k == K_HEARTBEAT) {
+            old = d.heartbeatSeconds;
+            d.heartbeatSeconds = uint32(value);
+            return old;
+        }
+        if (value > type(uint16).max) revert ParameterOutOfRange(k, value);
+        if (k == K_QUORUM) {
+            old = d.reporterQuorum;
+            d.reporterQuorum = uint16(value);
+        } else if (k == K_STEP) {
+            old = d.maxStepBps;
+            d.maxStepBps = uint16(value);
+        } else if (k == K_DISPERSION) {
+            old = d.maxDispersionBps;
+            d.maxDispersionBps = uint16(value);
+        } else if (k == K_ALARM) {
+            old = d.deviationAlarmBps;
+            d.deviationAlarmBps = uint16(value);
+        } else if (k == K_PAUSE_MAX) {
+            old = d.pauseMaxEpochs;
+            d.pauseMaxEpochs = uint16(value);
+        } else {
+            revert UnknownParameter(k);
+        }
+    }
+
+    /// The ranges and relations of technical reference §3.7, on a draft and the size of the reporter set.
+    function _check(Settings memory s, uint256 reporters) private pure {
+        uint256 k = uint256(s.reporterQuorum);
+        if (reporters < MIN_REPORTERS || reporters > MAX_REPORTERS || k > reporters || 2 * k <= reporters) {
+            revert ReporterSetSize(reporters, k);
+        }
+        uint256 tau = uint256(s.roundIntervalSeconds);
+        uint256 hb = uint256(s.heartbeatSeconds);
+        if (tau < MIN_INTERVAL || tau > MAX_INTERVAL) revert ParameterOutOfRange(K_INTERVAL, tau);
+        if (hb < MIN_HEARTBEAT || hb > MAX_HEARTBEAT || hb < 3 * tau) revert ParameterOutOfRange(K_HEARTBEAT, hb);
+        _range(K_STEP, s.maxStepBps, 250, 2500);
+        _range(K_DISPERSION, s.maxDispersionBps, 100, 1000);
+        _range(K_ALARM, s.deviationAlarmBps, 500, 5000);
+        _range(K_PAUSE_MAX, s.pauseMaxEpochs, 1, 4);
+        if (s.arkReferencePrice == 0) revert ParameterOutOfRange(K_ARK_REFERENCE, 0);
+    }
+
+    function _range(bytes32 k, uint256 value, uint256 lo, uint256 hi) private pure {
+        if (value < lo || value > hi) revert ParameterOutOfRange(k, value);
+    }
+
+    /// Governance only (technical reference §3.3: seven days). A key holding another role is refused (I41).
+    function addReporter(address reporter) external onlyGovernance {
+        _admit(reporter);
+        _check(_settings, reporterCount);
+    }
+
+    /// Governance only (seven days). The set stays inside its range and above the quorum.
+    function removeReporter(address reporter) external onlyGovernance {
+        if (!_isReporter[reporter]) revert NotReporter(reporter);
+        _isReporter[reporter] = false;
+        reporterCount -= 1;
+        _check(_settings, reporterCount);
+        emit ReporterRemoved(reporter);
+    }
+
+    function _admit(address reporter) private {
+        if (reporter == address(0)) revert ZeroAddress();
+        if (_isReporter[reporter]) revert ReporterKnown(reporter);
+        if (_roleKey[reporter] || reporter == governance || _holdsTimelockRole(reporter)) revert ReporterHoldsRole(reporter);
+        _isReporter[reporter] = true;
+        reporterCount += 1;
+        emit ReporterAdded(reporter);
+    }
+
+    function _holdsTimelockRole(address reporter) private view returns (bool) {
+        if (governance.code.length == 0) return false;
+        try IArkOracleTimelock(governance).guardian() returns (address g) {
+            if (g == reporter) return true;
+        } catch {}
+        try IArkOracleTimelock(governance).proposer() returns (address p) {
+            if (p == reporter) return true;
+        } catch {}
+        return false;
+    }
+
+    /// The guardian of the governing timelock; none at stage S0 (an account governs) or once renounced (S3).
+    function guardian() public view returns (address) {
+        if (governance.code.length == 0) return address(0);
+        try IArkOracleTimelock(governance).guardian() returns (address g) {
+            return g;
+        } catch {
+            return address(0);
+        }
+    }
+
+    /**
+     * Makes every series silent for `pauseMaxEpochs` epochs (yellow paper
+     * §6.1): the guardian, where no pause is in force; the timelock, to renew
+     * one that is. No pause once the guardian is renounced (stage S3).
+     */
+    function pause() external {
+        address g = guardian();
+        if (g == address(0)) revert NoPause();
+        uint64 until = pausedUntil;
+        bool inForce = block.timestamp < uint256(until);
+        if (msg.sender == g) {
+            if (inForce) revert PauseInForce(until);
+        } else if (msg.sender != governance || !inForce) {
+            revert NotGuardian(msg.sender);
+        }
+        until = uint64(block.timestamp + uint256(_settings.pauseMaxEpochs) * EPOCH);
+        pausedUntil = until;
+        emit Paused(msg.sender, until);
+    }
+}

@@ -1,0 +1,145 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * The epoch clock every Ark Staking contract shares.
+ *
+ * The one rule this library exists to enforce: **every contract in this product
+ * derives its epoch from the same expression**, so a delivery, a coupon, a
+ * release bound and a concentration window cannot disagree about which epoch
+ * they are in. A per-contract epoch parameter would let a deployment set two of
+ * them differently, and the failure would be silent — value credited to an
+ * epoch nothing else believes exists.
+ *
+ * A CONSTANT, WHERE THE WHITEPAPER MAKES IT GOVERNABLE
+ * ----------------------------------------------------
+ * Whitepaper §6.3 carries an epoch of seven days, governable, bounded only by
+ * the coupon cliff. It is a `constant` here, and that is a deliberate
+ * departure. An epoch number is the key a delivery, a coupon draw, a spent
+ * proof and an accepted root are all recorded under, so a vote that changed
+ * the length would not adjust a rate: it would repoint every one of those
+ * records at a different bucket, on two chains at once. The whitepaper's bound
+ * cannot rescue that, because it constrains the new value and says nothing
+ * about the records already written under the old one.
+ *
+ * `COUPON_CLIFF` is carried here rather than in `ArkCatBond` so the bound is
+ * checkable against the value it constrains from one place. Both are
+ * `constant`, so `EPOCH_LENGTH <= COUPON_CLIFF` holds by inspection; the suite
+ * asserts it anyway, because the two would otherwise be free to drift apart in
+ * separate commits.
+ *
+ * Epochs are numbered from the Unix epoch rather than from a genesis timestamp,
+ * so two contracts deployed at different moments still agree without being
+ * configured to.
+ */
+library ArkEpoch {
+    /// The value of whitepaper §6.3.
+    uint64 internal constant EPOCH_LENGTH = 7 days;
+
+    /**
+     * The interval from issuance in which a bond accrues but does not pay.
+     *
+     * A constant of whitepaper §6.4, and the upper bound §6.3 places on the
+     * epoch length: below one epoch cycle the cliff does not bind at all, so an
+     * epoch longer than the cliff would let a subscription made immediately
+     * before a determination collect a coupon and exit — which is the single
+     * thing the cliff exists to prevent.
+     */
+    uint64 internal constant COUPON_CLIFF = 30 days;
+
+    /**
+     * From a release instruction to the earliest settlement. Whitepaper §6.4.
+     *
+     * Here rather than in the registry because two contracts check relations
+     * against it — the registry's transit record and the exit parity and
+     * run-off drain of `ArkStakeParams` — and a second declaration would be a
+     * second value. It exceeds the dispute cycle with its appeal, twenty days,
+     * which is what stops a release from outrunning a determination already
+     * open against the position releasing.
+     */
+    uint64 internal constant UNBONDING_PERIOD = 21 days;
+
+    /**
+     * The four windows of the premium swap (whitepaper §4.7, §6.3), from the
+     * epoch after the one whose premium is offered. `ecdsa-stakings/shared/
+     * contracts/ArkEpochLib.sol` carries the two the escrow reads.
+     *
+     *   quote window        solvers quote lots, closing with epoch t + 1
+     *   admission window    the root carrying the selected locks is admitted
+     *   origin claim window the escrow pays a lot against its preimage
+     *   QRL claim margin    the preimage published there is presented here
+     *
+     * Constants, where whitepaper §6.3 makes them governable within ranges, for
+     * the reason `EPOCH_LENGTH` is (CLAUDE.md §7.10): each is a boundary a
+     * lot's expiry, a credit and a coupon draw are recorded against, so a vote
+     * would repoint records rather than adjust a rate. The values are the
+     * specification's and satisfy both of its relations by inspection: the
+     * margin is not below the admission and claim windows together (I31), and
+     * the four together are below the epoch, so the settlement of epoch t
+     * closes before the quote window offering t + 1 opens.
+     */
+    uint64 internal constant QUOTE_WINDOW = 1 days;
+    uint64 internal constant ADMISSION_WINDOW = 1 days;
+    uint64 internal constant EVM_CLAIM_WINDOW = 1 days;
+    /// The specification's value. The testnet profile raises it to twice Hoodi's finality plus a relayer interval (D12): `scripts/lib/profile.js`.
+    uint64 internal constant QRL_CLAIM_MARGIN = 2 days;
+
+    /**
+     * The root-level challenge window of the attestation contract (whitepaper
+     * §3.5, yellow paper §1.3): seven days in which any observer can re-derive
+     * and disprove what the attester quorum sealed. Anything the quorum reports
+     * — a delegation reconciliation among them — is acted on only after it.
+     */
+    uint64 internal constant CHALLENGE_WINDOW = 7 days;
+
+    /**
+     * The dispute cycle with its appeal, which is the longest a maturity may be
+     * held against a claim (whitepaper §5.3, §6.4).
+     *
+     * Here rather than in the bond for `UNBONDING_PERIOD`'s reason: the comment
+     * on that constant already cites this figure, and two contracts now check a
+     * relation against it, so a second declaration would be a second value. A
+     * bare duration literal and not an expression over another constant, because
+     * `test/profile.test.js` reads it as one.
+     */
+    uint64 internal constant DISPUTE_CYCLE_APPEAL = 20 days;
+
+    /// When the quote window offering `epoch`'s premium closes: the end of `epoch + 1`.
+    function quoteCloses(uint256 epoch) internal pure returns (uint256) {
+        return (epoch + 2) * EPOCH_LENGTH;
+    }
+
+    /// When it opens.
+    function quoteOpens(uint256 epoch) internal pure returns (uint256) {
+        return quoteCloses(epoch) - QUOTE_WINDOW;
+    }
+
+    /// The last instant, exclusive, the escrow pays a lot of `epoch`'s offering.
+    function evmExpiry(uint256 epoch) internal pure returns (uint256) {
+        return quoteCloses(epoch) + ADMISSION_WINDOW + EVM_CLAIM_WINDOW;
+    }
+
+    /**
+     * The QRL expiry of the same lots, which closes the settlement window of
+     * `epoch`: its proceeds are final from here and its coupon is paid, early
+     * in `epoch + 2` (whitepaper §4.7).
+     */
+    function settlementCloses(uint256 epoch) internal pure returns (uint256) {
+        return evmExpiry(epoch) + QRL_CLAIM_MARGIN;
+    }
+
+    /// The epoch a timestamp falls in.
+    function epochOf(uint256 timestamp) internal pure returns (uint256) {
+        return timestamp / EPOCH_LENGTH;
+    }
+
+    /// The epoch in progress.
+    function current() internal view returns (uint256) {
+        return block.timestamp / EPOCH_LENGTH;
+    }
+
+    /// The first instant of an epoch, for a bound that must be checked against it.
+    function startOf(uint256 epoch) internal pure returns (uint256) {
+        return epoch * EPOCH_LENGTH;
+    }
+}

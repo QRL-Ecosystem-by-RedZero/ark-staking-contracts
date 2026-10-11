@@ -1,0 +1,218 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./IArkTiers.hyp";
+
+/**
+ * Optimistic settlement with a stake-drawn jury of last resort.
+ *
+ * WHAT THE COURT IS FOR
+ * ---------------------
+ * Not for processing volume. The overwhelming majority of claims are never
+ * disputed: they are asserted, nobody challenges within the tier's window, and
+ * they settle automatically at almost no cost. The court exists to make LYING
+ * EXPENSIVE, which is what keeps that cheap path honest.
+ *
+ * JURORS ARE DRAWN FROM THE TIER'S OWN STAKE (invariant #2)
+ * ---------------------------------------------------------
+ * A Citadel dispute is judged by accounts staked in the Citadel pool, because
+ * they are the accounts slashed if the verdict is wrong. Drawing from a global
+ * pool would let people with no exposure decide, and their cheapest vote would
+ * always be whichever one protects the pool they actually sit in.
+ *
+ * COMMIT-REVEAL, NOT SIGNATURES
+ * -----------------------------
+ * Votes are committed as `keccak256(abi.encode(vote, salt, juror))` and revealed
+ * later. This needs no signature recovery, so it works on Hyperion, and it
+ * reuses the exact primitive already proven in AttestationVerifier. The juror
+ * address is inside the preimage so that two jurors casting the same vote with
+ * the same salt still produce different commitments; without it, a bystander
+ * could infer someone's vote by comparing hashes.
+ *
+ * Failing to reveal is penalised. Otherwise jurors would commit garbage and
+ * stay silent to dodge all risk, and the court would never reach quorum.
+ *
+ * COHERENCE INCENTIVE
+ * -------------------
+ * Majority jurors take a fee plus a share of the loser's bond; minority jurors
+ * are slashed. This is a Schelling point: not knowing how others will vote, and
+ * punished for deviating, the best strategy is to vote for the MOST OBVIOUS
+ * TRUTH, because that is the only thing strangers reliably converge on.
+ *
+ * APPEALS ESCALATE GEOMETRICALLY
+ * ------------------------------
+ * Each round doubles both the jury size and the bond. An attacker must fund
+ * every round without knowing how many there will be, while the defender need
+ * only win the last one. This is what defeats a P+epsilon bribe.
+ */
+interface IDisputeCourt {
+    /// What is being contested.
+    enum CaseKind {
+        Claim,
+        VoidProposal,
+        EpochRoot,
+        WalletLink,
+        Appraisal,
+        QDayDeclaration
+    }
+
+    /// Lifecycle of a case.
+    enum CaseState {
+        None,
+        Challenged,
+        JuryDrawn,
+        Committing,
+        Revealing,
+        Decided,
+        Appealed,
+        Executed
+    }
+
+    /// Which way a juror voted.
+    enum Verdict {
+        None,
+        UpholdAssertion,
+        RejectAssertion
+    }
+
+    struct Case {
+        bytes32 subject;
+        CaseKind kind;
+        CaseState state;
+        IArkTiers.InsuranceTier tier;
+        address asserter;
+        address challenger;
+        uint256 bond;
+        uint8 round;
+        uint16 jurySize;
+        uint64 commitDeadline;
+        uint64 revealDeadline;
+        Verdict outcome;
+    }
+
+    event CaseOpened(bytes32 indexed caseId, CaseKind indexed kind, bytes32 indexed subject, address challenger, uint256 bond);
+    event JuryDrawn(bytes32 indexed caseId, uint8 round, uint16 jurySize, bytes32 drawSeed);
+    event VoteCommitted(bytes32 indexed caseId, address indexed juror, bytes32 commitment);
+    event VoteRevealed(bytes32 indexed caseId, address indexed juror, Verdict vote);
+    event CaseDecided(bytes32 indexed caseId, Verdict outcome, uint16 majority, uint16 minority);
+    event Appealed(bytes32 indexed caseId, uint8 newRound, uint256 newBond);
+    event CaseExecuted(bytes32 indexed caseId, Verdict outcome);
+    event JurorPenalized(bytes32 indexed caseId, address indexed juror, uint256 slashed, bool failedToReveal);
+    event EscalatedToGovernance(bytes32 indexed caseId, string reason);
+
+    /// The bond attached does not match what this case requires.
+    error IncorrectBond(uint256 required, uint256 supplied);
+
+    /// The challenge window for this subject has already closed.
+    error ChallengeWindowClosed(bytes32 subject, uint64 closedAt);
+
+    /// The case is not in a state that allows this action.
+    error InvalidCaseState(bytes32 caseId, uint8 state);
+
+    /// The caller was not drawn as a juror for this case.
+    error NotADrawnJuror(bytes32 caseId, address caller);
+
+    /// The revealed vote does not hash to the commitment on record.
+    error RevealMismatch(bytes32 caseId, address juror);
+
+    /// The commit or reveal deadline has passed.
+    error PhaseDeadlinePassed(bytes32 caseId, uint64 deadline, uint64 currentTime);
+
+    /// The appeal window has closed; the verdict is final.
+    error AppealWindowClosed(bytes32 caseId);
+
+    /// The maximum number of appeal rounds has been reached.
+    error MaxRoundsReached(uint8 round, uint8 maximum);
+
+    /// Too few eligible jurors are staked in this tier to seat a jury.
+    error InsufficientJurors(uint8 tier, uint16 available, uint16 required);
+
+    /// Maximum appeal rounds before only governance escalation remains.
+    function MAX_ROUNDS() external view returns (uint8);
+
+    /**
+     * Opens a case against an assertion inside its challenge window.
+     *
+     * @param kind What is being contested.
+     * @param subject Identifier of the contested object: a policy, an epoch
+     *        root, a link, or a Q-Day declaration.
+     * @param tier The tier whose stake pool will supply the jury.
+     * @return caseId Handle for the rest of the proceeding.
+     */
+    function challenge(CaseKind kind, bytes32 subject, IArkTiers.InsuranceTier tier)
+        external
+        payable
+        returns (bytes32 caseId);
+
+    /**
+     * Seats a jury for the current round.
+     *
+     * @dev Randomness is `block.prevrandao` mixed with a seed committed BEFORE
+     *      the case opened. Mixing with a pre-committed seed stops the party who
+     *      chooses when to open a case from shopping for a favourable
+     *      `prevrandao`. Draw weight comes from IStakingVault and is capped per
+     *      address so no single whale can take a jury majority.
+     * @param caseId The case being staffed.
+     */
+    function drawJury(bytes32 caseId) external;
+
+    /**
+     * Commits a juror's sealed vote.
+     *
+     * @param caseId The case being judged.
+     * @param commitment keccak256(abi.encode(vote, salt, msg.sender)).
+     */
+    function commitVote(bytes32 caseId, bytes32 commitment) external;
+
+    /**
+     * Reveals a previously committed vote.
+     *
+     * @param caseId The case being judged.
+     * @param vote The verdict originally committed.
+     * @param salt The blinding value used in the commitment.
+     */
+    function revealVote(bytes32 caseId, Verdict vote, bytes32 salt) external;
+
+    /// @notice Tallies revealed votes, pays the majority, and slashes the minority and non-revealers.
+    function tally(bytes32 caseId) external;
+
+    /**
+     * Appeals a verdict, doubling jury size and bond.
+     *
+     * @param caseId The case being appealed.
+     * @return newRound The round number now in progress.
+     */
+    function appeal(bytes32 caseId) external payable returns (uint8 newRound);
+
+    /**
+     * Applies a final verdict to the world.
+     *
+     * @dev This is the only path by which money leaves ICapitalPool as the
+     *      result of a contested claim, and the only path that calls
+     *      IStakingVault.slash. Keeping both behind one function means there is
+     *      no shortcut from any governance role straight to funds.
+     * @param caseId The decided case.
+     */
+    function execute(bytes32 caseId) external;
+
+    /**
+     * Escalates to a full governance vote.
+     *
+     * @dev Reserved for the suspicion that the court itself has been captured.
+     *      Deliberately slow and expensive so it is never used as a substitute
+     *      for an ordinary appeal.
+     * @param caseId The case being escalated.
+     * @param reason Human-readable justification, recorded in the event log.
+     */
+    function escalateToGovernance(bytes32 caseId, string calldata reason) external;
+
+    /// @param caseId The case being queried.
+    /// @return The stored case record.
+    function caseOf(bytes32 caseId) external view returns (Case memory);
+
+    /// @return Whether `juror` was drawn for `caseId` in its current round.
+    function isDrawnJuror(bytes32 caseId, address juror) external view returns (bool);
+
+    /// @notice Convenience helper mirroring the on-chain commitment encoding.
+    function voteCommitment(Verdict vote, bytes32 salt, address juror) external pure returns (bytes32);
+}

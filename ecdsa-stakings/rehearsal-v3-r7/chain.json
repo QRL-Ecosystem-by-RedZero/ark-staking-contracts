@@ -1,0 +1,77 @@
+{
+  "name": "rehearsal-v3-r7",
+  "chainId": 31337,
+  "profile": "rapid",
+  "evmVersion": "shanghai",
+  "qrlOwnerLength": 64,
+  "rootSigners": {
+    "threshold": 2,
+    "signers": 3
+  },
+  "court": "real",
+  "qday": "MockQDayOracle",
+  "finality": "confirmations",
+  "confirmations": 1,
+  "deliveryMarginSeconds": 10,
+  "deployedFromBlock": 1858,
+  "assets": [
+    {
+      "symbol": "mREB",
+      "mock": "MockRebasingAsset",
+      "address": "0xd0F350b13465B5251bb03E4bbf9Fa1DbC4a378F3",
+      "rebasing": true,
+      "correlationGroup": "group:lido-like",
+      "exitBoundBps": 2500,
+      "escrow": "0x45a4ad99d85173469525ad61842eD6Dc75926Bb0"
+    },
+    {
+      "symbol": "mUNIT",
+      "mock": "MockAsset",
+      "address": "0xa27bC320252d51EEAA24BCCF6cc003979E485860",
+      "rebasing": false,
+      "correlationGroup": "group:mock-units",
+      "exitBoundBps": 2500,
+      "escrow": "0xacC09486C9e34aa1Dff13b2E64d5482A3648D018"
+    }
+  ],
+  "addresses": {
+    "relay": "0xF8f7754dACc9F8f4293C21476d920DE9Ba11F22e",
+    "operationsDestination": "0x00000000000000000000000000000000000E2e01"
+  },
+  "bondPrincipal": "15000000000000000000000",
+  "note": "rehearsal lane r7 (scripts/rehearsal-lanes.js): leg-b-exit",
+  "shared": false,
+  "authority": {
+    "threshold": 2,
+    "signers": 3,
+    "treeHeight": 11,
+    "generations": [
+      [
+        "0x5e8363d30a8fae0b61eca504958218b34c9a874e9a1e2a029c3bfcca0266931f",
+        "0x811bdf6e8dd2fafb4239c47e9470d49a71573351371e70d23982bfee7dd315f4",
+        "0x7d56305dbea6492f83b0fda3c9cf14625d5bc4afa4470693dddce1d6cccb8569"
+      ],
+      [
+        "0x6ba36e60d20f1e22fb1d38af9d59ec19efa4ea0715fb3c5c82db63b6bd9be7af",
+        "0x1051eb32ca1248db463a6be152aa6a5945d166c85c8857b692dc3c82f57fcd09",
+        "0x34cb42490a3a334a235d55fc4e3b010174c100b044f415673becddbc1b3e91f0"
+      ],
+      [
+        "0xc954a5dd02a00f3ff61e0c4798a27990155700609fc1008704b01d99f5fe1a7f",
+        "0xf7faea86b42408c2bcebe35842c50e2f6480cf529cb32edb13110f674c720492",
+        "0x42c4f992e66fd4018d42b51cc105b2eafc06db783b283480de86093a141450cd"
+      ],
+      [
+        "0xfc06eaf224789594f022fab68abd1f6db851626c63494203fd806aa3320cde79",
+        "0x2cec7d7e13ce76e543db5f85e21e7a621cc30ab362db741b3e05e9bd0aca29e9",
+        "0xfdefed3f6cc733ba9c6ef730574dee70eee42d9aa6cac8147062643f66553d74"
+      ]
+    ],
+    "commits": [
+      "0xe607cb84d13b1141840db32481684defc549b08dcae4eac5d2acb46ab88ba293",
+      "0xd2688a4e392bc6198851ea8ae7b92eb082be36ab7505be42594bb742c7d368ae",
+      "0x0b7ce6a717e5c8ff2b40e14d7cc467bff6c9f40f10d433acd2fbf3dd55c71190",
+      "0x290decd9548b62a8d60345a988386fc84ba6bc95484008f6362f93160ef3e563"
+    ]
+  }
+}

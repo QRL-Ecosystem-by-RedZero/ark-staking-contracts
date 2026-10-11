@@ -1,0 +1,1111 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./PremiumSwapJudge.hyp";
+import "./lib/EvmWords.hyp";
+import "./utils/ArkEpoch.hyp";
+
+/// The registry's premium share in force, which the juror fraction of an offering is proportioned against.
+interface IArkStakePremium {
+    function premiumShareBps() external view returns (uint256);
+}
+
+/// The court's juror fee pool (whitepaper §6.2; `ArkStakeCourt.fundFeePool`).
+interface IArkCourtFeePool {
+    function fundFeePool() external payable;
+}
+
+/**
+ * The premium swap, the QRL side. Whitepaper §4.7, yellow paper §1.4 and §3.5.
+ *
+ * The one rule this contract exists to enforce: **QRL locked for a lot of the
+ * premium reaches the delivered-proceeds account of the epoch the lot was
+ * offered for, against the preimage its solver revealed to take the lot on the
+ * origin chain, and reaches no other account but the solver's refund — and a
+ * solver that takes a selected lot and never shows the preimage here pays its
+ * commitment bond to that same account.**
+ *
+ * THE TIMETABLE OF ONE OFFERING, FOR EPOCH t
+ * -----------------------------------------
+ *   during t         the escrow offers its pot (`offerPremium`), carried here
+ *                    by the forward path (`recordOffer`)
+ *   last day of t+1  the quote window: solvers lock QRL and a bond (`quote`)
+ *   start of t+2     selection (`select`), by price, down to the reserve
+ *   + 2 days         evmExpiry: the escrow stops paying lots
+ *   + 4 days         qrlExpiry: claims here stop, unclaimed bonds are
+ *                    forfeited, the coupon of t is paid
+ *
+ * `ArkEpoch` holds the four windows. The QRL leg outlasts the origin-chain leg
+ * by the claim margin, which is not below the admission and claim windows
+ * together (I31), so a solver that took its lot there has revealed a preimage
+ * anyone can present here while the lock still pays.
+ *
+ * THE COMMITMENT BOND (whitepaper §4.7, yellow paper §3.5, I33)
+ * --------------------------------------------------------------
+ * A quote posts `lotValue` for the lot and, beside it, `bond = lotValue *
+ * b(d_t) / BPS`, where `b` falls from `solverBondCeilingBps` at the first
+ * offering (whose discount is the per-epoch bound m_epoch) to
+ * `solverBondFloorBps` at the reserve floor (`ArkStakeMath.solverBondBps`, the
+ * ladder anchored at m_epoch — 750, 630, 510, 390, 270, 150 at the reference
+ * values). The protocol computes it from the admitted discount; the solver
+ * only sends it, and a quote that sends anything else is refused
+ * (`BondMismatch`). The bond of an unselected lot returns with the lot. The
+ * bond of a selected lot is returned only if the preimage is presented here
+ * before `qrlExpiry` (`claim`, then `refund`); otherwise it is forfeited to
+ * the delivered proceeds of the offered epoch (`releaseForfeits`, which the
+ * coupon account pulls through the ledger before it reads that epoch). The
+ * free option this contract used to grant is gone: a selected lot left
+ * unclaimed got its whole lock back, so walking the reserve to its floor cost
+ * nothing but time.
+ *
+ * Nothing is pushed to a solver inside `claim`: a solver whose receiving
+ * code burned the gas of the claim could make the proceeds of a lot it had
+ * already taken on the origin chain unclaimable here, then take the lock
+ * back at expiry. The bond of a claimed lot is paid by `refund`, to the
+ * solver, at a call of anyone's choosing.
+ *
+ * THE RESERVE, IN SHARES
+ * ----------------------
+ * A lot is a number of the escrow's shares; the reserve is the epoch-average
+ * price per unit less the admitted discount (`ArkStakeMath.admittedDiscountBps`),
+ * converted at the rate the escrow's own offer recorded, `units / offered`.
+ * A lot below it is refused at the quote and passed over at the selection.
+ * Every comparison is cross-multiplied, and `quote`'s minimum rounds up,
+ * toward the bond. The ladder, the clearing floor, the retention period and
+ * the bond's two ends are those in force when the offering was recorded,
+ * snapshotted into it (G8).
+ *
+ * WHAT AN OFFERING MAY SELL
+ * -------------------------
+ * The escrow's snapshot is taken once the lots of every earlier offering have
+ * passed their origin-chain expiry, but before the previous offering has been
+ * selected; so the previous offering's selected lots are subtracted from it,
+ * and whatever of them lapses comes back in the next snapshot. Retained
+ * quantity is subtracted too. The escrow's `PremiumExceedsPot` is the last
+ * guard.
+ *
+ * RETIREMENT AND THE SHORTFALL CARRY (whitepaper §4.7, I34)
+ * --------------------------------------------------------
+ * The `unsoldEpochs`-th failure retires what the offering left unclaimed: it
+ * is retained, in the escrow's pot, as buffer, and offered no more. The
+ * retirement records a carry, the retired units valued at the reference
+ * price less the reserve floor (`ArkStakeMath.shortfallCarryQrl`), per asset
+ * here and in total in the ledger, where the bond reads it and suspends
+ * issuance while it stands. The retained units are held constant: at each
+ * later offering, while a carry stands, the shares they no longer need —
+ * their rebase yield, `retainedShares - ceil(retainedUnits * offered /
+ * units)` — are released into the quantity offered, and the QRL those
+ * shares fetch when claimed reduces the carry. Monotone, no interest, repaid
+ * only on the delivered-proceeds path. A carry share that fails to sell again
+ * returns to the retained stock.
+ *
+ * DEPARTURES, RECORDED
+ * --------------------
+ *  - `quote` names the chain and the asset as well as the epoch: one swap
+ *    serves every admitted escrow.
+ *  - The failure count of the reserve ladder is kept per asset, not per
+ *    quantity (yellow paper §3.5 makes it a property of the quantity): an
+ *    offering that sold below the clearing floor of what it could sell
+ *    steps it, one that did not resets it, and after `unsoldEpochs` failures
+ *    what that last offering left unclaimed is retained and offered no more.
+ *  - The juror-fee fraction is sold with the premium and its QRL credited to
+ *    the court's fee pool (whitepaper §6.2; phase C3b) in proportion to the
+ *    quantity it contributed — the escrow's offer does not separate the two,
+ *    so the proportion is the allocation's of the offered epoch t,
+ *    `jurorBps = offered_ops / (premium_t + offered_ops)` of every lot but the
+ *    carry shares, whose QRL repays the coupon's shortfall. `premium_t` is the
+ *    premium share noted in epoch t (`noteShare`, and every swap call made in
+ *    t, a record of t - 1's offer among them); an epoch nobody noted falls
+ *    back to the share in force at the record (audit 2026-09-29, QL-15). A lot
+ *    whose whole value is the juror fraction — a premium share of zero —
+ *    delivers nothing to the ledger, and the ledger is not called with zero.
+ *    With no fee pool named (`FEE_POOL` zero, the stand-in court) the
+ *    fraction goes to the ledger with the premium, as it did before the court
+ *    existed (R41 (4)).
+ *  - A full book (`MAX_LOTS`) takes a strictly better quote by evicting its
+ *    worst lot, whose QRL and bond are refundable at once; one solver holds
+ *    at most `MAX_LOTS_PER_SOLVER` lots of an offering; and the reserve the
+ *    selection compares with is the one the offering's first quote read, as
+ *    its window opened, never read again by a later quote or at `select`
+ *    (audit 2026-09-29, QL-17; fixed at the first quote since SWAPGOV-02 of
+ *    2026-09-30). Thirty-two lots at the reserve were a blockade a price rise
+ *    of one per cent voided for free.
+ *  - An offering is judged on what it SOLD, not on what was claimed of it
+ *    (audit 2026-10-03, OC-SWAP-06): a selected lot left unclaimed already
+ *    pays its commitment bond, and judging it a failure as well let a solver
+ *    that won a whole offering and walked away step the next one's reserve
+ *    down to buy it cheaper. What the failed offering left unclaimed is
+ *    still what retires.
+ *  - A declaration that closes the escrow between `select` and a lot's
+ *    origin-chain claim makes the lot unpayable there (`SettlementClosed`),
+ *    and its bond is forfeited like any other unclaimed lot's: this leg
+ *    cannot see the closure, and a solver quoting an escrow takes that risk
+ *    for the two days of the claim window (OC-SWAP-08).
+ *  - The carry is valued at the epoch-average price of the retired epoch,
+ *    P_e from the oracle, the swap's own series (whitepaper §5.5, yellow
+ *    paper §4.6; before item 123, P of the epoch last closed when it
+ *    retired).
+ *
+ * SUSPENDED PRICING (yellow paper §4.6; OC-ORC-04, staking CLAUDE.md item 123)
+ * -------------------------------------------------------------------------
+ * A quote made under the breaker or a silent series, while no quote has
+ * fixed the offering's reserve, is refused without a revert: the refusal is
+ * recorded and the QRL sent returned (`quote`). An offering whose window
+ * refused a quote and that selected no lot is carried whole, its failure
+ * count neither stepped nor reset (`PremiumSwapJudge`); a reserve fixed
+ * before the suspension runs to its close; a retirement whose price cannot be
+ * read waits for the next priced epoch's.
+ *
+ * THE JUDGEMENT MODULE (staking CLAUDE.md item 123)
+ * -------------------------------------------------
+ * The judgement of an offering, the retirement and the release of the
+ * retained stock's yield run in `PremiumSwapJudge`, in this contract's
+ * storage, by a delegatecall from `_judgePrevious`; the constructor creates
+ * it. The storage of both is `PremiumSwapStore`'s, declared once, in the
+ * order this contract declared it before the split. No external function,
+ * selector or event moved: the module emits under this contract's address.
+ *
+ * No owner, no setter: every dependency is a constructor immutable.
+ */
+contract PremiumSwap is IPremiumSwap, PremiumSwapStore {
+    /// keccak256("ARK_STAKE_V1"), as `ArkStakeIds.STAKE_DOMAIN`.
+    bytes32 internal constant STAKE_DOMAIN = 0x7b78fb66e5c4c423ff7a9a14a2788b272f00bb59ce43a9623718bad3f1cfa45d;
+
+    /// keccak256("ARK_STAKE_OFFER_V1"), as `ArkStakeIds.OFFER_DOMAIN`.
+    bytes32 internal constant OFFER_DOMAIN = 0xf31bdf39f2b36a1d845fa0ebddd9ede2a75e86163753426f768bda2e43a49745;
+
+    /**
+     * keccak256("ARK_STAKE_PREMIUM_V3"), as `ArkStakeIds.PREMIUM_DOMAIN`. V3
+     * since the leaf binds the offered epoch and the commitment bond (yellow
+     * paper §3.5), so a V2 leaf can never verify against a V3 escrow.
+     */
+    bytes32 internal constant PREMIUM_DOMAIN = 0x62aa012827ba11814bd6dd90fc72ca32919303403d8827a8d5788a3b0f1cd888;
+
+    /**
+     * Lots one offering may carry. Selection sorts them in memory, so the
+     * bound is on the gas of `select`, which anyone must be able to pay.
+     *
+     * A count alone was a door anyone could shut: thirty-two quotes of one
+     * share each, at about a wei apiece, filled it, a real solver met
+     * `TooManyLots`, the offering cleared below its floor, and six such epochs
+     * retired the premium as buffer (audit 2026-09-27, D4). So a lot is also
+     * at least `ceil(available / MAX_LOTS)` shares unless it takes the whole
+     * available quantity: thirty-two lots then have to bid for the whole
+     * offering at the reserve, which is a sale and not a blockade (whitepaper
+     * §4.7, yellow paper §3.5). The commitment bond prices the lots that are
+     * selected and never claimed.
+     */
+    uint256 public constant MAX_LOTS = 32;
+
+    /// Lots one solver (`msg.sender`) may hold in one offering: a quarter of the book (QL-17; a reference value).
+    uint256 internal constant MAX_LOTS_PER_SOLVER = 8;
+
+    /**
+     * The most epochs a quantity below the batching threshold is carried
+     * before it is offered whatever its size (whitepaper §4.7, §6.4; PV-05):
+     * the model's `OFFERING_CARRY_MAX_EPOCHS`, a constant.
+     */
+    uint256 public constant OFFERING_CARRY_MAX_EPOCHS = 4;
+
+    /**
+     * Base units of one whole unit of the origin asset the batching threshold
+     * is taken at: 10^18. The model takes 10^decimals as recorded at the
+     * asset's admission (PV-13); the registry's admission record carries no
+     * decimals (a field there would change `admitAsset`'s selector, which
+     * contracts/core's timelock table keys on), and every form admitted to
+     * date is an eighteen-decimal token. Reported (2026-09-30).
+     */
+    uint256 internal constant OFFERING_UNIT_SCALE = 1e18;
+
+    /*
+     * The dependencies (`REGISTRY`, `PARAMS`, `LEDGER`, `ATTESTATION`,
+     * `FEE_POOL`) and the storage are `PremiumSwapStore`'s, declared once for
+     * this contract and the judgement module, in the order they had here.
+     */
+
+    /**
+     * Where the judgement and the retirement run (`PremiumSwapJudge`, in this
+     * contract's storage by delegatecall; see `_judgePrevious`), created here
+     * with this contract's own five dependencies (staking CLAUDE.md item 123).
+     * Not exposed, so the ABI is the one before the split: it is this
+     * contract's first creation, at CREATE nonce 1.
+     */
+    address private immutable JUDGE_MODULE;
+
+    constructor(address registry_, address params_, address ledger_, address attestation_, address feePool_)
+        PremiumSwapStore(registry_, params_, ledger_, attestation_, feePool_)
+    {
+        JUDGE_MODULE = address(new PremiumSwapJudge(registry_, params_, ledger_, attestation_, feePool_));
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Identifiers — byte for byte ArkStakeIds.sol and identifiers.js.     */
+    /* Laid out in 32-byte words through EvmWords, never through this      */
+    /* compiler's abi.encode: since QIP-55 the native slot is 64 bytes and */
+    /* a natively encoded leaf stops matching the origin-chain escrow.     */
+    /* ------------------------------------------------------------------ */
+
+    function assetKey(uint256 chainId, address asset) public pure returns (bytes32) {
+        return keccak256(abi.encodePacked(EvmWords.word(chainId), EvmWords.evmWord(asset)));
+    }
+
+    /**
+     * The escrow's offer, `ArkStakeIds.premiumOfferLeaf`: bound to the escrow
+     * that holds the pot (D10), which the offering records and every lock of
+     * it binds.
+     */
+    function premiumOfferLeaf(
+        uint256 chainId,
+        address escrow,
+        address asset,
+        uint256 epoch,
+        uint256 shares,
+        uint256 units
+    ) public pure returns (bytes32) {
+        return keccak256(
+            abi.encodePacked(
+                STAKE_DOMAIN,
+                OFFER_DOMAIN,
+                EvmWords.word(chainId),
+                EvmWords.evmWord(escrow),
+                EvmWords.evmWord(asset),
+                EvmWords.word(epoch),
+                EvmWords.word(shares),
+                EvmWords.word(units)
+            )
+        );
+    }
+
+    /**
+     * The premium lock of yellow paper §3.5: the escrow that pays it (D10),
+     * the asset, the offered epoch, the lot, the hashlock, the solver's
+     * recipient, the shares, the commitment bond and `evmExpiry`, after the
+     * chain. Two packed halves hashed as one preimage, so the legacy code
+     * generator's stack holds the words.
+     */
+    function premiumLockLeaf(uint256 chainId, address escrow, address asset, LockTerms memory t)
+        public
+        pure
+        returns (bytes32)
+    {
+        return keccak256(
+            bytes.concat(
+                abi.encodePacked(
+                    STAKE_DOMAIN,
+                    PREMIUM_DOMAIN,
+                    EvmWords.word(chainId),
+                    EvmWords.evmWord(escrow),
+                    EvmWords.evmWord(asset),
+                    EvmWords.word(t.epoch),
+                    t.lotId
+                ),
+                abi.encodePacked(
+                    t.hashlock,
+                    EvmWords.evmWord(t.recipient),
+                    EvmWords.word(t.shares),
+                    EvmWords.word(t.bond),
+                    EvmWords.word(uint256(t.evmExpiry))
+                )
+            )
+        );
+    }
+
+    /**
+     * The lot identifier of the QuantaSwap contracts: yellow paper §1.4
+     * `quote`. The solver is this chain's account — the quote's `msg.sender` —
+     * so it enters as the two words of `EvmWords.ownerWords`, like the bound
+     * owner of `stakeAssetId`; the recipient stays one word, an origin-chain
+     * address. `value` is the lot's QRL, never its bond.
+     */
+    function lotIdOf(
+        bytes32 hashlock,
+        address solver,
+        address recipient,
+        uint256 shares,
+        uint256 value,
+        uint64 qrlExpiry
+    ) public pure returns (bytes32) {
+        (bytes32 solverHi, bytes32 solverLo) = EvmWords.ownerWords(solver);
+        return sha256(
+            abi.encodePacked(
+                hashlock,
+                solverHi,
+                solverLo,
+                EvmWords.evmWord(recipient),
+                EvmWords.word(shares),
+                EvmWords.word(value),
+                EvmWords.word(uint256(qrlExpiry))
+            )
+        );
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The offer                                                           */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Record an escrow's offer for `epoch`, proven against the attested
+     * forward root of that epoch. Any sender; the proof is the authority.
+     *
+     * The parameters that will price and judge this quantity are read here,
+     * when it is fixed (G8), and so is the escrow the offer came from, which
+     * every lock of the offering binds (D10).
+     *
+     * BATCHING (whitepaper §4.7 as revised 2026-09-30: EC-03, PV-05, PV-13).
+     * Below `offeringBatchMultiple` times the claim cost, in base units of the
+     * asset, no offering opens: the quantity is carried, whole, into the next
+     * epoch's offer, which the escrow's pot already holds, so nothing moves,
+     * nothing fails and the reserve does not step (`OfferingCarried`). The
+     * carry is bounded: a quantity carried `OFFERING_CARRY_MAX_EPOCHS` epochs
+     * opens whatever its size, and one that has failed an offering is never
+     * batched (the model's `offeringOpens`). The juror fraction of an
+     * offering that carries several epochs is the quantity-weighted mix of
+     * theirs (`offeringJurorBps`), taken on the increments of units each
+     * carried epoch's offer showed.
+     */
+    function recordOffer(
+        uint256 chainId,
+        address escrow,
+        address asset,
+        uint256 epoch,
+        uint256 shares,
+        uint256 units,
+        bytes32[] calldata proof
+    ) external {
+        bytes32 key = assetKey(chainId, asset);
+        Offering storage o = _offerings[key][epoch];
+        if (o.recorded) revert OfferExists(key, epoch);
+        if (shares == 0 || units == 0) revert ZeroValue();
+        bytes32 leaf = premiumOfferLeaf(chainId, escrow, asset, epoch, shares, units);
+        if (!ATTESTATION.verify(epoch, leaf, proof)) revert BadOfferProof(epoch, leaf);
+        IArkStakeParams.SwapParams memory p = PARAMS.swapParams();
+
+        _noteShare();
+        (bool opens, uint256 juror) = _batch(key, epoch, units, p);
+        if (!opens) return;
+
+        o.offered = shares;
+        o.units = units;
+        o.recorded = true;
+        o.escrow = escrow;
+        o.prevPlusOne = uint64(_lastOfferPlusOne[key]);
+        _lastOfferPlusOne[key] = epoch + 1;
+        _snapshot(o, p);
+        o.jurorBps = uint16(juror);
+        emit OfferRecorded(chainId, asset, epoch, shares, units);
+    }
+
+    /**
+     * Whether `epoch`'s offer of `units` opens an offering, and the juror
+     * fraction it opens at; where it does not, the quantity is carried
+     * (`OfferingCarried`). See `recordOffer`.
+     */
+    function _batch(bytes32 key, uint256 epoch, uint256 units, IArkStakeParams.SwapParams memory p)
+        private
+        returns (bool, uint256 juror)
+    {
+        Carry storage c = _carries[key];
+        // Offers move forward: an epoch at or before one already recorded or carried is refused.
+        if (epoch < _lastOfferPlusOne[key] || (c.fromPlusOne != 0 && epoch <= uint256(c.last))) revert OfferExists(key, epoch);
+        juror = _jurorBpsAt(epoch, p);
+        // The new premium: the increment of units this epoch's offer shows
+        // over the last one recorded or carried, accumulated since the last
+        // offering (re-audit 2026-09-30, SWAPGOV-01; the model's
+        // `offeringOpens`). The pot the offer states also holds the offering
+        // before's unsold and in-flight quantity and the retained stock, so
+        // compared whole it never fell below the threshold in steady state
+        // and dust offerings opened, failed and walked the ladder.
+        //
+        // Between the offer of e - 1 and this one the escrow paid out of the
+        // pot the lots of the offering of e - 2, and no other: they are paid
+        // after its quote window closes, in epoch e, and before the escrow
+        // offers e (`offerPremium` waits for their evmExpiry); every claim of
+        // them here closes at their QRL expiry, before e's offer can be
+        // recorded. Their units are added back, at that offering's own rate,
+        // so the increment is the fresh premium and not the fresh premium
+        // less the lots paid, which carried a fresh premium far above the
+        // threshold two epochs in every four (OC-SWAP-02). Read here and not
+        // taken off at each claim: a claim recorded before e - 1's offer
+        // would have come off a pot that still held it.
+        uint256 grown = units;
+        unchecked {
+            Offering storage paid = _offerings[key][epoch - 2];
+            if (paid.offered != 0) grown += (paid.claimed * paid.units) / paid.offered;
+        }
+        grown = grown > c.units ? grown - c.units : 0;
+        uint256 acc = c.weight + grown;
+        c.units = units;
+        uint256 carried = c.fromPlusOne == 0 ? 0 : epoch + 1 - uint256(c.fromPlusOne);
+        uint256 threshold = ArkStakeMath.offeringBatchThresholdUnits(p.offeringBatchMultiple, p.claimCostGwei, OFFERING_UNIT_SCALE);
+        // A failure counted or the carry bound opens whatever the size, nothing
+        // new included: the offering before it is judged only by the next one
+        // that opens, so a carry that waited for new premium kept a failed
+        // offering unjudged and its quantity neither offered nor retired for
+        // as long as the book stopped yielding (SWAPGOV-11, still open at the
+        // audit of 2026-10-03). An offer recorded once its quote window has
+        // closed is carried, never an offering no solver could quote and that
+        // would be judged failed (SWAPGOV-10).
+        if (
+            block.timestamp >= ArkEpoch.quoteCloses(epoch)
+                || (acc < threshold && carried < OFFERING_CARRY_MAX_EPOCHS && _failedOfferings[key] == 0)
+        ) {
+            if (c.fromPlusOne == 0) c.fromPlusOne = uint64(epoch + 1);
+            c.last = uint64(epoch);
+            c.weight = acc;
+            c.jurorWeight += grown * juror;
+            emit OfferingCarried(key, epoch, units, threshold, carried);
+            return (false, 0);
+        }
+        // The quantity-weighted juror fraction of every epoch carried into
+        // this one (the model's `offeringJurorBps`); truncates, toward the
+        // coupon. One epoch alone is its own fraction, and so is an offering
+        // that opens on nothing new (the carry bound, or a failure counted).
+        if (c.fromPlusOne != 0) {
+            if (acc != 0) juror = (c.jurorWeight + grown * juror) / acc;
+            c.fromPlusOne = 0;
+            c.jurorWeight = 0;
+        }
+        c.weight = 0;
+        return (true, juror);
+    }
+
+    /**
+     * Note the premium share in force in the epoch in progress, once per
+     * epoch (QL-15): the juror fraction of this epoch's offering is
+     * proportioned against it when the offer is recorded, in a later epoch.
+     * Anyone; the figure is the registry's, not the caller's. Also run by
+     * `recordOffer`, `quote` and `select`.
+     */
+    function noteShare() external {
+        _noteShare();
+    }
+
+    function _noteShare() private {
+        uint256 epoch = ArkEpoch.current();
+        if (_shareAt[epoch] != 0) return;
+        try IArkStakePremium(address(REGISTRY)).premiumShareBps() returns (uint256 premium) {
+            _shareAt[epoch] = premium + 1;
+            emit PremiumShareNoted(epoch, premium);
+        } catch {}
+    }
+
+    /*
+     * The premium share noted in an epoch is read from its `PremiumShareNoted`
+     * event: the view `premiumShareAt` left for the swap's v3 room (re-audit
+     * 2026-09-30).
+     */
+
+    function _snapshot(Offering storage o, IArkStakeParams.SwapParams memory p) private {
+        o.maxEpochMoveBps = p.maxEpochMoveBps;
+        o.firstReserveDiscountBps = p.firstReserveDiscountBps;
+        o.reserveStepBps = p.reserveStepBps;
+        o.reserveFloorBps = p.reserveFloorBps;
+        o.tailPremiumFloorBps = p.tailPremiumFloorBps;
+        o.clearingFloorBps = p.clearingFloorBps;
+        o.unsoldEpochs = p.unsoldEpochs;
+        o.solverBondCeilingBps = p.solverBondCeilingBps;
+        o.solverBondFloorBps = p.solverBondFloorBps;
+    }
+
+    /**
+     * The juror fraction's part of `epoch`'s quantity (whitepaper §4.2, §6.2):
+     * the operations share's offered part over it and the premium share of
+     * that epoch (QL-15), the share in force now where it was not noted.
+     * Truncates, toward the coupon. A premium unreadable now (a silent
+     * oracle) leaves the quantity all premium: the offer is recorded whatever
+     * the oracle says. Zero with no fee pool named.
+     */
+    function _jurorBpsAt(uint256 epoch, IArkStakeParams.SwapParams memory p) private view returns (uint256) {
+        if (FEE_POOL == address(0)) return 0;
+        (, uint256 offered) = ArkStakeMath.operationsSplit(p.operationsBps, p.jurorFeeShareBps);
+        uint256 premium;
+        uint256 noted = _shareAt[epoch];
+        if (noted != 0) {
+            premium = noted - 1;
+        } else {
+            try IArkStakePremium(address(REGISTRY)).premiumShareBps() returns (uint256 share) {
+                premium = share;
+            } catch {
+                return 0;
+            }
+        }
+        return premium + offered == 0 ? 0 : (offered * ArkStakeMath.BPS) / (premium + offered);
+    }
+
+    /*
+     * The release of the retained stock's yield into an offering (I34) runs
+     * in `PremiumSwapJudge`, after the judgement: see `_judgePrevious`.
+     */
+
+    /* ------------------------------------------------------------------ */
+    /* The quote                                                           */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Lock `lotValue` of QRL for a lot of `shares` of `epoch`'s offering,
+     * under `hashlock`, for `recipient` on the origin chain, and the
+     * commitment bond beside it: `msg.value` is at least the two, and the
+     * excess is returned. Any sender; the sender is the solver, and only the
+     * solver is refunded.
+     *
+     * Open and firm: the lot is public from here and pays its own price, so a
+     * quote seen by another solver can be outbid and never worsened.
+     *
+     * SUSPENDED PRICING (yellow paper §4.6): "Where the series is silent
+     * (section 6.1) or the circuit breaker is active when a quote is made,
+     * the quote is refused and the refusal recorded." A quote made while no
+     * quote has fixed the offering's reserve, under the breaker or a silent
+     * series, stores no lot, records the refusal (`QuoteRefused`), returns
+     * the zero lot id and sends `msg.value` back whole; it does not revert,
+     * since a revert records nothing. Only a real silence or breaker takes
+     * this path, so a refusal cannot be bought. The judgement of the offering
+     * reads the record (`PremiumSwapJudge`): one that refused a quote and
+     * selected no lot is carried whole, no failure counted. "An offering
+     * whose reserve was fixed before the suspension runs to its close at that
+     * reserve": the reserve is never read again once fixed.
+     */
+    function quote(
+        uint256 chainId,
+        address asset,
+        uint256 epoch,
+        uint256 shares,
+        bytes32 hashlock,
+        address recipient,
+        uint256 lotValue
+    ) external payable nonReentrant returns (bytes32 lotId) {
+        if (recipient == address(0)) revert ZeroAddress();
+        if (shares == 0 || lotValue == 0) revert ZeroValue();
+        {
+            uint256 opens = ArkEpoch.quoteOpens(epoch);
+            uint256 closes = ArkEpoch.quoteCloses(epoch);
+            if (block.timestamp < opens || block.timestamp >= closes) revert OutsideQuoteWindow(opens, closes);
+        }
+        // Once per SOLVER. Keyed by the hashlock alone, anyone who saw a
+        // solver's quote in the mempool could send the same hashlock first
+        // and make the real quote revert. The lot id and the origin-chain
+        // leaf both bind the solver, so two solvers' lots never collide.
+        if (_hashlockUsed[_hashlockKey(hashlock)]) revert HashlockUsed(hashlock);
+
+        bytes32 key = assetKey(chainId, asset);
+        uint256 due;
+        if (!_offerings[key][epoch].recorded) revert NoOffer(key, epoch);
+        if (_suspended(key, epoch)) {
+            // Refused and recorded (OC-ORC-04); `due` stays zero, so all of
+            // `msg.value` goes back below.
+            _quoteRefused[key][epoch] = true;
+            emit QuoteRefused(key, epoch, msg.sender);
+        } else {
+            _noteShare();
+            _judgePrevious(key, epoch);
+            uint256 bond = _price(key, epoch, shares, lotValue);
+            due = lotValue + bond;
+            if (msg.value < due) revert BondMismatch(due, msg.value);
+            bytes32 mine = _solverKey(key, epoch, msg.sender);
+            if (_solverLots[mine] >= MAX_LOTS_PER_SOLVER) revert SolverLotsFull(MAX_LOTS_PER_SOLVER);
+            _solverLots[mine] += 1;
+            uint256 slot = _slotFor(key, epoch, shares, lotValue);
+            lotId = _store(key, epoch, shares, hashlock, recipient, lotValue, bond, slot);
+        }
+        // What the solver sent above the bond the protocol computes goes back at
+        // once: the bond is never the solver's figure (I33), and the one a view
+        // quoted before this offering's first judgement may be the higher one.
+        if (msg.value > due) _pay(msg.sender, msg.value - due);
+    }
+
+    /**
+     * Whether pricing is suspended for `epoch`'s offering (yellow paper
+     * §4.6): no quote has fixed its reserve, and the series is silent — the
+     * registry's `epochPrice` reverts, `OracleSilent` or an oracle that does
+     * not answer — or the breaker is active. A reserve fixed before is never
+     * suspended: the offering runs to its close at it.
+     */
+    function _suspended(bytes32 key, uint256 epoch) private view returns (bool) {
+        if (_offerings[key][epoch].reserveNum != 0) return false;
+        try REGISTRY.epochPrice() returns (uint256) {
+            return REGISTRY.breakerActive();
+        } catch {
+            return true;
+        }
+    }
+
+    /// Send `amount` to `to`, or revert `TransferFailed`.
+    function _pay(address to, uint256 amount) private {
+        (bool sent, ) = to.call{value: amount}("");
+        if (!sent) revert TransferFailed(to, amount);
+    }
+
+    /**
+     * Every refusal of a lot's size, and the bond the protocol computes for it.
+     *
+     * Any price is accepted (whitepaper §4.7 as revised 2026-09-30): the
+     * reserve binds at the selection, at the reading the offering's first
+     * quote took, which every later quote and the selection keep (OC-SWAP-11).
+     * A quote refused below the reserve it read could not be placed where a
+     * later reading inside the same window would have admitted it, and a lot
+     * is never selected below the reserve fixed for the window. A reading of
+     * zero — no epoch-average price — is refused, never fixed: a reserve of
+     * zero would select every lot at any price, a one-wei lot with no bond
+     * included (OC-SWAP-07).
+     */
+    function _price(bytes32 key, uint256 epoch, uint256 shares, uint256 lotValue) private returns (uint256) {
+        uint256 avail = _available(key, epoch);
+        if (shares > avail) revert ExceedsOffer(shares, avail);
+        // Rounds up, against the dust lot; see MAX_LOTS.
+        uint256 least = (avail + MAX_LOTS - 1) / MAX_LOTS;
+        if (shares < least && shares != avail) revert LotTooSmall(least, shares);
+        (uint256 num,, uint256 discount) = _reserveRatio(key, epoch);
+        if (num == 0) revert ZeroValue();
+        // The reserve read by the offering's first quote, when its window
+        // opens and the offering before it is judged, fixed for the window and
+        // the selection (re-audit 2026-09-30, SWAPGOV-02): a later reading,
+        // written by any quote, let a one-wei quote in the last block void
+        // every lot quoted before it.
+        Offering storage o = _offerings[key][epoch];
+        if (o.reserveNum == 0) o.reserveNum = num;
+        (uint256 bond,) = _bondOf(o, discount, lotValue);
+        return bond;
+    }
+
+    /**
+     * Where a new lot goes in the offering's book: appended while it has
+     * room; in a full book, the place of its worst lot — the lowest price
+     * per share, the latest quoted among equals — where the new lot's price
+     * is strictly higher (QL-17). The lot pushed out keeps its QRL and bond,
+     * refundable at once, and leaves its solver's count. `MAX_LOTS` still
+     * bounds the selection's sort.
+     */
+    function _slotFor(bytes32 key, uint256 epoch, uint256 shares, uint256 lotValue) private returns (uint256 slot) {
+        bytes32[] storage ids = _lotIds[key][epoch];
+        uint256 n = ids.length;
+        if (n < MAX_LOTS) return n;
+        slot = 0;
+        for (uint256 i = 1; i < n; ++i) {
+            Lot storage a = _lots[ids[i]];
+            Lot storage w = _lots[ids[slot]];
+            // a at or below the worst so far, cross-multiplied: the later wins the tie.
+            if (a.value * w.shares <= w.value * a.shares) slot = i;
+        }
+        Lot storage worst = _lots[ids[slot]];
+        if (lotValue * worst.shares <= worst.value * shares) revert TooManyLots(MAX_LOTS);
+        worst.status = LotStatus.Evicted;
+        _solverLots[_solverKey(key, epoch, worst.solver)] -= 1;
+    }
+
+    /**
+     * Put `lotId` in place of the lot at `slot`: the evicted lot's place
+     * closes up and the new lot goes last, so the book stays in quote order
+     * and a tie evicts the latest quoted (re-audit 2026-09-30, SWAPGOV-06;
+     * reusing the slot made an older lot the "latest" once its neighbour
+     * was replaced).
+     */
+    function _evict(bytes32[] storage ids, uint256 slot, bytes32 lotId) private {
+        emit LotEvicted(ids[slot], lotId);
+        uint256 n = ids.length;
+        for (uint256 i = slot + 1; i < n; ++i) ids[i - 1] = ids[i];
+        ids[n - 1] = lotId;
+    }
+
+    /// The bond of a lot of `lotValue` at `discount`, and its rate, from the offering's snapshot. Truncates, toward the solver (I33).
+    function _bondOf(Offering storage o, uint256 discount, uint256 lotValue)
+        private
+        view
+        returns (uint256 bond, uint256 bps)
+    {
+        bps = ArkStakeMath.solverBondBps(
+            o.solverBondCeilingBps, o.solverBondFloorBps, o.maxEpochMoveBps, o.reserveFloorBps, discount
+        );
+        bond = ArkStakeMath.solverBondQrl(lotValue, bps);
+    }
+
+    function _store(
+        bytes32 key,
+        uint256 epoch,
+        uint256 shares,
+        bytes32 hashlock,
+        address recipient,
+        uint256 lotValue,
+        uint256 bond,
+        uint256 slot
+    ) private returns (bytes32 lotId) {
+        uint64 qrlExpiry = uint64(ArkEpoch.settlementCloses(epoch));
+        lotId = lotIdOf(hashlock, msg.sender, recipient, shares, lotValue, qrlExpiry);
+        if (_lots[lotId].status != LotStatus.None) revert LotExists(lotId);
+
+        _hashlockUsed[_hashlockKey(hashlock)] = true;
+        bytes32[] storage ids = _lotIds[key][epoch];
+        if (slot == ids.length) ids.push(lotId);
+        else _evict(ids, slot, lotId);
+        _lots[lotId] = Lot({
+            solver: msg.sender,
+            recipient: recipient,
+            status: LotStatus.Quoted,
+            epoch: uint64(epoch),
+            qrlExpiry: qrlExpiry,
+            key: key,
+            hashlock: hashlock,
+            shares: shares,
+            value: lotValue,
+            bond: bond
+        });
+        emit LotQuoted(lotId, key, epoch, hashlock, msg.sender, recipient, shares, lotValue, bond);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Selection                                                           */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Select `epoch`'s lots, once, in the admission window after its quote
+     * window closes. Any sender; the order is fixed by the lots themselves.
+     *
+     * Whole lots in descending order of price, while the price is not below
+     * the reserve and the quantity is not exhausted; a lot too large for what
+     * is left is passed over for a smaller one below it. A lot not selected is
+     * refundable at once, bond included; a selected lot's bond is at risk
+     * until its preimage is presented here.
+     */
+    function select(uint256 chainId, address asset, uint256 epoch) external nonReentrant {
+        {
+            uint256 opens = ArkEpoch.quoteCloses(epoch);
+            uint256 closes = opens + ArkEpoch.ADMISSION_WINDOW;
+            if (block.timestamp < opens || block.timestamp >= closes) revert OutsideSelectionWindow(opens, closes);
+        }
+        bytes32 key = assetKey(chainId, asset);
+        Offering storage o = _offerings[key][epoch];
+        if (!o.recorded) revert NoOffer(key, epoch);
+        if (o.selected) revert AlreadySelected(key, epoch);
+
+        _noteShare();
+        _judgePrevious(key, epoch);
+        uint256 avail = _available(key, epoch);
+        uint256 sold = _take(chainId, asset, key, epoch, avail);
+
+        o.available = avail;
+        o.sold = sold;
+        o.selected = true;
+        emit OfferingSelected(key, epoch, avail, sold, _failedOfferings[key], _retainedShares[key]);
+    }
+
+    /// Sort the lots by price and take them greedily. Returns the shares selected.
+    function _take(uint256 chainId, address asset, bytes32 key, uint256 epoch, uint256 avail)
+        private
+        returns (uint256 sold)
+    {
+        bytes32[] memory ids = _byPrice(_lotIds[key][epoch]);
+        // The reserve fixed by the offering's first quote (QL-17, SWAPGOV-02),
+        // never read again here: a price that moved after the window no
+        // longer voids the lots quoted at it, bonds refunded, for nothing.
+        Offering storage o = _offerings[key][epoch];
+        uint256 num = o.reserveNum;
+        uint256 den = o.offered * ArkStakeMath.BPS * ArkStakeMath.PRICE_SCALE;
+        uint256 left = avail;
+        uint256 atRisk;
+        for (uint256 i = 0; i < ids.length; ++i) {
+            Lot storage l = _lots[ids[i]];
+            // Below the reserve here, and so is every lot after it.
+            if (l.value * den < l.shares * num) break;
+            if (l.shares > left) continue;
+            left -= l.shares;
+            l.status = LotStatus.Selected;
+            atRisk += l.bond;
+            _announce(chainId, asset, ids[i]);
+        }
+        if (atRisk != 0) bondsAtRisk[epoch] += atRisk;
+        sold = avail - left;
+    }
+
+    /// The premium lock the relayer seals for a selected lot.
+    function _announce(uint256 chainId, address asset, bytes32 lotId) private {
+        Lot storage l = _lots[lotId];
+        address escrow = _offerings[l.key][uint256(l.epoch)].escrow;
+        LockTerms memory t = LockTerms({
+            epoch: uint256(l.epoch),
+            lotId: lotId,
+            hashlock: l.hashlock,
+            recipient: l.recipient,
+            shares: l.shares,
+            bond: l.bond,
+            evmExpiry: uint64(ArkEpoch.evmExpiry(uint256(l.epoch)))
+        });
+        emit LotSelected(
+            lotId,
+            chainId,
+            asset,
+            t.hashlock,
+            t.recipient,
+            t.shares,
+            t.evmExpiry,
+            premiumLockLeaf(chainId, escrow, asset, t),
+            t.epoch,
+            t.bond
+        );
+    }
+
+    /// Insertion sort, descending by value per share, cross-multiplied. At most MAX_LOTS.
+    function _byPrice(bytes32[] storage src) private view returns (bytes32[] memory ids) {
+        uint256 n = src.length;
+        ids = new bytes32[](n);
+        for (uint256 i = 0; i < n; ++i) {
+            bytes32 id = src[i];
+            Lot storage a = _lots[id];
+            uint256 j = i;
+            while (j > 0) {
+                Lot storage b = _lots[ids[j - 1]];
+                if (b.value * a.shares >= a.value * b.shares) break;
+                ids[j] = ids[j - 1];
+                --j;
+            }
+            ids[j] = id;
+        }
+    }
+
+    /**
+     * Judge the previous offering once its claims are final, before this one
+     * is priced, at the first quote or the selection, once: one that sold
+     * below the clearing floor of what it could sell steps the reserve down,
+     * one that did not resets the count, the `unsoldEpochs`-th failure
+     * retires what that offering left unclaimed and records its carry (I34),
+     * and one carried for suspended pricing counts nothing (yellow paper
+     * §4.6). Then the retained stock's yield is released into this one.
+     *
+     * The bodies run in `PremiumSwapJudge` (`judge`), in this contract's
+     * storage, by a delegatecall of a fixed selector (staking CLAUDE.md item
+     * 123): the rule on suspended pricing did not fit here beside them on
+     * the v3 line. A revert there is re-raised here byte for byte.
+     */
+    function _judgePrevious(bytes32 key, uint256 epoch) private {
+        Offering storage o = _offerings[key][epoch];
+        if (o.judged) return;
+        o.judged = true;
+        (bool ok, ) = JUDGE_MODULE.delegatecall(abi.encodeWithSelector(PremiumSwapJudge.judge.selector, key, epoch));
+        if (!ok) {
+            /// @hyperion memory-safe-assembly
+            assembly {
+                let p := mload(0x40)
+                returndatacopy(p, 0, returndatasize())
+                revert(p, returndatasize())
+            }
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Claim, refund and forfeit                                           */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Credit a selected lot's QRL to the delivered proceeds of its epoch,
+     * against the preimage its solver published on the origin chain. Any
+     * sender: the QRL has one destination, so the carrier chooses when and
+     * never where. The bond is no longer at risk and waits for `refund`.
+     *
+     * The first shares sold of an offering are the retained stock's yield
+     * (I34): the QRL they fetch, at this lot's price, reduces the carry.
+     */
+    function claim(bytes32 lotId, bytes32 secret) external nonReentrant {
+        Lot storage l = _lots[lotId];
+        if (l.status != LotStatus.Selected) revert NotSelected(lotId);
+        if (sha256(abi.encodePacked(secret)) != l.hashlock) revert WrongPreimage(l.hashlock);
+        if (block.timestamp >= uint256(l.qrlExpiry)) revert LotExpired(l.qrlExpiry);
+
+        l.status = LotStatus.Claimed;
+        uint256 epoch = uint256(l.epoch);
+        bondsAtRisk[epoch] -= l.bond;
+        Offering storage o = _offerings[l.key][epoch];
+        o.claimed += l.shares;
+        uint256 carried = _recover(l.key, l.shares, l.value);
+        emit LotClaimed(lotId, secret, msg.sender);
+        // The juror fraction of what is not carry to the court's fee pool
+        // (whitepaper §6.2); truncates, toward the ledger.
+        uint256 fee = FEE_POOL == address(0) ? 0 : ((l.value - carried) * uint256(o.jurorBps)) / ArkStakeMath.BPS;
+        // Nothing to deliver where the lot is all juror fraction (a premium
+        // share of zero, QL-15): the ledger refuses zero, and the claim must not.
+        if (l.value != fee) LEDGER.deliver{value: l.value - fee}(epoch);
+        if (fee != 0) {
+            emit JurorFeeRouted(lotId, epoch, fee);
+            IArkCourtFeePool(FEE_POOL).fundFeePool{value: fee}();
+        }
+    }
+
+    /**
+     * Reduce the asset's carry by the QRL its yield shares fetched in a lot of
+     * `shares` for `value`, and return that QRL (`carried`, before the carry's
+     * cap), which the juror fraction does not reach. Truncates, toward the carry.
+     */
+    function _recover(bytes32 key, uint256 shares, uint256 value) private returns (uint256 carried) {
+        uint256 pending = _carryShares[key];
+        if (pending == 0) return 0;
+        uint256 taken = pending < shares ? pending : shares;
+        _carryShares[key] = pending - taken;
+        uint256 c = _shortfallCarry[key];
+        carried = (value * taken) / shares;
+        uint256 repaid = carried > c ? c : carried;
+        if (repaid == 0) return carried;
+        _shortfallCarry[key] = c - repaid;
+        LEDGER.recoverShortfall(repaid);
+    }
+
+    /**
+     * Return QRL to a lot's solver. Any sender; the solver is the only payee.
+     *
+     *  - A lot not selected: its QRL and its bond, at once after the selection
+     *    (or after the selection window, if nobody selected).
+     *  - A selected lot unclaimed at its QRL expiry: its QRL and not its bond,
+     *    which is forfeited to the proceeds of its epoch (I33). The whole lock
+     *    used to come back here, which made abandoning a selected lot free.
+     *  - A claimed lot: its bond, once.
+     */
+    function refund(bytes32 lotId) external nonReentrant {
+        Lot storage l = _lots[lotId];
+        LotStatus s = l.status;
+        uint256 value = l.value;
+        uint256 bond = l.bond;
+        if (s == LotStatus.Quoted) {
+            uint256 epoch = uint256(l.epoch);
+            if (
+                !_offerings[l.key][epoch].selected &&
+                block.timestamp < ArkEpoch.quoteCloses(epoch) + ArkEpoch.ADMISSION_WINDOW
+            ) revert NotRefundable(lotId);
+        } else if (s == LotStatus.Selected) {
+            if (block.timestamp < uint256(l.qrlExpiry)) revert NotRefundable(lotId);
+            // The bond is forfeited (I33) and stays on the lot's record.
+            bond = 0;
+        } else if (s == LotStatus.Claimed && bond != 0) {
+            value = 0;
+        } else if (s != LotStatus.Evicted) {
+            // Pushed out of a full book by a better quote (QL-17): all of it, at once; anything else, nothing.
+            revert NotRefundable(lotId);
+        }
+        if (s != LotStatus.Claimed) l.status = LotStatus.Refunded;
+        if (bond != 0) l.bond = 0;
+        emit LotRefunded(lotId, value, bond);
+        _pay(l.solver, value + bond);
+    }
+
+    /**
+     * Send the ledger the bonds of `epoch`'s lots selected and not claimed
+     * before their QRL expiry (I33). Any sender, from that expiry; the ledger
+     * credits them to `epoch` and to no other, and `ArkBondCoupon.distribute`
+     * pulls them through the ledger before it reads the epoch. A claim after
+     * the expiry is refused, so what is at risk then is exactly what was
+     * forfeited.
+     */
+    function releaseForfeits(uint256 epoch) external nonReentrant {
+        uint256 due = ArkEpoch.settlementCloses(epoch);
+        if (block.timestamp < due) revert ForfeitsNotDue(epoch, due);
+        uint256 amount = bondsAtRisk[epoch];
+        if (amount == 0) return;
+        bondsAtRisk[epoch] = 0;
+        emit BondsForfeited(epoch, amount);
+        LEDGER.forfeit{value: amount}(epoch);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The quantity and the reserve                                        */
+    /* ------------------------------------------------------------------ */
+
+    /// The key of `_solverLots`: (asset key, epoch, solver).
+    function _solverKey(bytes32 key, uint256 epoch, address solver) private pure returns (bytes32) {
+        return keccak256(abi.encode(key, epoch, solver));
+    }
+
+    function _hashlockKey(bytes32 hashlock) private view returns (bytes32) {
+        return keccak256(abi.encodePacked(hashlock, msg.sender));
+    }
+
+    /* `_available`, what an offering may sell, is `PremiumSwapStore`'s: the judgement reads it too. */
+
+    /**
+     * The reserve per share as a ratio `num / den`: QRL per share is at
+     * least `num / den`. The epoch-average price per unit, less the admitted
+     * discount, at the offer's units per share; the ladder is the offering's
+     * snapshot (G8). Also returns the discount, which the bond is priced on.
+     */
+    function _reserveRatio(bytes32 key, uint256 epoch)
+        private
+        view
+        returns (uint256 num, uint256 den, uint256 discount)
+    {
+        Offering storage o = _offerings[key][epoch];
+        uint256 coupon = REGISTRY.couponAtExactCoverBps(
+            IReferencePriceOracle(REGISTRY.priceOracle()).realisedYieldBps(0, address(0))
+        );
+        discount = ArkStakeMath.admittedDiscountBps(
+            o.maxEpochMoveBps,
+            o.firstReserveDiscountBps,
+            o.reserveStepBps,
+            o.reserveFloorBps,
+            o.tailPremiumFloorBps,
+            coupon,
+            _failedOfferings[key]
+        );
+        // The epoch average and never the settlement series: whitepaper §5.5
+        // gives the swap's reserve that window alone. P_t of the offered
+        // epoch, closed when the first quote reads it (yellow paper §4.6;
+        // the registry's `epochPrice`, OC-ORC-08), and not read again once
+        // that quote fixed it, so a silent series does not stop the window.
+        num = o.reserveNum;
+        if (num == 0) num = o.units * REGISTRY.epochPrice() * (ArkStakeMath.BPS - discount);
+        den = o.offered * ArkStakeMath.BPS * ArkStakeMath.PRICE_SCALE;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Views                                                               */
+    /* ------------------------------------------------------------------ */
+
+    function lotOf(bytes32 lotId) external view returns (Lot memory) {
+        return _lots[lotId];
+    }
+
+    function offeringOf(uint256 chainId, address asset, uint256 epoch) external view returns (Offering memory) {
+        return _offerings[assetKey(chainId, asset)][epoch];
+    }
+
+    function lotsOf(uint256 chainId, address asset, uint256 epoch) external view returns (bytes32[] memory) {
+        return _lotIds[assetKey(chainId, asset)][epoch];
+    }
+
+    function available(uint256 chainId, address asset, uint256 epoch) external view returns (uint256) {
+        return _available(assetKey(chainId, asset), epoch);
+    }
+
+    /**
+     * The reserve for a lot of `shares`: the one fixed by the offering's first
+     * quote, else at the failure count standing now — which that first quote's
+     * judgement of the offering before may still move (OC-SWAP-03; a solver
+     * reads it once `offeringOf(..).judged`). Rounds up. Zero for an epoch with
+     * no offering recorded (OC-SWAP-10).
+     */
+    function required(uint256 chainId, address asset, uint256 epoch, uint256 shares) external view returns (uint256) {
+        bytes32 key = assetKey(chainId, asset);
+        (uint256 num, uint256 den,) = _reserveRatio(key, epoch);
+        if (den == 0) return 0;
+        uint256 fixedNum = _offerings[key][epoch].reserveNum;
+        if (fixedNum != 0) num = fixedNum;
+        return (shares * num + den - 1) / den;
+    }
+
+    /// The commitment bond a lot of `lotValue` posts now, and its rate (I33): what `quote` adds to `lotValue`.
+    function bondFor(uint256 chainId, address asset, uint256 epoch, uint256 lotValue)
+        external
+        view
+        returns (uint256 bond, uint256 bondBps)
+    {
+        bytes32 key = assetKey(chainId, asset);
+        (,, uint256 discount) = _reserveRatio(key, epoch);
+        return _bondOf(_offerings[key][epoch], discount, lotValue);
+    }
+
+    /// The four windows and the epoch's instants, for the suite and the relayer.
+    function timetable(uint256 epoch)
+        external
+        pure
+        returns (uint256 quoteOpens, uint256 quoteCloses, uint256 evmExpiry, uint256 qrlExpiry)
+    {
+        return (
+            ArkEpoch.quoteOpens(epoch),
+            ArkEpoch.quoteCloses(epoch),
+            ArkEpoch.evmExpiry(epoch),
+            ArkEpoch.settlementCloses(epoch)
+        );
+    }
+}

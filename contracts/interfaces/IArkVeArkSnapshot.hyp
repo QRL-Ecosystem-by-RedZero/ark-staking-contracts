@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * The two calls the juror pool makes on veARK — contracts/core's `VeArk`, read
+ * at a snapshot block (whitepaper §6.1, §6.2; yellow paper §4.1 "Draw
+ * weight"). A subset of core's `IVeArk`, each signature word for word, so the
+ * pool reads core's lock contract by address; `test/ArkJurorPool.test.js`
+ * holds both to core's interface where the umbrella checkout has it. The
+ * repositories do not import each other, hence a copy and not an import.
+ *
+ * `IVeArk.hyp` in this tree is the inherited insurance product's (CLAUDE.md
+ * §0, §8.2) and is not this contract.
+ */
+interface IArkVeArkSnapshot {
+    /**
+     * Records the global totals and this block's timestamp. Permissionless.
+     *
+     * @dev Makes the current block a readable snapshot for every `...At` view.
+     */
+    function checkpoint() external;
+
+    /// @param account The locker being queried.
+    /// @param blockNumber A recorded snapshot block.
+    /// @return Weight of `account`'s own lock at the snapshot.
+    function weightAt(address account, uint256 blockNumber) external view returns (uint256);
+}

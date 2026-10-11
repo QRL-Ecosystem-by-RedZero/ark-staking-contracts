@@ -1,0 +1,295 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/security/ReentrancyGuard.hyp";
+
+import "./interfaces/IProceedsLedger.hyp";
+import "./utils/ArkEpoch.hyp";
+import "./utils/QuantumErrors.hyp";
+
+/**
+ * The delivered-proceeds account.
+ *
+ * The one rule this contract exists to enforce: **a coupon can be paid from
+ * nothing but the premium share actually delivered for the epoch it belongs
+ * to.** See IProceedsLedger for why that is a separate contract rather than a
+ * guard inside the bond.
+ *
+ * ONE DEPOSITOR, AND THE EPOCH IS THE LOT'S
+ * ---------------------------------------
+ * The proceeds of epoch t are the QRL of the swap lots of the premium share
+ * swept in t: quoted in the window closing with t + 1, claimed on QRL until
+ * their QRL expiry early in t + 2 (whitepaper §4.7, yellow paper §1.4). The
+ * account of t accepts a credit only from the premium swap, which credits a
+ * lot to the epoch whose premium it sold and to no other, and only until that
+ * settlement window closes; the coupon of t is paid once it has. Keyed by t,
+ * not by the epoch the credit arrives in. Crediting value is a gift, but
+ * *choosing which epoch to credit* moves value between two sets of
+ * bondholders, which is why nobody but the swap chooses.
+ *
+ * WHY AN EPOCH SEALS ON ITS FIRST DRAW
+ * ------------------------------------
+ * The bond computes a per-unit coupon index from the balance delivered for an
+ * epoch. A draw is only possible after the settlement window has closed, when no
+ * delivery can arrive any more; sealing on the first draw is kept as the second
+ * of two independent guards, because a residue carry is the one other way value
+ * reaches an epoch and it must not land behind an index already fixed.
+ *
+ * WHAT HAPPENS TO AN EPOCH'S RESIDUE
+ * ----------------------------------
+ * Two different things can be left in an epoch, and whitepaper §4.6 treats
+ * them oppositely. A *shortfall* — proceeds below the coupon the holders were
+ * owed — is never carried forward: that epoch's coupon is reduced and nothing
+ * later makes it good. A *residue* — proceeds above what the bond's truncating
+ * divisions paid out — is distributed with the following epoch, because it was
+ * delivered for the coupon and belongs to the holders of bond principal.
+ *
+ * Only the bond can tell the two apart, since only the bond knows what it owed,
+ * so only the bond may carry a residue, and only into the epoch immediately
+ * after it, before anything has been drawn from that epoch.
+ */
+contract ProceedsLedger is IProceedsLedger, ReentrancyGuard {
+    /// Set once, by the deployer, and never re-pointable. See `setBond`.
+    address public bond;
+
+    /// The premium swap, the one depositor. Set once, by the deployer. See `setSwap`.
+    address public swap;
+
+    address private immutable _deployer;
+
+    mapping(uint256 => uint256) private _delivered;
+    mapping(uint256 => uint256) private _drawn;
+    mapping(uint256 => bool) private _sealed;
+
+    /**
+     * The shortfall carry of whitepaper §4.7 and I34, in QRL: what the
+     * retirements of unsold premium withheld from the holders of bond
+     * principal, less what the yield of the retained shares has since
+     * delivered. Written by the swap alone — up at a retirement, down as that
+     * yield clears — and read by the bond, whose issuance is suspended while
+     * it is not zero ("a coupon shortfall is unrecovered"). No value sits
+     * behind it here: it is a record, repaid on the delivered-proceeds path
+     * and from no account of its own.
+     */
+    uint256 public shortfallCarry;
+
+    constructor() {
+        _deployer = msg.sender;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Wiring                                                              */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Name the bond that may draw coupons. One-shot.
+     *
+     * Not an admin setter, deliberately. Whoever can re-point the drawer of
+     * this ledger can direct every coupon this product ever pays, and no
+     * timelock makes that acceptable. The cost is that a deployment naming the
+     * wrong address cannot be repaired and has to be redeployed — treat the
+     * call as irreversible, because it is.
+     */
+    function setBond(address bond_) external {
+        if (msg.sender != _deployer) revert OnlyDeployer(msg.sender);
+        if (bond != address(0)) revert BondAlreadySet(bond);
+        if (bond_ == address(0)) revert ZeroAddress();
+
+        bond = bond_;
+        emit BondSet(bond_);
+    }
+
+    /**
+     * Name the premium swap, the one account that may credit proceeds. One-shot,
+     * for `setBond`'s reason: whoever could re-point it could credit an epoch
+     * of their choosing.
+     */
+    function setSwap(address swap_) external {
+        if (msg.sender != _deployer) revert OnlyDeployer(msg.sender);
+        if (swap != address(0)) revert SwapAlreadySet(swap);
+        if (swap_ == address(0)) revert ZeroAddress();
+
+        swap = swap_;
+        emit SwapSet(swap_);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Delivery                                                            */
+    /* ------------------------------------------------------------------ */
+
+    /// @inheritdoc IProceedsLedger
+    function deliver(uint256 epoch) external payable {
+        if (msg.sender != swap) revert OnlySwap(msg.sender);
+        if (msg.value == 0) revert ZeroValue();
+        _requireCreditable(epoch);
+        if (_sealed[epoch]) revert EpochSealed(epoch);
+
+        _delivered[epoch] += msg.value;
+        emit ProceedsDelivered(epoch, msg.sender, msg.value);
+    }
+
+    /**
+     * Credit the commitment bonds forfeited against `epoch`'s offering
+     * (whitepaper §4.7, I33): part of that epoch's delivered proceeds, so its
+     * coupon pays them. Swap only, and only after the epoch has closed and
+     * while nothing has been drawn from it: a forfeit is determined at the
+     * QRL expiry of the lots, the instant the settlement window closes, so it
+     * lands outside `deliver`'s window by construction, and the coupon
+     * account collects it (`collectForfeits`) before it reads the balance.
+     */
+    function forfeit(uint256 epoch) external payable {
+        if (msg.sender != swap) revert OnlySwap(msg.sender);
+        if (msg.value == 0) revert ZeroValue();
+        if (_sealed[epoch]) revert EpochSealed(epoch);
+
+        _delivered[epoch] += msg.value;
+        emit BondsForfeited(epoch, msg.value);
+    }
+
+    /**
+     * Ask the swap to hand over what `epoch`'s offering forfeited. Any sender;
+     * the swap decides how much, the ledger which epoch. `ArkBondCoupon
+     * .distribute` calls it before it reads the epoch's balance, so a bond
+     * forfeited at the close of the window is in the coupon of the epoch whose
+     * share was offered and of no other.
+     */
+    function collectForfeits(uint256 epoch) external {
+        // An account with no code is a stand-in depositor (the unit suite's),
+        // which holds no bonds; a call to it would revert every distribution.
+        if (swap.code.length == 0) return;
+        IForfeitSource(swap).releaseForfeits(epoch);
+    }
+
+    /// Record a retirement's carry (I34). Swap only.
+    function carryShortfall(uint256 qrl) external {
+        if (msg.sender != swap) revert OnlySwap(msg.sender);
+        shortfallCarry += qrl;
+        emit ShortfallCarried(qrl, shortfallCarry);
+    }
+
+    /**
+     * Reduce the carry by QRL the retained shares' yield delivered (I34):
+     * monotone, never below zero, bearing no interest. Swap only.
+     */
+    function recoverShortfall(uint256 qrl) external {
+        if (msg.sender != swap) revert OnlySwap(msg.sender);
+        uint256 c = shortfallCarry;
+        uint256 r = qrl > c ? c : qrl;
+        shortfallCarry = c - r;
+        emit ShortfallRecovered(r, c - r);
+    }
+
+    /**
+     * Refuse a credit to `epoch` outside its settlement window: before the
+     * epoch has closed its premium has not been offered, and from the QRL
+     * expiry of its lots its coupon may be paid. The swap refuses a claim
+     * from that expiry on, so this is the second of two guards.
+     */
+    function _requireCreditable(uint256 epoch) private view {
+        uint256 opens = ArkEpoch.startOf(epoch + 1);
+        uint256 closes = ArkEpoch.settlementCloses(epoch);
+        if (block.timestamp < opens || block.timestamp >= closes) {
+            revert CreditWindowShut(epoch, opens, closes);
+        }
+    }
+
+    /**
+     * Reject a bare transfer.
+     *
+     * Value arriving with no epoch attached cannot be credited to one, and
+     * crediting it by default would let a mistimed send silently become
+     * someone's coupon. There is one way in and it names the epoch it is for.
+     */
+    receive() external payable {
+        revert ZeroValue();
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Drawing                                                             */
+    /* ------------------------------------------------------------------ */
+
+    /// @inheritdoc IProceedsLedger
+    function draw(uint256 epoch, address to, uint256 amount) external nonReentrant {
+        if (msg.sender != bond) revert OnlyBond(msg.sender);
+        if (to == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroValue();
+
+        // The coupon of an epoch is paid at the close of its settlement window
+        // and not before: drawn earlier, the index would be fixed on proceeds
+        // the swap had not finished delivering.
+        uint256 payable_ = ArkEpoch.settlementCloses(epoch);
+        if (block.timestamp < payable_) revert NotYetPayable(epoch, payable_);
+
+        uint256 available = _delivered[epoch] - _drawn[epoch];
+        if (amount > available) revert InsufficientProceeds(epoch, amount, available);
+
+        _sealed[epoch] = true;
+        _drawn[epoch] += amount;
+
+        (bool ok,) = to.call{value: amount}("");
+        if (!ok) revert TransferFailed(to, amount);
+
+        emit ProceedsDrawn(epoch, to, amount);
+    }
+
+    /**
+     * Carry what the bond left undrawn in `epoch` into `epoch + 1`.
+     *
+     * Bond only, for the reason in the header: a residue and a shortfall look
+     * identical from here. The source's window must have closed, so its
+     * proceeds are final; the destination must be unsealed, so the residue
+     * joins that epoch's coupon rather than landing behind an index already
+     * fixed. The source is sealed by the carry. No value leaves this contract,
+     * so there is no transfer to guard.
+     *
+     * The destination's CREDIT window may have shut. The bond distributes one
+     * epoch at a time, in order, and carries while distributing `epoch`, so
+     * `epoch + 1` is always the next epoch it will distribute and nothing has
+     * been fixed on it yet; refusing a late carry only stranded the residue in
+     * a sealed epoch for good (R26). The credit window binds depositors, whose
+     * choice of epoch moves value between bondholders; the bond's carry makes
+     * no such choice.
+     */
+    function carryResidue(uint256 epoch) external {
+        if (msg.sender != bond) revert OnlyBond(msg.sender);
+
+        uint256 from = ArkEpoch.settlementCloses(epoch);
+        if (block.timestamp < from) revert NotYetPayable(epoch, from);
+        uint256 next = epoch + 1;
+        if (_sealed[next]) revert EpochSealed(next);
+
+        uint256 residue = _delivered[epoch] - _drawn[epoch];
+        if (residue == 0) revert ZeroValue();
+
+        _sealed[epoch] = true;
+        _drawn[epoch] += residue;
+        _delivered[next] += residue;
+
+        emit ResidueCarried(epoch, next, residue);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Views                                                               */
+    /* ------------------------------------------------------------------ */
+
+    /// @inheritdoc IProceedsLedger
+    function deliveredIn(uint256 epoch) external view returns (uint256) {
+        return _delivered[epoch];
+    }
+
+    /// @inheritdoc IProceedsLedger
+    function remainingIn(uint256 epoch) external view returns (uint256) {
+        return _delivered[epoch] - _drawn[epoch];
+    }
+
+    /// @inheritdoc IProceedsLedger
+    function isSealed(uint256 epoch) external view returns (bool) {
+        return _sealed[epoch];
+    }
+
+    /// The epoch in progress, so a caller need not duplicate the clock.
+    function currentEpoch() external view returns (uint256) {
+        return ArkEpoch.current();
+    }
+
+}

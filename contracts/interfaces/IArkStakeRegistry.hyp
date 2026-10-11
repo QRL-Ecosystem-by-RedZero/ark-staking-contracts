@@ -1,0 +1,319 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./IArkStakeParams.hyp";
+
+/**
+ * The position record, and the price of cover computed from the book it forms.
+ *
+ * The one rule this contract exists to enforce: **the address entitled to
+ * release a position is part of that position's identifier, not a field beside
+ * it.** Whitepaper §3.2, invariant I4. A position and the address entitled to
+ * release it are one object, so no state transition produces one without the
+ * other, and an adversary holding every recovered key on the origin chain has
+ * no field to change — recomputing the identifier with a different beneficiary
+ * yields a different identifier, corresponding to no position.
+ *
+ * The registry is the QRL-side record. The escrow on the origin chain holds the
+ * value; this holds who is owed it, on the chain whose signatures the event does
+ * not affect, so the entitlement survives a declaration without any procedure
+ * being run against it.
+ */
+interface IArkStakeRegistry is IArkStakeAdmissions, IGovernanceHandover {
+    /* ------------------------------------------------------------------ */
+    /* Types                                                               */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * What the admission audit of whitepaper §3.2 establishes about an asset,
+     * and the state of its periodic yield review.
+     *
+     * `exitBoundBps` calibrates the per-epoch release bound, which is why it is
+     * recorded from the asset's published exit path rather than chosen by the
+     * protocol. `correlationGroup` is the unit concentration is measured in:
+     * two assets on the same consensus client, operator set or withdrawal queue
+     * do not fail independently. `yieldFloorBps` is the figure the admission
+     * condition was evaluated against at admission.
+     *
+     * `transferVerified` records an audit result that must be positive for the
+     * asset to be here at all, so a stored `false` is unreachable: the value is
+     * asserted at admission rather than filed.
+     */
+    struct AssetProfile {
+        bool admitted;
+        bool transferVerified;
+        /// The balance rebases, so principal is recorded in shares rather than units.
+        bool rebasing;
+        /// Yield can be collected by a call the escrow makes permissionlessly.
+        bool permissionlessYieldPath;
+        /// Zero where the asset has no upgrade authority. Disclosed at anchoring. Section 3.2.
+        address upgradeAuthority;
+        bytes32 correlationGroup;
+        /// The asset's published exit bound, per epoch, in bps of anchored notional.
+        uint16 exitBoundBps;
+        /// The realised yield over the trailing window, as measured at admission.
+        uint16 yieldFloorBps;
+        address asset;
+        uint256 chainId;
+        /// Consecutive reviewed epochs in which the yield condition failed.
+        uint8 failingEpochs;
+        /// The last epoch the yield condition was reviewed in. Zero before the first review.
+        uint64 lastReviewEpoch;
+    }
+
+    /**
+     * What an admission proposal supplies. Whitepaper §3.2.
+     *
+     * One calldata struct because the audit establishes a set of facts about a
+     * single asset and they arrive together, and because hypc's stack does not
+     * admit nine separate parameters alongside the locals the checks need.
+     */
+    struct AssetInput {
+        uint256 chainId;
+        address asset;
+        bytes32 correlationGroup;
+        /// Recorded and disclosed. An authority that would exclude the asset is refused by the audit, not here.
+        address upgradeAuthority;
+        uint16 exitBoundBps;
+        /// y_A: the realised yield of the asset over the trailing window.
+        uint16 yieldBps;
+        bool rebasing;
+        bool transferVerified;
+        bool permissionlessYieldPath;
+    }
+
+    /// A position. Every field is fixed at anchoring except the release fields.
+    struct Anchor {
+        address asset;
+        address boundQrlOwner;
+        uint256 chainId;
+        uint256 anchoredNotional;
+        uint64 anchoredAt;
+        uint64 depositNonce;
+        /// 0 none, 1 anchored, 2 in transit, 3 released.
+        uint8 status;
+        /// When the unbonding period elapses. Zero while no release is instructed.
+        uint64 releasableAt;
+        /// Monotonic per position; a release payload is admissible once.
+        uint64 claimNonce;
+        /**
+         * The group the notional was counted in at anchoring, and is taken out
+         * of at release. Fixed here rather than read from the asset's profile,
+         * because a de-listed asset re-admitted under another group would
+         * otherwise release notional from a group that never held it.
+         */
+        bytes32 correlationGroup;
+        /**
+         * The origin-chain escrow the position was anchored in, as its forward
+         * leaf named it (D10, 2026-09-28). Every return leaf of the position
+         * binds it, so a receipt sealed for this position pays at no other
+         * escrow of the relay — a successor escrow of the same asset included.
+         */
+        address escrow;
+    }
+
+    /**
+     * The six fields an anchoring fixes, as they arrive from the origin chain.
+     *
+     * One calldata struct because the five that form the identifier are one
+     * object: a caller assembling them separately can transpose two addresses
+     * and produce a valid-looking identifier for a position that does not
+     * exist.
+     */
+    struct AnchorInput {
+        uint256 chainId;
+        address asset;
+        address depositor;
+        address boundQrlOwner;
+        uint64 depositNonce;
+        uint256 anchoredNotional;
+        /// The escrow that emitted the anchor; bound by its forward leaf, not part of the identifier.
+        address escrow;
+    }
+
+    /**
+     * The shares of whitepaper §4.2, and where the operations share goes.
+     *
+     * The staker share is the residual, net of the levy since 2026-09-28.
+     * `jurorFeeShareBps` is not a share of yield: it is the fraction of the
+     * operations share the escrow holds for the auction rather than spends,
+     * and it travels with the allocation because an ownerless escrow has no
+     * other way to be told about a vote. The last five fields (gap item 19,
+     * I39, appended so a reader of the first five is unaffected): the
+     * stabilization levy in force, the target rung a term commitment locks and
+     * is topped up to (`sigma_t`, unscaled), the fraction covered it is scaled
+     * by, the reserve's cap factor `psrCapEpochs * (sigma_4 - sigma_1)`, and the
+     * term a position anchoring now commits for.
+     */
+    struct Allocation {
+        uint16 stakerBps;
+        uint16 premiumBps;
+        uint16 bufferBps;
+        uint16 operationsBps;
+        uint16 jurorFeeShareBps;
+        uint16 levyBps;
+        uint16 sigmaTargetBps;
+        uint16 coveredBps;
+        uint16 psrCapBps;
+        uint16 commitTermEpochs;
+        /// A step of the threat stage queued: no term commitment while it is (V4, 2026-09-30; QL-25, PV-20).
+        /// Staged in the parameter set for the next boundary, or queued in its timelock (`stageStepQueued()`).
+        bool stepQueued;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Events                                                              */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * An asset was admitted, with the two figures the condition of §3.2 was
+     * decided on. The event is the durable statement of how close to the line
+     * the asset was at the moment it was let in.
+     */
+    event AssetAdmitted(bytes32 indexed assetKey, address indexed asset, uint256 indexed chainId, bytes32 correlationGroup, uint16 yieldFloorBps, uint16 couponFloorBps);
+
+    /// The yield condition of §3.2 was re-evaluated for an epoch.
+    event AssetReviewed(bytes32 indexed assetKey, uint256 indexed epoch, uint256 yieldBps, uint256 yieldFloorBps, uint8 failingEpochs);
+
+    /// Why an asset closed to new anchoring. Ordinals are a wire format: append, never reorder.
+    enum DelistReason {
+        Governance,
+        YieldBelowFloor
+    }
+
+    event AssetDelisted(bytes32 indexed assetKey, DelistReason reason);
+
+    event Anchored(bytes32 indexed stakeAssetId, address indexed boundQrlOwner, bytes32 indexed assetKey, uint256 anchoredNotional, uint256 epoch);
+
+    /**
+     * A proven deposit was recorded although it falls outside a control on the
+     * inflow: its asset was de-listed, or it carried its group past the
+     * admission cap (`groupShareBps` against `capBps`; `capBps` reads 10,000
+     * while the cap is unsatisfiable and so not binding).
+     *
+     * Recorded, never refused. The escrow is one-way and has already taken the
+     * deposit; a release needs this record, so a refusal here would strand it
+     * on the origin chain. The inflow is stopped at the escrow, by the
+     * de-listing leaf, and this event is the evidence that prompts one.
+     */
+    event AnchoredOutsideControls(bytes32 indexed stakeAssetId, bytes32 indexed assetKey, bool delisted, uint256 groupShareBps, uint256 capBps);
+
+    /**
+     * A release was signed on QRL. The notional left the covered book in this
+     * block (whitepaper §3.3), and `releaseLeaf` is what the attester seals.
+     *
+     * The escrow admits a release only where a payload reproduces a leaf of a
+     * root it has already accepted, which makes substitution of the recipient
+     * in the origin-chain mempool ineffective rather than merely expensive: a
+     * different recipient is a different payload, a different leaf, and no
+     * membership proof. Whitepaper §3.5.
+     */
+    event ReleaseInstructed(bytes32 indexed stakeAssetId, address indexed recipient, uint64 claimNonce, bytes32 releaseLeaf, uint64 releasableAt, uint256 notional);
+
+    /// The origin chain paid the release out in full, proven against an epoch root.
+    event ReleaseSettled(bytes32 indexed stakeAssetId, uint256 notional, uint256 epoch);
+
+    /// The premium share priced for an epoch, carried while the circuit breaker holds.
+    event PremiumMarked(uint256 indexed epoch, uint16 premiumBps);
+
+    /**
+     * The reference price read at the first touch after the boundary that
+     * opens `epoch` (the close of `epoch - 1`), outside the breaker: the
+     * boundary reading the trigger-2 severity measures to (EC-01, PV-03).
+     */
+    event BoundaryReading(uint256 indexed epoch, uint256 price);
+
+    /**
+     * An escrow's buffer, in units of its asset, proven against the forward
+     * root of `epoch` (the escrow's `BufferReported` leaf). `bufferOrig` is the
+     * book-wide total it now stands at: the denominator of utilisation beside
+     * the capacity conversion of bond principal (whitepaper §4.3).
+     */
+    event BufferRecorded(bytes32 indexed assetKey, uint256 indexed epoch, uint256 units, uint256 bufferOrig);
+
+    /// Governance asked for the seed of `escrow` to be returned, the `count`-th time (re-audit 2026-09-30, ORIGIN-01).
+    event SeedReturnRequested(uint256 indexed chainId, address indexed escrow, uint256 count);
+
+    /* ------------------------------------------------------------------ */
+    /* Errors                                                              */
+    /* ------------------------------------------------------------------ */
+
+    error OnlyGovernance(address caller);
+    error OnlyDeployer(address caller);
+    error AlreadySet(address current);
+
+    error AssetNotAdmitted(bytes32 assetKey);
+    error AssetAlreadyAdmitted(bytes32 assetKey);
+
+    /// Admission would list a correlation group beyond the bound the measurement iterates.
+    error TooManyCorrelationGroups(uint256 max);
+
+    /// A deposit that names no beneficiary is rejected rather than defaulted.
+    error NoBeneficiary();
+
+    /**
+     * The asset cannot fund a coupon at exact cover that clears the floor under
+     * the tail-risk premium: `sigma_t * y_A / att_eff >= Delta_min` fails.
+     * Whitepaper §3.2 and §4.5. Necessary and not sufficient.
+     */
+    error YieldBelowAdmissionFloor(bytes32 assetKey, uint256 yieldBps, uint256 requiredBps);
+
+    /// The audit did not establish a transfer path the escrow can call. Whitepaper §3.2.
+    error TransferNotVerified(address asset);
+
+    /// The yield condition has already been reviewed for this asset in this epoch.
+    error AlreadyReviewed(bytes32 assetKey, uint256 epoch);
+
+    /**
+     * The bound would be set below an admitted asset's own published exit path.
+     *
+     * Whitepaper §6.3 states the range in that direction. A protocol throttle
+     * tighter than the origin chain's own would hold a position more tightly
+     * than the asset it consists of does.
+     */
+    error ReleaseBoundBelowAssetExit(uint256 boundBps, uint256 assetExitBps);
+
+    error UnknownAnchor(bytes32 stakeAssetId);
+    error AnchorExists(bytes32 stakeAssetId);
+    error NotBoundOwner(bytes32 stakeAssetId, address caller);
+    error WrongStatus(bytes32 stakeAssetId, uint8 status);
+
+    /**
+     * A buffer report no newer than the one already recorded for the asset. An
+     * older report would roll the buffer back to a figure the escrow no longer
+     * holds, which after a loss settlement overstates cover.
+     */
+    error BufferReportNotNewer(bytes32 assetKey, uint256 recordedEpoch, uint256 epoch);
+
+    /// A proof already consumed against this epoch and leaf.
+    error ProofSpent(bytes32 spendKey);
+
+    /// Membership against the epoch root failed.
+    error BadProof(uint256 epoch, bytes32 leaf);
+
+    /// The release path is closed permanently. Whitepaper §3.5, invariant I15.
+    error ReleaseClosed();
+
+    /// A release recipient wider than an origin-chain (20-byte) address. See `EvmWords.isEvmAddress`.
+    error RecipientNotOriginAddress(address recipient);
+
+    /**
+     * An anchor named its escrow, asset or depositor in a non-canonical
+     * encoding: a 64-byte QRL address word whose high bytes are not zero
+     * (audit 2026-09-29 R2 M-3, QL-27). The leaf hashes the low word only, so
+     * a variant still proved, took the position's identifier first and left
+     * the true record refused for good.
+     */
+    error AnchorNotCanonical(address value);
+
+    /**
+     * A claimant of the censorship ground, held in the book until its
+     * escrow's recovery is applied or the hold lapses (OC-LEGA-01): released
+     * first, it would leave the recovery of the draw it was paid to the
+     * positions that stayed.
+     */
+    error ClaimantHeld();
+
+    /// The premium mark failed with too little gas left to tell a starved call from a failing oracle (OC-LEGB-11).
+    error MarkStarved();
+}

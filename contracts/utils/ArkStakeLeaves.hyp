@@ -1,0 +1,285 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "../lib/EvmWords.hyp";
+import "../interfaces/IArkStakeRegistry.hyp";
+
+/**
+ * The return-path leaves that carry a quantity or a rate to the origin chain:
+ * the allocation, the loss settlement and the recovery share (whitepaper §3.5,
+ * yellow paper §2.2), byte for byte `ArkStakeIds.sol` and the relayer's
+ * `identifiers.js`.
+ *
+ * The one rule this library exists to enforce: **a leaf is laid out in the
+ * origin chain's 32-byte words, whatever this chain's word width** — built
+ * with `abi.encodePacked` over `EvmWords`, never with native `abi.encode`,
+ * whose 64-byte slots on the QIP-55 line would produce leaves that verify
+ * nowhere (CLAUDE.md item 26).
+ *
+ * WHY A LIBRARY AND NOT THE REGISTRY
+ * ----------------------------------
+ * The registry built these as public functions until 2026-09-28, when the
+ * allocation leaf grew to nine rates (phase C2) and the registry's v3 runtime
+ * stood 1,525 bytes under EIP-170. The loss and recovery leaves were built on
+ * QRL by nothing — the court and the recovery procedure that will seal them
+ * are not in this tree — and the allocation leaf is sealed from
+ * `currentAllocationLeaf` alone, so the external builders were bytes spent on
+ * the suite. The suite reaches them through `StakeMathHarness`; the registry
+ * keeps the one it seals.
+ *
+ * EVERY LEAF BINDS THE ESCROW THAT PAYS IT (D10, 2026-09-28)
+ * ----------------------------------------------------------
+ * One relay serves every escrow of an origin chain, so each of these carries
+ * the origin-chain address of the escrow that acts on it (yellow paper §2.2,
+ * I6): a loss or a share sealed for one escrow verifies at no other, and one
+ * allocation is sealed per escrow. The recovery share also binds the
+ * successor state it is paid on (whitepaper §5.4, I36).
+ */
+library ArkStakeLeaves {
+    /// keccak256("ARK_STAKE_V1"), as `ArkStakeIds.STAKE_DOMAIN` and the registry's.
+    bytes32 internal constant STAKE_DOMAIN = 0x7b78fb66e5c4c423ff7a9a14a2788b272f00bb59ce43a9623718bad3f1cfa45d;
+
+    /**
+     * keccak256("ARK_STAKE_ALLOCATION_V4"). V3 since 2026-09-28: the leaf
+     * carries the stabilization levy, the target rung and the cover a term
+     * commitment is topped up against, the reserve's cap factor and the
+     * commitment term (gap item 19, I39), so no V2 leaf verifies at a V3 escrow;
+     * V4 since 2026-09-30: and whether a step of the threat stage is queued,
+     * `stepQueued`, one word of 0 or 1 (QL-25, PV-20).
+     */
+    bytes32 internal constant ALLOCATION_DOMAIN = 0x00dea64034af1c14fb698f0f5d5dc90f019a7ebd16e16a20664167d7d7e352fc;
+
+    /// keccak256("ARK_LOSS_V1"): the loss leaf carries no STAKE_DOMAIN (yellow paper §2.2).
+    bytes32 internal constant LOSS_DOMAIN = 0xe325f1a59c183640d2cd7301dbd4a5daf3e36569500d05e57fadb7a9c4455e20;
+
+    /// keccak256("ARK_RECOVERY_V1"): as `LOSS_DOMAIN`.
+    bytes32 internal constant RECOVERY_DOMAIN = 0x4eae7b329f9f2fe17f6b58af08766d28f2b93286b5e3782b191cb0c0344dbfe0;
+
+    /// keccak256("ARK_STAKE_RELEASED_V1"), as the registry's `RELEASED_DOMAIN`.
+    bytes32 internal constant RELEASED_DOMAIN = 0x1b5c902ec2c18bbcb342f901ea8496a8330696a9d00d7d5f6ae055dbbf1b4cb5;
+
+    /// keccak256("ARK_STAKE_BUFFER_V1"), as the registry's `BUFFER_DOMAIN`.
+    bytes32 internal constant BUFFER_DOMAIN = 0x797db8e4a78fe7f6eaad089bffcc820051f8a3ade37bddda13e381d8da78551d;
+
+    /**
+     * keccak256("ARK_STAKE_ANCHOR_COUNT_V2"), as `ArkStakeIds.ANCHOR_COUNT_DOMAIN` (audit 2026-09-29, QL-05,
+     * QL-06). V2 since the re-audit of 2026-09-30 (BOND-02): the count is CUMULATIVE, every stake
+     * leaf of every root through the epoch, so a V1 leaf (that root's own count) never proves here.
+     */
+    bytes32 internal constant ANCHOR_COUNT_DOMAIN = 0x0652b5706f2b29d23becd11203d7bae566e534e4d3302e3192469ec4de809774;
+
+    /**
+     * The forward root's own count of the anchors it carries,
+     * `ArkStakeIds.anchorCountLeaf`: the relayer seals one into the root of
+     * every closed origin epoch, a quiet one included — where it is then the
+     * whole root — so a root exists for every epoch and says how many
+     * deposits it proves (audit 2026-09-29, QL-05, QL-06). Built by the
+     * relayer from its own leaves; no escrow emits it.
+     */
+    function anchorCountLeaf(uint256 epoch, uint256 count) internal pure returns (bytes32) {
+        return keccak256(
+            abi.encodePacked(STAKE_DOMAIN, ANCHOR_COUNT_DOMAIN, EvmWords.word(epoch), EvmWords.word(count))
+        );
+    }
+
+    /**
+     * The leaf an attester seals for an anchoring, naming the origin-chain
+     * escrow it was made in (yellow paper §2.2 `stakeLeafKey`, D10). The
+     * registry keeps that escrow with the position, and every return leaf of
+     * the position binds it. A public function of the registry until
+     * 2026-09-29, as are the three below; moved for its v3 size.
+     */
+    function stakeLeafKey(address escrow, bytes32 id, uint256 anchoredNotional) internal pure returns (bytes32) {
+        return keccak256(
+            abi.encodePacked(STAKE_DOMAIN, EvmWords.evmWord(escrow), id, EvmWords.word(anchoredNotional))
+        );
+    }
+
+    /**
+     * The key a proof is consumed against: the epoch and the leaf, never the
+     * asset (invariant I6).
+     *
+     * Consumption keyed by asset would block a legitimate re-anchoring after a
+     * release. Consumption keyed by leaf alone would let an old proof be
+     * replayed against a position that is no longer escrowed.
+     */
+    function spendKey(uint256 epoch, bytes32 leaf) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked(EvmWords.word(epoch), leaf));
+    }
+
+    /// The payload a release commits to, signed on QRL before any origin-chain transaction exists.
+    function releasePayload(bytes32 id, address recipient, uint64 claimNonce, uint256 chainId)
+        internal
+        pure
+        returns (bytes32)
+    {
+        return keccak256(
+            abi.encodePacked(
+                id, EvmWords.evmWord(recipient), EvmWords.word(uint256(claimNonce)), EvmWords.word(chainId)
+            )
+        );
+    }
+
+    /**
+     * The leaf the escrow checks a release against, bound to that escrow
+     * (D10). The escrow checks it twice since 2026-09-29: at the admission of
+     * the root that carries it, to take the position out of the book the
+     * premium is charged on, and after the unbonding, to consume it
+     * (whitepaper §3.3, I18; audit 2026-09-22, X7).
+     */
+    function releaseLeaf(address escrow, bytes32 payload) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked(STAKE_DOMAIN, EvmWords.evmWord(escrow), payload));
+    }
+
+    /**
+     * The forward-path leaf an attester seals once the escrow has paid a
+     * release out in full (yellow paper §2.2). Built here, not as a public
+     * function of the registry, since phase C3b: the registry's v3 runtime
+     * needed the bytes for the settlement price (whitepaper §5.5), and the
+     * suite reaches it through `StakeMathHarness`.
+     */
+    function releasedLeaf(address escrow, bytes32 id, uint64 claimNonce) internal pure returns (bytes32) {
+        return keccak256(
+            abi.encodePacked(
+                STAKE_DOMAIN, RELEASED_DOMAIN, EvmWords.evmWord(escrow), id, EvmWords.word(uint256(claimNonce))
+            )
+        );
+    }
+
+    /**
+     * The forward-path leaf of an escrow's buffer, `ArkStakeIds.bufferLeaf`,
+     * emitted by the escrow's `reportBuffer` once per epoch. The chain, the
+     * escrow and the asset are in the preimage because one root carries every
+     * escrow's facts. Moved here from the registry with `releasedLeaf`.
+     */
+    function bufferLeaf(uint256 chainId, address escrow, address asset, uint256 epoch, uint256 units)
+        internal
+        pure
+        returns (bytes32)
+    {
+        return keccak256(
+            abi.encodePacked(
+                STAKE_DOMAIN,
+                BUFFER_DOMAIN,
+                EvmWords.word(chainId),
+                EvmWords.evmWord(escrow),
+                EvmWords.evmWord(asset),
+                EvmWords.word(epoch),
+                EvmWords.word(units)
+            )
+        );
+    }
+
+    /// keccak256("ARK_STAKE_SEED_RETURN_V1"), as `ArkStakeIds.SEED_RETURN_DOMAIN` (PV-17, 2026-09-30).
+    bytes32 internal constant SEED_RETURN_DOMAIN = 0xdce3579d119514aadb22ec03905469f05765676c8f51e30c9797f196abfc5750;
+
+    /**
+     * The return of one escrow's seeding deposit, sealed for `epoch`
+     * (whitepaper §4.2, yellow paper §2.2 `seedReturnLeafKey`; PV-17 of
+     * 2026-09-30), as `ArkStakeIds.seedReturnLeaf`. Sealed by the relayer
+     * only while the bond's `seedReturnSealable()` holds: no determination
+     * open and no declaration ratified.
+     */
+    function seedReturnLeaf(uint256 chainId, address escrow, uint256 epoch) internal pure returns (bytes32) {
+        return keccak256(
+            abi.encodePacked(
+                STAKE_DOMAIN, SEED_RETURN_DOMAIN, EvmWords.word(chainId), EvmWords.evmWord(escrow), EvmWords.word(epoch)
+            )
+        );
+    }
+
+    /**
+     * The allocation of an epoch. The staker share is absent: it is the
+     * residual, recomputed on the origin chain by subtraction, which is how
+     * the identity of whitepaper §4.2 is enforced across the relay rather
+     * than trusted through it. Every other field is governable or measured on
+     * QRL, and an ownerless escrow has no other way to be told of it. Two
+     * packed halves hashed as one preimage, for the legacy code generator's
+     * stack.
+     */
+    function allocationLeaf(address escrow, uint256 epoch, IArkStakeRegistry.Allocation memory a)
+        internal
+        pure
+        returns (bytes32)
+    {
+        return keccak256(
+            bytes.concat(
+                abi.encodePacked(
+                    STAKE_DOMAIN,
+                    ALLOCATION_DOMAIN,
+                    EvmWords.evmWord(escrow),
+                    EvmWords.word(epoch),
+                    EvmWords.word(uint256(a.premiumBps)),
+                    EvmWords.word(uint256(a.bufferBps)),
+                    EvmWords.word(uint256(a.operationsBps)),
+                    EvmWords.word(uint256(a.jurorFeeShareBps))
+                ),
+                abi.encodePacked(
+                    EvmWords.word(uint256(a.levyBps)),
+                    EvmWords.word(uint256(a.sigmaTargetBps)),
+                    EvmWords.word(uint256(a.coveredBps)),
+                    EvmWords.word(uint256(a.psrCapBps)),
+                    EvmWords.word(uint256(a.commitTermEpochs)),
+                    EvmWords.word(a.stepQueued ? 1 : 0)
+                )
+            )
+        );
+    }
+
+    /**
+     * The loss settlement: the buffer's part of a trigger-1 determination for
+     * one position, paid on the origin chain (whitepaper §3.5, §5.2). The
+     * preimage is the yellow paper §2.2 listing's, under a domain of its own
+     * rather than under STAKE_DOMAIN, and it names a quantity because its
+     * recipient holds no position whose principal would fix one.
+     */
+    function lossLeaf(
+        uint256 chainId,
+        address escrow,
+        bytes32 determinationId,
+        bytes32 id,
+        address destination,
+        uint256 quantity
+    ) internal pure returns (bytes32) {
+        return keccak256(
+            abi.encodePacked(
+                LOSS_DOMAIN,
+                EvmWords.word(chainId),
+                EvmWords.evmWord(escrow),
+                determinationId,
+                id,
+                EvmWords.evmWord(destination),
+                EvmWords.word(quantity)
+            )
+        );
+    }
+
+    /**
+     * One recipient's share of a realised escrow (whitepaper §5.4); yellow
+     * paper §2.2's preimage, `successorId` the admitted successor state it is
+     * paid on (zero: the origin chain), so a share is spent once and on one
+     * fork (I36).
+     */
+    function shareLeaf(
+        uint256 chainId,
+        address escrow,
+        bytes32 successorId,
+        bytes32 recoveryId,
+        bytes32 recipient,
+        address destination,
+        uint256 quantity
+    ) internal pure returns (bytes32) {
+        return keccak256(
+            abi.encodePacked(
+                RECOVERY_DOMAIN,
+                EvmWords.word(chainId),
+                EvmWords.evmWord(escrow),
+                successorId,
+                recoveryId,
+                recipient,
+                EvmWords.evmWord(destination),
+                EvmWords.word(quantity)
+            )
+        );
+    }
+}

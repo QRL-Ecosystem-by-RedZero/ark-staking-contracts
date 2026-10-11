@@ -1,0 +1,48 @@
+{
+  "name": "rehearsal-v3-gov",
+  "chainId": 31337,
+  "profile": "testnet",
+  "evmVersion": "shanghai",
+  "qrlOwnerLength": 64,
+  "rootSigners": {
+    "threshold": 2,
+    "signers": 3
+  },
+  "court": "real",
+  "qday": "ArkQDayOracle",
+  "finality": "confirmations",
+  "confirmations": 1,
+  "deliveryMarginSeconds": 10,
+  "deployedFromBlock": 0,
+  "assets": [
+    {
+      "symbol": "mREB",
+      "mock": "MockRebasingAsset",
+      "address": null,
+      "rebasing": true,
+      "correlationGroup": "group:lido-like",
+      "exitBoundBps": 2500,
+      "escrow": null
+    },
+    {
+      "symbol": "mUNIT",
+      "mock": "MockAsset",
+      "address": null,
+      "rebasing": false,
+      "correlationGroup": "group:mock-units",
+      "exitBoundBps": 2500,
+      "escrow": null
+    }
+  ],
+  "addresses": {
+    "relay": null,
+    "operationsDestination": "0x00000000000000000000000000000000000E2E01"
+  },
+  "bondPrincipal": "80000000000000000000000",
+  "note": "OC audit 2026-10-03: as rehearsal-v3, but at the testnet profile (70-minute epochs) with core governance (ArkTimelock, ArkGovernor, VeArk, ArkQDayOracle), for governance-live, governance-qday and the court's escalation. Origin on the same Hardhat node as rehearsal-v3 (port 8548), its own contracts.",
+  "governance": {
+    "record": "deployments/governance-rehearsal-v3-gov.json",
+    "selfDeploy": true
+  },
+  "shared": false
+}

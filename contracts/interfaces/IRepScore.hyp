@@ -1,0 +1,135 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * RepScore — soulbound reputation, and the hard limits on what it may buy.
+ *
+ * THE BOUNDARY (protocol invariant #7)
+ * ------------------------------------
+ * RepScore touches exactly two things: the PREMIUM a policyholder pays, and
+ * the WAITING PERIOD before coverage vests. It must never touch `payoutRatio`,
+ * `deductible`, `cap`, `reserveFactor`, or any term of the solvency invariant.
+ *
+ * A reputation system that can lower reserves is a reputation system that can
+ * bankrupt the protocol by issuing points.
+ *
+ * THE DISCOUNT IS PAID FOR, NOT WAIVED
+ * ------------------------------------
+ * The capital pool always receives 60% of the NOTIONAL premium. The DAO
+ * treasury covers the discounted difference out of a capped annual incentive
+ * budget, and when that budget is exhausted the discount programme switches
+ * itself off with no vote required. Uncapped incentive programmes drain
+ * treasuries quietly; this one cannot.
+ *
+ * WHY WAITING-PERIOD RELIEF IS RESTRICTED HARDER THAN FEE RELIEF
+ * --------------------------------------------------------------
+ * A fee discount only costs revenue, which is budgeted for. Shortening the
+ * vesting curve directly increases ADVERSE SELECTION, because that curve is
+ * the barrier stopping someone whose origin wallet is already compromised from
+ * buying cover and claiming immediately. Hence a hard 30-day floor, and only
+ * for Group A assets, where valuation data is strongest.
+ *
+ * SOULBOUND AND DECAYING
+ * ----------------------
+ * Transferable reputation is just a market in reputation, and the risk signal
+ * it was meant to carry becomes noise. Reputation also decays: it describes a
+ * current state, not a permanent medal, and decay prevents farming points once
+ * and exploiting them forever.
+ */
+interface IRepScore {
+    /// Where a score change came from, for auditability of the incentive budget.
+    enum PointSource {
+        PolicyMatured,
+        PremiumPaid,
+        JurorCoherent,
+        VeArkLock,
+        CommunityContribution,
+        FraudulentClaim,
+        SlashedAsJuror,
+        SlashedAsAttester,
+        ForfeitedQipBond
+    }
+
+    event PointsCredited(address indexed account, PointSource indexed source, uint256 amount, uint256 newScore);
+    event PointsDebited(address indexed account, PointSource indexed source, uint256 amount, uint256 newScore);
+    event Decayed(address indexed account, uint256 removed, uint256 newScore);
+    event SourceAuthorized(address indexed source, bool allowed);
+
+    /// Only an authorised contract may credit or debit points.
+    error UnauthorizedSource(address caller);
+
+    /// RepScore is soulbound; there is no transfer path.
+    error NonTransferable();
+
+    /// A benefit was requested beyond the hard cap governance may not exceed.
+    error BenefitExceedsCap(uint16 requestedBps, uint16 capBps);
+
+    /// The annual incentive budget is exhausted; discounts are paused.
+    error DiscountBudgetExhausted(uint256 remaining, uint256 requested);
+
+    /// Maximum premium discount, in bps. Hard cap: governance cannot raise it past this.
+    function MAX_DISCOUNT_BPS() external view returns (uint16);
+
+    /**
+     * Largest share of one account's score that community contribution may
+     * supply, in bps. Hard cap: 4000 (40%).
+     *
+     * @dev Without this, writing enough posts and running enough bots earns the
+     *      same discount as years of paid policies and a long veARK lock. A fee
+     *      discount is real money out of the treasury, so it has to track risk —
+     *      and risk correlates with HAVING SOMETHING TO LOSE, not with volume of
+     *      contribution. Excess is truncated at aggregation, never banked.
+     */
+    function MAX_CONTRIBUTION_SHARE_BPS() external view returns (uint16);
+
+    /// Hard floor on the vesting period in days, regardless of score.
+    function MIN_VESTING_DAYS() external view returns (uint16);
+
+    /// Default vesting period in days, applied at zero reputation.
+    function DEFAULT_VESTING_DAYS() external view returns (uint16);
+
+    /// @param account The account being queried.
+    /// @return The current, decay-adjusted score.
+    function scoreOf(address account) external view returns (uint256);
+
+    /**
+     * The premium discount this account currently earns.
+     *
+     * @param account The prospective policyholder.
+     * @return discountBps Discount in basis points, never above `MAX_DISCOUNT_BPS`.
+     */
+    function discountBps(address account) external view returns (uint16 discountBps);
+
+    /**
+     * The vesting period this account gets for a given asset group.
+     *
+     * @dev Relief applies only to Group A. For Groups B and C this returns
+     *      `DEFAULT_VESTING_DAYS` no matter how high the score is.
+     * @param account The prospective policyholder.
+     * @param assetGroup The asset group as classified by IAssetRegistry.
+     * @return days_ Effective vesting period, never below `MIN_VESTING_DAYS`.
+     */
+    function effectiveVestingDays(address account, uint8 assetGroup) external view returns (uint16 days_);
+
+    /**
+     * Credits points from an authorised source.
+     *
+     * @dev Policy-derived points are proportional to PREMIUM PAID, not to the
+     *      number of policies, so minting many tiny policies farms nothing.
+     * @param account The account being credited.
+     * @param source Origin of the points, recorded for audit.
+     * @param amount Points to add.
+     */
+    function creditPoints(address account, PointSource source, uint256 amount) external;
+
+    /// @notice Debits points from an authorised source, for example after a proven fraud.
+    function debitPoints(address account, PointSource source, uint256 amount) external;
+
+    /**
+     * Remaining discount budget for the current period.
+     *
+     * @return remaining QRL still available to subsidise discounts before the
+     *         programme pauses itself.
+     */
+    function discountBudgetRemaining() external view returns (uint256 remaining);
+}

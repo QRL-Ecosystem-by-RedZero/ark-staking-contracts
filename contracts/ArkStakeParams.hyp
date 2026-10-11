@@ -1,0 +1,1239 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./interfaces/IArkStakeParams.hyp";
+import "./ArkStakeParamsChecks.hyp";
+import "./utils/ArkStakeMath.hyp";
+import "./utils/ArkEpoch.hyp";
+import "./utils/QuantumErrors.hyp";
+
+/**
+ * The governable parameters of Ark Staking, and the threat stage.
+ *
+ * The one rule this contract exists to enforce: **a vote outside a range, or a
+ * pair of parameters outside a relation of the nine of whitepaper §6.3, does
+ * not execute** (G1). See IArkStakeParams for why the set is one contract.
+ *
+ * THE GOVERNANCE SIDE (ArkGovernance-Design.md §6.1 - §6.4, 2026-09-28)
+ * ---------------------------------------------------------------------
+ * `governance` is meant to be `ArkTimelock` in contracts/core, which computes
+ * each operation's delay from its payload and bounds a value-transfer key's
+ * step (G2). Nothing here trusts that it is: every rule below holds whoever
+ * governance is (design N2).
+ *
+ *  - Keyed diffs, compare-and-swap (`setParamsDiff`, design §6.2). A change
+ *    names the value it replaces, so two proposals queued in parallel cannot
+ *    silently undo each other: the second one's `expected` is stale. The
+ *    comparison is against the LATEST STAGED value, not only the value in
+ *    force: two diffs executed in one epoch both wait for the same boundary,
+ *    and comparing the second against the value in force would let it land
+ *    on top of the first and erase it. Every change goes into a draft and
+ *    every range and relation is checked on the whole draft, so a diff of one
+ *    key is refused where it breaks a relation with a key it does not touch.
+ *  - Epoch-effective, never retroactive (design §6.4, G8). An executed diff or
+ *    stage vote is staged for the first epoch that starts after it; `params()`,
+ *    `bondParams()`, `threatStage()` and `sigmaTargetBps()` return what is in
+ *    force for the current epoch, applying a staged change lazily in the views
+ *    as well, so no consumer sees a figure move in the middle of an epoch.
+ *  - The threat stage names the stage it moves from, moves one step, and at
+ *    most once per epoch (`lastStageEpoch`, audit D9; design §6.3, G9).
+ *  - A value-transfer key moves at most a quarter of its governable range per
+ *    change (design §6.9, decision D7): the quarter the timelock's table
+ *    holds, checked again here as a second, independent layer.
+ *
+ * THE ECOSYSTEM PHASE (QuantumArk-Phases.md §3-4; staking CLAUDE.md item 129)
+ * -----------------------------------------------------------------------------
+ * Since 2026-10-07 the threat stage is not voted on its own: it is derived
+ * from the phase `arkPhase` (contracts/core's `ArkPhase`) reports,
+ * `STAGE_OF_PHASE = [1, 1, 2*, 4, 1]`. In phase 2 (Classical Sunset) the
+ * stage is a band, 2 or 3, which `setThreatStage` moves under every rule it
+ * had (one step per epoch, `fromStage` bound, in force from the next epoch);
+ * each entry into phase 2 starts at 2. Three fields vary with the phase and
+ * are kept as five rows (`PhaseRow`): the admitted terms and the Cushion's
+ * target and ceiling. Each row is checked at construction and on every diff;
+ * a cell moves by its own key (field name, an at sign, phase digit:
+ * `_rowCell`), with the CAS, the step and the next-epoch effect of every
+ * other key. One phase vote in core therefore
+ * moves the stage and all three fields at one boundary.
+ *
+ * The phase is read per epoch, by `phaseAt(epoch)` and never by `phase()`:
+ * the registry seals the stage into an epoch's allocation once, and the bond
+ * reads the stage of an epoch when it closes it, an epoch or more later
+ * (`runoffParamsAt`). One function of the epoch answers both, so the figure
+ * sealed for an epoch and the figure its close reads are the same figure.
+ * `phaseAt` applies core's Q-Day override (a ratified declaration reads as
+ * phase 3), so a declaration moves the stage to 4 in the epoch it is read in,
+ * without waiting for a boundary: the one change here that is not
+ * epoch-effective, and the one the bond already treats as immediate.
+ *
+ * The coupon-multiple bound of §4.5 is deliberately not checked here: it
+ * constrains the pair (`att_eff`, `sigma_t`), and `att_eff` moves with the
+ * measured concentration of the book without any parameter changing, so a
+ * check at a vote would pass and then cease to hold. The registry enforces it
+ * where the premium is computed, by reducing the indemnity.
+ */
+contract ArkStakeParams is IArkStakeParams {
+    /**
+     * The ceiling on the per-epoch release bound: the origin-chain escrow's
+     * `RELEASE_BOUND_BPS`, which is a constant there.
+     *
+     * The escrow is the leg that actually moves the asset, so the bound that
+     * binds is the escrow's; this parameter enters the exit parity of invariant
+     * I25. A vote raising it above the escrow's would let the ladder admit a
+     * faster run-off of bond principal than the anchored book can actually
+     * leave at — the asymmetry the parity closes. Widening the exit is a
+     * redeployment of the escrow and a vote here, together.
+     * `test/ArkStakeSpec.test.js` reads both figures out of the two sources.
+     */
+    uint16 public constant MAX_RELEASE_BOUND_BPS = 2500;
+
+    /*
+     * The quarter of each value-transfer key's governable range (design §6.8,
+     * §6.9, decision D7). Each division truncates, so a step is never wider
+     * than a quarter: the residual favours the side the vote would move value
+     * away from. Where a bound is relational (the rungs of the ladder, D_0) the
+     * outer bound of whitepaper §6.3 is used, as contracts/core's
+     * `ArkGovTables` does; `test/ArkStakeGovernance.test.js` holds the two equal.
+     */
+    uint256 private constant STEP_LADDER = uint256(4000 - 1850) / 4; // 537
+    uint256 private constant STEP_INDEMNITY = uint256(10000 - 5000) / 4; // 1,250
+    uint256 private constant STEP_PML_FLOOR = uint256(5000 - 1500) / 4; // 875
+    uint256 private constant STEP_JUNIOR_THICKNESS = uint256(9000 - 5000) / 4; // 1,000
+    uint256 private constant STEP_SENIOR_COUPON = uint256(500 - 0) / 4; // 125
+    uint256 private constant STEP_D0 = uint256(10000 - 5000) / 4; // 1,250: the bottom of S_floor's range to BPS
+    uint256 private constant STEP_SEVERITY_FLOOR = uint256(8000 - 5000) / 4; // 750
+    uint256 private constant STEP_VERDICT_COVER = uint256(8000 - 3333) / 4; // 1,166
+    // The keys added to the list on 2026-09-30 (EC-06; PV-05, PV-19): the
+    // model's `VALUE_TRANSFER_KEYS`, thirty-nine in all with the eleven above.
+    uint256 private constant STEP_SLOPE_RATIO = uint256(10000 - 2500) / 4; // 1,875
+    uint256 private constant STEP_CEILING = uint256(9500 - 1850) / 4; // 1,912
+    uint256 private constant STEP_SURGE = uint256(8750 - 1850) / 4; // 1,725
+    uint256 private constant STEP_LEVY = uint256(500 - 100) / 4; // 100: also the tail-premium floor
+    uint256 private constant STEP_COMMIT_TERM = uint256(26 - 4) / 4; // 5
+    uint256 private constant STEP_PSR_CAP = uint256(12 - 2) / 4; // 2: also unsoldEpochs
+    uint256 private constant STEP_EPOCH_MOVE = uint256(3000 - 1500) / 4; // 375
+    uint256 private constant STEP_FIRST_DISCOUNT = uint256(500 - 300) / 4; // 50: also the solver bond floor
+    uint256 private constant STEP_RESERVE_STEP = uint256(1000 - 250) / 4; // 187: also the operations share
+    uint256 private constant STEP_RESERVE_FLOOR = uint256(6000 - 2500) / 4; // 875: also the run-off trigger
+    uint256 private constant STEP_CLEARING = uint256(7500 - 2500) / 4; // 1,250: also the juror-fee fraction
+    uint256 private constant STEP_BOND_CEILING = uint256(1500 - 500) / 4; // 250: also the queue decay, the run-off bound
+    uint256 private constant STEP_EXPOSURE_FLOOR = uint256(5000 - 2000) / 4; // 750: also h_max
+    uint256 private constant STEP_WINDOW = uint256(6 - 2) / 4; // 1
+    uint256 private constant STEP_BUFFER = uint256(1500 - 250) / 4; // 312: the share and its escalator cap
+    uint256 private constant STEP_RAMP = uint256(2000 - 500) / 4; // 375
+    uint256 private constant STEP_BATCH = uint256(100 - 0) / 4; // 25
+    uint256 private constant STEP_CLAIM_COST = uint256(10000000 - 0) / 4; // 2,500,000
+    // The Cushion's two keys, 2026-10-06 (technical reference §3.3): forty-one in all.
+    // Per phase since 2026-10-07 (item 129): the step of each phase's cell.
+    uint256 private constant STEP_CUSHION_TARGET = uint256(2000 - 0) / 4; // 500
+    uint256 private constant STEP_CUSHION_CEILING = uint256(3000 - 0) / 4; // 750
+
+    /// keccak256("claimCostGwei"): the one field wider than sixteen bits (`setParamsDiff`).
+    bytes32 private constant K_CLAIM_COST = 0xe1bba42e4184aca99c045f879a68aef003a85e1657d9373b119318f4c5b970b1;
+
+    /**
+     * The threat stage of each ecosystem phase (QuantumArk-Phases.md §4),
+     * byte p for phase p: [1, 1, 2, 4, 1]. Phase 2's byte is where its band
+     * starts; `setThreatStage` moves the band to 3 and back. A constant, so
+     * no vote can map a phase to another stage: what a phase means for the
+     * price is compiled, and only which phase is in force is governed.
+     */
+    uint256 private constant STAGE_OF_PHASE = 0x0104020101;
+
+    /// Phases 0 - 4. A phase contract reporting another index is refused (`UnknownPhase`).
+    uint256 private constant PHASES = 5;
+
+    /// The phase whose stage is a band, and the band's two stages.
+    uint8 private constant BAND_PHASE = 2;
+    uint8 private constant BAND_LOW = 2;
+    uint8 private constant BAND_HIGH = 3;
+
+    /// Storage, not immutable, since 2026-09-27: see `IGovernanceHandover`.
+    address public governance;
+    address public pendingGovernance;
+    address private immutable _deployer;
+
+    /**
+     * The ranges and relations (`_check`): a module this contract created at
+     * construction, CREATE nonce 1 (staking CLAUDE.md item 128). No setter.
+     */
+    address private immutable CHECKS_MODULE;
+
+    /**
+     * The ecosystem phase (contracts/core's `ArkPhase`): the stage and the
+     * row of each epoch are its phase's. Fixed at construction, no setter: a
+     * re-pointable phase source would let its holder pick the price of cover.
+     */
+    IArkPhase public immutable arkPhase;
+
+    /// The registry whose admitted assets bound the release bound from below. Set once; ends construction.
+    IArkStakeAdmissions public registry;
+
+    /**
+     * Three banks, in rotation: `_bank[_live]` is the set last recorded as in
+     * force; the next (`_next()`) holds a staged diff while `_pendingEpoch` is
+     * non-zero; the one after holds the set in force before `_liveSince`. A
+     * staged set comes into force by advancing `_live`, so no whole set is
+     * ever copied in storage, and staging writes the oldest bank, never the
+     * set in force before the live one: with two banks a diff executed in the
+     * epoch the previous one took effect overwrote the set the bond was still
+     * to close the epoch before at (OC-LEGB-05, G8).
+     */
+    Params[3] private _bank;
+    uint8 private _live;
+    /// The epoch from which the next bank is in force; zero when nothing is staged.
+    uint256 private _pendingEpoch;
+
+    /**
+     * The band of phase 2 last recorded as in force, 2 or 3 (item 129; the
+     * stage itself is the phase's). Launches at 2. With `_stageSince`, the
+     * epoch it took effect from: a band value recorded before the phase in
+     * force began belongs to an earlier stay in phase 2 and reads as 2.
+     */
+    uint8 private _stage;
+    uint8 private _pendingStage;
+    uint256 private _pendingStageEpoch;
+
+    /// @inheritdoc IArkStakeParams
+    uint256 public lastStageEpoch;
+
+    /**
+     * The epoch from which `_bank[_live]` has been in force, written when a
+     * staged set is recorded as in force (G8). Before it, the other bank held
+     * the set in force until the next diff overwrites it.
+     */
+    uint256 private _liveSince;
+
+    /**
+     * The band in force before `_stage`, and the epoch `_stage` took effect
+     * from (phase C3, G8): the run-off gate reads the stage in force in the
+     * epoch it observes, which it closes an epoch or more later. Written when
+     * a staged step is recorded as in force, as `_liveSince` is.
+     */
+    uint8 private _prevStage;
+    uint256 private _stageSince;
+
+    /**
+     * The successor states admitted per origin chain, in admission order
+     * (whitepaper §5.4, I36), and each one's one-based place in it.
+     */
+    mapping(uint256 => uint256) private _successorCount;
+    mapping(bytes32 => uint256) private _successorIndex;
+
+    /// The epoch `_prevStage` took effect from (item 129), appended so every earlier slot keeps its place.
+    uint256 private _prevStageSince;
+
+    /**
+     * The five phase rows of each bank, packed (item 129): `_rows[i]` goes
+     * with `_bank[i]` and rotates with it, so a diff stages rows and set
+     * together and one `_pendingEpoch` brings both into force. The cell of
+     * field f (0 `admittedTermsMask`, 1 `cushionTargetBps`, 2
+     * `cushionCeilingBps`) of phase p is the sixteen bits from bit
+     * 16 x (3p + f), the layout `ArkStakeParamsChecks.check` reads.
+     */
+    uint256[3] private _rows;
+
+    /**
+     * `initial` is the set the product launches with, written by the deployer
+     * at construction and nowhere else (design §6.2: the whole-set setter is
+     * gone, because a whole-set write lets a proposal queued behind another
+     * restore every key the first one changed). A zero first rung — outside
+     * its range, so never a set anyone could mean — stands for the reference
+     * values of whitepaper chapter 6 below. Either way the set passes every
+     * range and relation before it is written.
+     *
+     * `deployer_` is the account that names the registry: the parameter set
+     * crosses the single-request ceiling of CLAUDE.md §3.1 since 2026-09-28,
+     * and created through `ChunkedDeployer` its `msg.sender` would be that
+     * contract, which can make no call with the right.
+     *
+     * `phase_` is the ecosystem phase (item 129), refused where it counts
+     * epochs of another length than `ArkEpoch`. `rows` are the five phase
+     * rows; a zero mask in row 0 — outside its range, the same sentinel as
+     * the first rung — stands for the reference rows below. The three
+     * per-phase fields of `initial` are not read. Appended after `initial`,
+     * so the launch set keeps its place in the constructor's inputs.
+     */
+    constructor(address governance_, address deployer_, Params memory initial, address phase_, PhaseRow[5] memory rows) {
+        if (governance_ == address(0) || deployer_ == address(0) || phase_ == address(0)) revert ZeroAddress();
+        governance = governance_;
+        _deployer = deployer_;
+        address checks = address(new ArkStakeParamsChecks());
+        CHECKS_MODULE = checks;
+        uint256 len = IArkPhase(phase_).epochLength();
+        if (len != ArkEpoch.EPOCH_LENGTH) revert PhaseEpochMismatch(len, ArkEpoch.EPOCH_LENGTH);
+        arkPhase = IArkPhase(phase_);
+        if (initial.threatStage1Bps == 0) initial = _reference();
+        if (rows[0].admittedTermsMask == 0) rows = _referenceRows();
+        uint256 packed;
+        for (uint256 i = 0; i < PHASES; i++) {
+            packed |= (uint256(rows[i].admittedTermsMask)
+                | (uint256(rows[i].cushionTargetBps) << 16)
+                | (uint256(rows[i].cushionCeilingBps) << 32)) << (48 * i);
+        }
+        _check(checks, initial, packed);
+        _bank[0] = initial;
+        _rows[0] = packed;
+        _stage = BAND_LOW;
+        _prevStage = BAND_LOW;
+        emit ParamsSet(initial);
+        emit PhaseRowsSet(rows);
+    }
+
+    /**
+     * The reference rows of QuantumArk-Phases.md §4, the deployment profile
+     * on every network (spec, testnet, rapid): rows 0, 1 and 4 are the flat
+     * values of 2026-10-06 (every term, c_tgt 500, c_max 1,500); phase 2
+     * closes the three-year term (a position opened from 2030 matures in the
+     * disallowed range) and doubles the Cushion's target; phase 3 admits no
+     * new principal and carries the Cushion at its ceiling's top.
+     */
+    function _referenceRows() private pure returns (PhaseRow[5] memory r) {
+        r[0] = PhaseRow({admittedTermsMask: 7, cushionTargetBps: 500, cushionCeilingBps: 1500});
+        r[1] = PhaseRow({admittedTermsMask: 7, cushionTargetBps: 500, cushionCeilingBps: 1500});
+        r[2] = PhaseRow({admittedTermsMask: 3, cushionTargetBps: 1000, cushionCeilingBps: 2000});
+        r[3] = PhaseRow({admittedTermsMask: 0, cushionTargetBps: 1500, cushionCeilingBps: 3000});
+        r[4] = PhaseRow({admittedTermsMask: 7, cushionTargetBps: 500, cushionCeilingBps: 1500});
+    }
+
+    /**
+     * The reference values of whitepaper chapter 6. Each satisfies its range
+     * and every relation, which the constructor checks, and
+     * `test/ArkStakeSpec.test.js` holds them to ARK_STAKING.
+     */
+    function _reference() private pure returns (Params memory) {
+        return Params({
+            threatStage1Bps: 1850,
+            threatStage2Bps: 2500,
+            threatStage3Bps: 3000,
+            threatStage4Bps: 3700,
+            // A ratio of the stage's target share since 2026-09-30 (EC-07):
+            // 1,850 at the fourth stage, the absolute slope it replaced.
+            premiumSlopeRatioBps: 5000,
+            premiumCeilingBps: 7400,
+            surgeCeilingBps: 8500,
+            tailPremiumFloorBps: 200,
+            indemnityBps: 10000,
+            pmlFloorBps: 2000,
+            maxAssetShareBps: 2000,
+            bufferBps: 250,
+            operationsBps: 250,
+            jurorFeeShareBps: 2000,
+            maxEpochMoveBps: 2500,
+            fxHaircutMaxBps: 2500,
+            fxWindowDays: 90,
+            releaseBoundBps: 2500,
+            maturityLadderBps: 1428,
+            runoffTriggerBps: 2500,
+            runoffBoundBps: 2000,
+            juniorThicknessBps: 7000,
+            // 100 since the 2026-09-26 revision: senior's trigger-2 exposure is
+            // partial under the progressive settlement of whitepaper 4.6, and
+            // the 100 bps surrendered reach junior through the residual.
+            seniorCouponBps: 100,
+            reserveStepBps: 500,
+            reserveFloorBps: 5000,
+            clearingFloorBps: 5000,
+            // Seven since the first-offering rung (EC-03): 2 + ceil((5,000 - 2,500) / 500).
+            unsoldEpochs: 7,
+            graceEpochs: 2,
+            validatorConcentrationBps: 1000,
+            exitDeadlineEpochs: 2,
+            operatorBondBps: 1000,
+            rewardRateCapBps: 1000,
+            // The 2026-09-26 remediation revision (whitepaper §4.2, §4.4, §4.6,
+            // §5.3, §6.2) and the 2026-09-27 triage (the kappa range).
+            stabilizationLevyBps: 200,
+            commitmentTermEpochs: 13,
+            psrCapEpochs: 6,
+            trigger2FloorBps: 6000,
+            severityFloorBps: 6000,
+            assessmentWindowEpochs: 4,
+            queueDecayBps: 1500,
+            queueExposureFloorBps: 2500,
+            jurorSlashBps: 3000,
+            verdictCoverBps: 6666,
+            // Keys of the timelock's table that were not fields until
+            // 2026-09-28 (phase C1b; design §6.2).
+            bufferEscalatorCapBps: 1500,
+            solverBondCeilingBps: 750,
+            solverBondFloorBps: 150,
+            successorLimit: 3,
+            challengeWindowDays: 7,
+            evidenceDays: 3,
+            commitDays: 2,
+            revealDays: 1,
+            appealDays: 2,
+            // Every term of the fixed set (phase C3; whitepaper §6.3). This and
+            // the Cushion's two fields are row 0's values, kept so the set
+            // reads whole; the rows are what is used (item 129).
+            admittedTermsMask: 7,
+            // The papers' EC revision, 2026-09-30 (whitepaper §4.2, §4.7, §6.3).
+            firstReserveDiscountBps: 400,
+            offeringBatchMultiple: 50,
+            claimCostGwei: 600000,
+            bufferRampThresholdBps: 1000,
+            // The Cushion, 2026-10-06 (yellow paper §4.5; technical reference §3.2).
+            cushionTargetBps: 500,
+            cushionCeilingBps: 1500
+        });
+    }
+
+    modifier onlyGovernance() {
+        if (msg.sender != governance) revert OnlyGovernance(msg.sender);
+        _;
+    }
+
+    /// @inheritdoc IGovernanceHandover
+    function proposeGovernance(address next) external onlyGovernance {
+        pendingGovernance = next;
+        emit GovernanceProposed(governance, next);
+    }
+
+    /// @inheritdoc IGovernanceHandover
+    function acceptGovernance() external {
+        address next = pendingGovernance;
+        // `next != 0` is implied: the zero address sends no transaction.
+        if (msg.sender != next) revert NotPendingGovernance(msg.sender);
+        emit GovernanceTransferred(governance, next);
+        governance = next;
+        pendingGovernance = address(0);
+    }
+
+    /**
+     * Name the registry. One-shot, deployer only, and the end of construction.
+     *
+     * The registry is read for one figure — the widest exit bound an admitted
+     * asset published — and a re-pointable source for it would let whoever
+     * held the key lower the floor under the release bound. Until it is named
+     * the floor is zero, which is right for a book with no admitted asset.
+     */
+    function setRegistry(address registry_) external {
+        if (msg.sender != _deployer) revert OnlyDeployer(msg.sender);
+        if (address(registry) != address(0)) revert AlreadySet(address(registry));
+        if (registry_ == address(0)) revert ZeroAddress();
+        registry = IArkStakeAdmissions(registry_);
+        emit RegistrySet(registry_);
+    }
+
+    /**
+     * Apply a keyed diff, compare-and-swap on each key, in force from the next
+     * epoch boundary. Design §6.2, §6.4; whitepaper §6.3.
+     *
+     * Each change names, as `expected`, the value its key holds in the latest
+     * staged set (`paramOf`); a value-transfer key moves at most its step from
+     * the value IN FORCE (re-audit 2026-09-30, SWAPGOV-04; GV-01); and every
+     * range and relation is checked on the whole draft. Without the
+     * draft-wide check a diff of one key could break a relation with a key it
+     * does not name; with `expected` compared with the value in force instead
+     * of the staged one, the second of two diffs executed in one epoch would
+     * erase the first. The step is the other way round: measured from the
+     * staged value, two diffs executed in one epoch each moved a full step
+     * and together two; measured from the value in force they move one step
+     * between them at most (core's timelock also queues one operation per key).
+     *
+     * A phase-row cell (its field name, an at sign and its phase digit; item
+     * 129) is one more key: its `expected` is the latest staged cell, its
+     * step is the flat field's, measured from the cell in force, and all five
+     * rows are checked with the set. The rows are staged with the set whatever the diff touches,
+     * so the bank and its rows always come into force together.
+     */
+    function setParamsDiff(ParamChange[] calldata changes) external onlyGovernance {
+        uint256 n = changes.length;
+        if (n == 0) revert EmptyDiff();
+        _settleParams();
+
+        Params memory d = _load(true);
+        Params memory f = _load(false);
+        uint256 rd = _latestRows();
+        uint256 rf = _rowsInForce();
+        uint256 effective = ArkEpoch.current() + 1;
+        for (uint256 i = 0; i < n; i++) {
+            bytes32 k = changes[i].key;
+            for (uint256 j = 0; j < i; j++) {
+                if (changes[j].key == k) revert DuplicateParameter(k);
+            }
+            uint256 value = changes[i].value;
+            // Checked before `_swap` narrows it: a wide value truncated into a
+            // field could land inside its range. Every field is sixteen bits
+            // but the claim cost, thirty-two; every row cell is sixteen.
+            if (value > (k == K_CLAIM_COST ? type(uint32).max : type(uint16).max)) {
+                revert ParameterValueTooLarge(k, value);
+            }
+            uint256 old;
+            uint256 step;
+            uint256 cur;
+            uint256 cell = _rowCell(k);
+            if (cell < 3 * PHASES) {
+                uint256 at = 16 * cell;
+                old = (rd >> at) & 0xffff;
+                rd = (rd & ~(uint256(0xffff) << at)) | (value << at);
+                cur = (rf >> at) & 0xffff;
+                // The mask has no step; the Cushion's two take the flat keys'.
+                uint256 field = cell % 3;
+                step = field == 0 ? 0 : (field == 1 ? STEP_CUSHION_TARGET : STEP_CUSHION_CEILING);
+            } else {
+                (old, step) = _swap(d, k, value);
+                // The value in force, read by the same switch on a copy.
+                if (step != 0) (cur,) = _swap(f, k, value);
+            }
+            if (old != changes[i].expected) revert StaleParameter(k, changes[i].expected, old);
+            if (step != 0) {
+                uint256 moved = value > cur ? value - cur : cur - value;
+                if (moved > step) revert ParameterStepTooLarge(k, cur, value, step);
+            }
+            emit ParamChangeStaged(k, old, value, effective);
+        }
+        _check(CHECKS_MODULE, d, rd);
+        _bank[_next()] = d;
+        _rows[_next()] = rd;
+        _pendingEpoch = effective;
+    }
+
+    /**
+     * The cell of a phase-row key, 3p + f (item 129), or 15 for any other key.
+     * `k` is keccak256 of the field name, an at sign and the phase digit,
+     * written out as literals as `_swap`'s are; the suite recomputes each.
+     */
+    function _rowCell(bytes32 k) private pure returns (uint256) {
+        if (k == 0x622d84e344c6357d6b8302b0fcae104aff28b288e903ed5232a9b773b9bea23b) return 0; // admittedTermsMask@0
+        if (k == 0xd8698d2e7b878573490ad597974fc676e66123907058c5e65106060f86d5a8ae) return 1; // cushionTargetBps@0
+        if (k == 0x22abdc454f92d624547f11dfa11bf8fcf5eb14066af439e3be66ad34ef2633c4) return 2; // cushionCeilingBps@0
+        if (k == 0x0856ec835cf7456e9fc463820f6d9889aa87daeb1cb4f2ef996ae64ff5ca694e) return 3; // admittedTermsMask@1
+        if (k == 0xc47f4bf6c5748e6a1d18ffa079cc5d5734ddfdcc9059bb34db2f83d6d42eaa99) return 4; // cushionTargetBps@1
+        if (k == 0x87f5b343d0464b2facbdeaef784d5714f0393931e98822425acea92e7a838d3d) return 5; // cushionCeilingBps@1
+        if (k == 0xcfe5d7160138607c6ba7fc3af9a71f360c79005381b0a351ac222c1252f1ec02) return 6; // admittedTermsMask@2
+        if (k == 0x7f8303b138265b740cba5705721c9c46750aacd3c4a71d066f63afabb9ec852b) return 7; // cushionTargetBps@2
+        if (k == 0x864c66d18c26e83686706cf99dade0275e888a5e55c762d8e279bc1876a43a09) return 8; // cushionCeilingBps@2
+        if (k == 0x65d4a0b5d4292c5621e2e3772b422534082174509547d6f05fb816d3897b7459) return 9; // admittedTermsMask@3
+        if (k == 0x36c753576b6b1b365965ba0072e725e7b459bab7cf5400d8bae2c724f6ee5619) return 10; // cushionTargetBps@3
+        if (k == 0x3dad9f6468e530cbbe4d06dbda44c73d92cf065ee046331b36133a0698363163) return 11; // cushionCeilingBps@3
+        if (k == 0x0d6a226b5e530929fa3504a3e7ea2bfa35c415a6de9c5a01425d76d471b79d4d) return 12; // admittedTermsMask@4
+        if (k == 0x9dcbe906c19e6d875331133d9d45013daa05932b466070514ebd200bdff15db4) return 13; // cushionTargetBps@4
+        if (k == 0x30e77738852c1a938d236d85364920c4acd3cfbadd6389ffdcbcb00641c8d848) return 14; // cushionCeilingBps@4
+        return 3 * PHASES;
+    }
+
+    /// @inheritdoc IArkStakeParams
+    function params() external view returns (Params memory p) {
+        p = _load(false);
+        _fillRow(p, _rowsInForce());
+    }
+
+    /**
+     * Write the row of the phase in force into the three per-phase fields of
+     * a set read out of a bank, whose own copies of them are never read.
+     */
+    function _fillRow(Params memory p, uint256 rows) private view {
+        PhaseRow memory r = _row(rows, _phaseNow());
+        p.admittedTermsMask = r.admittedTermsMask;
+        p.cushionTargetBps = r.cushionTargetBps;
+        p.cushionCeilingBps = r.cushionCeilingBps;
+    }
+
+    /// Row `ph` of a packed bank of rows.
+    function _row(uint256 rows, uint8 ph) private pure returns (PhaseRow memory r) {
+        if (ph >= PHASES) revert UnknownPhase(ph);
+        uint256 w = rows >> (48 * uint256(ph));
+        r.admittedTermsMask = uint16(w);
+        r.cushionTargetBps = uint16(w >> 16);
+        r.cushionCeilingBps = uint16(w >> 32);
+    }
+
+    /// @inheritdoc IArkStakeParams
+    function phaseRow(uint8 ph) external view returns (PhaseRow memory) {
+        return _row(_rowsInForce(), ph);
+    }
+
+    /// @inheritdoc IArkStakeParams
+    function registryParams() external view returns (RegistryParams memory r) {
+        Params storage p = _inForce();
+        r.threatStage1Bps = p.threatStage1Bps;
+        r.threatStage4Bps = p.threatStage4Bps;
+        r.premiumSlopeRatioBps = p.premiumSlopeRatioBps;
+        r.premiumCeilingBps = p.premiumCeilingBps;
+        r.surgeCeilingBps = p.surgeCeilingBps;
+        r.tailPremiumFloorBps = p.tailPremiumFloorBps;
+        r.indemnityBps = p.indemnityBps;
+        r.pmlFloorBps = p.pmlFloorBps;
+        r.maxAssetShareBps = p.maxAssetShareBps;
+        r.bufferBps = p.bufferBps;
+        r.bufferEscalatorCapBps = p.bufferEscalatorCapBps;
+        r.bufferRampThresholdBps = p.bufferRampThresholdBps;
+        r.operationsBps = p.operationsBps;
+        r.jurorFeeShareBps = p.jurorFeeShareBps;
+        r.maxEpochMoveBps = p.maxEpochMoveBps;
+        r.fxHaircutMaxBps = p.fxHaircutMaxBps;
+        r.fxWindowDays = p.fxWindowDays;
+        r.releaseBoundBps = p.releaseBoundBps;
+        r.stabilizationLevyBps = p.stabilizationLevyBps;
+        r.commitmentTermEpochs = p.commitmentTermEpochs;
+        r.psrCapEpochs = p.psrCapEpochs;
+    }
+
+    /// @inheritdoc IArkStakeParams
+    function swapParams() external view returns (SwapParams memory s) {
+        Params storage p = _inForce();
+        s.maxEpochMoveBps = p.maxEpochMoveBps;
+        s.firstReserveDiscountBps = p.firstReserveDiscountBps;
+        s.reserveStepBps = p.reserveStepBps;
+        s.reserveFloorBps = p.reserveFloorBps;
+        s.tailPremiumFloorBps = p.tailPremiumFloorBps;
+        s.clearingFloorBps = p.clearingFloorBps;
+        s.unsoldEpochs = p.unsoldEpochs;
+        s.solverBondCeilingBps = p.solverBondCeilingBps;
+        s.solverBondFloorBps = p.solverBondFloorBps;
+        s.operationsBps = p.operationsBps;
+        s.jurorFeeShareBps = p.jurorFeeShareBps;
+        s.offeringBatchMultiple = p.offeringBatchMultiple;
+        s.claimCostGwei = p.claimCostGwei;
+    }
+
+    /// @inheritdoc IArkStakeParams
+    function pendingParams() external view returns (Params memory staged, uint256 effectiveEpoch) {
+        staged = _load(true);
+        // The staged rows, at the phase in force now (item 129).
+        _fillRow(staged, _latestRows());
+        if (!_pendingDue()) effectiveEpoch = _pendingEpoch;
+    }
+
+    /// @inheritdoc IArkStakeParams
+    function paramOf(bytes32 key) external view returns (uint256 value) {
+        uint256 cell = _rowCell(key);
+        if (cell < 3 * PHASES) return (_latestRows() >> (16 * cell)) & 0xffff;
+        // `_swap` writes into a memory copy, dropped here.
+        (value,) = _swap(_load(true), key, 0);
+    }
+
+    /**
+     * The stated senior coupon in force in `epoch`, which may be past (G8):
+     * the coupon account fixes an epoch's rate when the bond closes it, which
+     * is always in a later epoch, so the rate in force at the close is the
+     * wrong one whenever a vote took effect at that boundary. Exact for any
+     * epoch since the set before the latest took effect, the third bank
+     * keeping it while a new diff is staged (OC-LEGB-05).
+     */
+    function seniorCouponBpsAt(uint256 epoch) external view returns (uint16) {
+        return _bankAt(epoch).seniorCouponBps;
+    }
+
+    /// @inheritdoc IArkStakeParams
+    function runoffParamsAt(uint256 epoch) external view returns (uint16, uint16, uint8, uint16, uint16) {
+        Params storage p = _bankAt(epoch);
+        return (p.runoffTriggerBps, p.runoffBoundBps, _stageAt(epoch), p.queueDecayBps, p.queueExposureFloorBps);
+    }
+
+    /// @inheritdoc IArkStakeParams
+    function admittedTermsMask() external view returns (uint16) {
+        return _row(_rowsInForce(), _phaseNow()).admittedTermsMask;
+    }
+
+    /// @inheritdoc IArkStakeParams
+    function trigger2Params() external view returns (uint16, uint16, uint16, uint16) {
+        Params storage p = _inForce();
+        return (p.trigger2FloorBps, p.severityFloorBps, p.assessmentWindowEpochs, p.maxEpochMoveBps);
+    }
+
+    /// @inheritdoc IArkStakeParams
+    function courtParams() external view returns (uint16, uint16, uint16, uint16, uint16, uint16, uint16) {
+        Params storage p = _inForce();
+        return (
+            p.verdictCoverBps,
+            p.jurorSlashBps,
+            p.challengeWindowDays,
+            p.evidenceDays,
+            p.commitDays,
+            p.revealDays,
+            p.appealDays
+        );
+    }
+
+    /**
+     * Admit a successor state (whitepaper §5.4, §6.3; yellow paper §4.3).
+     *
+     * The admission order IS the order the bond's one subrogation residual is
+     * applied in (I36), so it is recorded here, where the vote lands, and
+     * nowhere else. Append only: "replacing one follows the same procedure and
+     * resets no residual" (yellow paper §4.3), and a successor once admitted
+     * keeps its place, so no vote can reorder forks that have already begun to
+     * realise. The limit is the one in force at the admission (G8).
+     */
+    function admitSuccessor(uint256 chainId, bytes32 successorId) external onlyGovernance {
+        bytes32 k = keccak256(abi.encode(chainId, successorId));
+        if (successorId == bytes32(0) || _successorIndex[k] != 0) revert SuccessorNotAdmissible(chainId, successorId);
+        uint256 limit = _inForce().successorLimit;
+        uint256 n = _successorCount[chainId];
+        if (n >= limit) revert SuccessorLimitReached(chainId, limit);
+        _successorCount[chainId] = n + 1;
+        _successorIndex[k] = n + 1;
+        emit SuccessorAdmitted(chainId, successorId, n + 1);
+    }
+
+    /// @inheritdoc IArkStakeParams
+    function successorIndex(uint256 chainId, bytes32 successorId) external view returns (uint256) {
+        return _successorIndex[keccak256(abi.encode(chainId, successorId))];
+    }
+
+    /// @inheritdoc IArkStakeParams
+    function successorCount(uint256 chainId) external view returns (uint256) {
+        return _successorCount[chainId];
+    }
+
+    /// @inheritdoc IArkStakeParams
+    function bondParams()
+        external
+        view
+        returns (uint16, uint16, uint16, uint16, uint16, uint16, uint16, uint16)
+    {
+        Params storage p = _inForce();
+        // The Cushion's two from the row of the phase in force (item 129).
+        PhaseRow memory r = _row(_rowsInForce(), _phaseNow());
+        return (
+            p.maturityLadderBps,
+            p.runoffTriggerBps,
+            p.runoffBoundBps,
+            p.juniorThicknessBps,
+            p.seniorCouponBps,
+            p.tailPremiumFloorBps,
+            r.cushionTargetBps,
+            r.cushionCeilingBps
+        );
+    }
+
+    /**
+     * Vote the band of phase 2 one step, 2 -> 3 or 3 -> 2, from `fromStage`.
+     * Whitepaper §4.4; design §6.3; QuantumArk-Phases.md §4 (item 129).
+     *
+     * Since 2026-10-07 the stage is the ecosystem phase's, and this vote is
+     * the one optional step inside it: in Classical Sunset the stage may sit
+     * at 2 or 3 (the 2030 and 2033-2035 marks) without a change of phase. In
+     * any other phase it is refused (`StageFixedByPhase`): stage 1 and stage
+     * 4 are reached by moving the phase, which is core's vote.
+     *
+     * The stage is a decision about the threat and not an estimate of it, since
+     * no observable of the timing of the systemic event exists. One step per
+     * vote; the thirty-day delay is the timelock's. Each stage buys the
+     * indemnity §4.5 gives its value, so a lower stage is thinner cover at a
+     * lower price and not the same cover for less.
+     *
+     * At most one vote per epoch (audit 2026-09-27, D9). Checked first, so a
+     * second vote inside an epoch is refused as such whatever stage it names.
+     * The vote binds `fromStage`, so a proposal written against one stage
+     * cannot execute against another; it takes effect at the next epoch
+     * boundary. A band step that lands after the phase has left 2 changes
+     * nothing, and a later return to phase 2 starts at 2 again.
+     */
+    function setThreatStage(uint8 fromStage, uint8 toStage) external onlyGovernance {
+        _settleStage();
+        uint256 epoch = ArkEpoch.current();
+        // Epoch zero is 1970, so a zero `lastStageEpoch` reads as "never".
+        if (lastStageEpoch == epoch) revert ThreatStageAlreadyStepped(epoch);
+        uint8 ph = _phaseAt(epoch);
+        if (ph != BAND_PHASE) revert StageFixedByPhase(ph);
+        uint8 current = _stageAt(epoch);
+        if (current != fromStage) revert ThreatStageMismatch(current, fromStage);
+        if (toStage != (current == BAND_LOW ? BAND_HIGH : BAND_LOW)) revert ThreatStageStep(current, toStage);
+
+        lastStageEpoch = epoch;
+        _pendingStage = toStage;
+        _pendingStageEpoch = epoch + 1;
+        emit ThreatStageSet(current, toStage, epoch + 1);
+    }
+
+    /// @inheritdoc IArkStakeParams
+    function threatStage() public view returns (uint8) {
+        return _stageAt(ArkEpoch.current());
+    }
+
+    /// @inheritdoc IArkStakeParams
+    function pendingThreatStage() external view returns (uint8 stage, uint256 effectiveEpoch) {
+        return _pendingStep();
+    }
+
+    /**
+     * The stage a step on its way puts in force at the next boundary, and
+     * that boundary; (0, 0) when none would change the stage. A phase step
+     * pending in the phase contract decides it where there is one (a band
+     * staged for the same boundary is moot once the phase leaves 2, and a
+     * phase entering 2 starts its band at 2); otherwise a band step staged
+     * here, while the phase in force is 2.
+     */
+    function _pendingStep() private view returns (uint8 stage, uint256 effective) {
+        uint256 epoch = ArkEpoch.current();
+        (uint8 to, uint256 pe) = arkPhase.pendingPhase();
+        if (pe > epoch) {
+            stage = _stageOf(to);
+            effective = pe;
+        } else {
+            uint256 be = _pendingStageEpoch;
+            if (be <= epoch || _phaseAt(epoch) != BAND_PHASE) return (0, 0);
+            stage = _pendingStage;
+            effective = be;
+        }
+        if (stage == _stageAt(epoch)) return (0, 0);
+    }
+
+    /**
+     * @inheritdoc IArkStakeParams
+     * @dev A governance that is not a timelock (the deploying account before
+     *      the handover, a successor without the view) reads as nothing
+     *      queued, never as a revert of the allocation. A step queued in a
+     *      timelock not yet accepted as governance is seen from the acceptance.
+     *      The registry writes this flag into the epoch's allocation leaf,
+     *      which is sealed once per epoch root: a step scheduled during epoch
+     *      e reaches the escrow with the root of e + 1, so commitments made in
+     *      the rest of e still lock the old rung — a window of at most one
+     *      epoch, stated, not resealed (OC-LEGB-09).
+     */
+    function stageStepQueued() external view returns (bool) {
+        (uint8 next,) = _pendingStep();
+        if (next != 0) return true;
+        address g = governance;
+        if (g.code.length == 0) return false;
+        try IStageStepQueue(g).stageStepQueued() returns (bool q) {
+            return q;
+        } catch {
+            return false;
+        }
+    }
+
+    /// The target share in force: the ladder in force at the stage in force.
+    function sigmaTargetBps() public view returns (uint256) {
+        uint8 stage = threatStage();
+        Params storage p = _inForce();
+        if (stage == 1) return p.threatStage1Bps;
+        if (stage == 2) return p.threatStage2Bps;
+        if (stage == 3) return p.threatStage3Bps;
+        return p.threatStage4Bps;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The two banks                                                       */
+    /* ------------------------------------------------------------------ */
+
+    function _pendingDue() private view returns (bool) {
+        uint256 e = _pendingEpoch;
+        return e != 0 && ArkEpoch.current() >= e;
+    }
+
+    /// The set in force for the current epoch.
+    function _inForce() private view returns (Params storage) {
+        return _bank[_pendingDue() ? _next() : _live];
+    }
+
+    /// The bank after the live one: the staged set, or, once it is written, the oldest.
+    function _next() private view returns (uint256) {
+        return (uint256(_live) + 1) % 3;
+    }
+
+    /**
+     * The set in force IN `epoch`, which may be past (G8): the staged set
+     * from its epoch, the live set from `_liveSince`, and before it the set
+     * the live one replaced (OC-LEGB-05). Exact for any epoch since that set
+     * took effect; an older epoch reads it too.
+     */
+    function _bankAt(uint256 epoch) private view returns (Params storage) {
+        uint256 e = _pendingEpoch;
+        if (e != 0 && epoch >= e) return _bank[_next()];
+        return _bank[epoch >= _liveSince ? _live : (uint256(_live) + 2) % 3];
+    }
+
+    /**
+     * The stage in force IN `epoch`, past or present (G8): its phase's, and
+     * in phase 2 the band then in force (item 129). The band is the value
+     * staged for `epoch` or recorded in force at it, with `_bankAt`'s reach.
+     * A band value recorded before the phase now in force began belongs to an
+     * earlier stay in phase 2, so an epoch of the current stay reads it as 2:
+     * every entry into phase 2 starts at 2. For an epoch of an earlier stay
+     * the band recorded at it is read as it stands; only the run-off gate
+     * reads a past stage, and only as `stage >= 4`, which no band reaches.
+     */
+    function _stageAt(uint256 epoch) private view returns (uint8) {
+        uint8 ph = _phaseAt(epoch);
+        if (ph != BAND_PHASE) return _stageOf(ph);
+        uint8 band;
+        uint256 since;
+        uint256 e = _pendingStageEpoch;
+        if (e != 0 && epoch >= e) {
+            (band, since) = (_pendingStage, e);
+        } else if (epoch >= _stageSince) {
+            (band, since) = (_stage, _stageSince);
+        } else {
+            (band, since) = (_prevStage, _prevStageSince);
+        }
+        uint256 entered = arkPhase.phaseEnteredEpoch();
+        return epoch >= entered && since < entered ? BAND_LOW : band;
+    }
+
+    /// The stage a phase implies before any band step: `STAGE_OF_PHASE`.
+    function _stageOf(uint8 ph) private pure returns (uint8) {
+        if (ph >= PHASES) revert UnknownPhase(ph);
+        return uint8(STAGE_OF_PHASE >> (8 * uint256(ph)));
+    }
+
+    /**
+     * The phase in force IN `epoch`, refused outside 0 - 4. Read by epoch,
+     * never as `phase()`: see the contract's header.
+     */
+    function _phaseAt(uint256 epoch) private view returns (uint8 ph) {
+        ph = arkPhase.phaseAt(epoch);
+        if (ph >= PHASES) revert UnknownPhase(ph);
+    }
+
+    /// The phase in force for the current epoch: the row every view answers with.
+    function _phaseNow() private view returns (uint8) {
+        return _phaseAt(ArkEpoch.current());
+    }
+
+    /// The rows in force for the current epoch: `_inForce`'s bank's.
+    function _rowsInForce() private view returns (uint256) {
+        return _rows[_pendingDue() ? _next() : _live];
+    }
+
+    /// The latest staged rows: `_latest`'s bank's.
+    function _latestRows() private view returns (uint256) {
+        return _rows[_pendingEpoch != 0 ? _next() : _live];
+    }
+
+    /// The latest staged set: what a diff executed now is compared against and builds on.
+    function _latest() private view returns (Params storage) {
+        return _bank[_pendingEpoch != 0 ? _next() : _live];
+    }
+
+    /**
+     * The one place a whole set is copied out of storage: the legacy code
+     * generator writes a copy inline at every conversion, fifty-two fields
+     * each, and four of them cost more than the rest of the contract's views.
+     */
+    function _load(bool latest) private view returns (Params memory) {
+        return latest ? _latest() : _inForce();
+    }
+
+    /// Record a staged set whose epoch has come as the set in force.
+    function _settleParams() private {
+        if (_pendingDue()) {
+            _live = uint8(_next());
+            _liveSince = _pendingEpoch;
+            _pendingEpoch = 0;
+        }
+    }
+
+    function _settleStage() private {
+        uint256 e = _pendingStageEpoch;
+        if (e != 0 && ArkEpoch.current() >= e) {
+            _prevStage = _stage;
+            _prevStageSince = _stageSince;
+            _stage = _pendingStage;
+            _stageSince = e;
+            _pendingStageEpoch = 0;
+        }
+    }
+
+    /**
+     * Write `v` into the field of `d` whose key is `k`; return the value it
+     * replaced and the key's D7 step (zero for a key that is not a
+     * value-transfer key). `k = keccak256(bytes("<field name>"))`, written out
+     * as literals so no hash is computed on chain; each name is beside its
+     * hash and the suite recomputes every one. An unknown key reverts: there
+     * is no default field. `setParamsDiff` has bounded `v` to the field's
+     * width, so every narrowing below is exact.
+     *
+     * The step of every key of the model's `VALUE_TRANSFER_KEYS`, thirty-nine
+     * since 2026-09-30 (EC-06; PV-05, PV-19), is a quarter of its range there,
+     * rounded down; every other key takes none here.
+     */
+    function _swap(Params memory d, bytes32 k, uint256 v0) private pure returns (uint256 old, uint256 step) {
+        uint16 v = uint16(v0);
+        if (k == 0xbd501150b3262270f185103ac5694bd75bf0e012e001308773fc0f1be5420862) {
+            // threatStage1Bps
+            old = d.threatStage1Bps;
+            d.threatStage1Bps = v;
+            step = STEP_LADDER;
+        } else if (k == 0xba2a4e73712fe7ad28d7ca28485d3810e625e5b960b5c760fc0a96af711893ce) {
+            // threatStage2Bps
+            old = d.threatStage2Bps;
+            d.threatStage2Bps = v;
+            step = STEP_LADDER;
+        } else if (k == 0x2fcdbd233cd81b2f690249e85dad09ce182ec2d2d0cd8149e63e43cb04067486) {
+            // threatStage3Bps
+            old = d.threatStage3Bps;
+            d.threatStage3Bps = v;
+            step = STEP_LADDER;
+        } else if (k == 0xd6d65074381569e6b6f908e5da7aad1c3a4d98a1cec27ac103087764c6dbdf6f) {
+            // threatStage4Bps
+            old = d.threatStage4Bps;
+            d.threatStage4Bps = v;
+            step = STEP_LADDER;
+        } else if (k == 0xc50c02adbc4ac3c284395860b86a8d07138a36a913fc7f0832b71e3f2c6b8904) {
+            // premiumSlopeRatioBps
+            old = d.premiumSlopeRatioBps;
+            d.premiumSlopeRatioBps = v;
+            step = STEP_SLOPE_RATIO;
+        } else if (k == 0x45d102e34bfe1e80fa368f71920bb564e15582a405e09e6537ec778dc0247a4e) {
+            // premiumCeilingBps
+            old = d.premiumCeilingBps;
+            d.premiumCeilingBps = v;
+            step = STEP_CEILING;
+        } else if (k == 0x12986b47d1d7bd91fc1508f0dd4b2a0eb6cb4d51eed67a9483797a45856de0d9) {
+            // surgeCeilingBps
+            old = d.surgeCeilingBps;
+            d.surgeCeilingBps = v;
+            step = STEP_SURGE;
+        } else if (k == 0x55f92214b842e36d9b44f49ae1dfcfe80c42b2bff6a0f3cac8eba54e8fb513a7) {
+            // tailPremiumFloorBps
+            old = d.tailPremiumFloorBps;
+            d.tailPremiumFloorBps = v;
+            step = STEP_LEVY;
+        } else if (k == 0xf23634ea7a1fd0427a64c3ebe40c9ef7a7c906898ce89f884e694a871fd9a338) {
+            // indemnityBps
+            old = d.indemnityBps;
+            d.indemnityBps = v;
+            step = STEP_INDEMNITY;
+        } else if (k == 0x2d72d1347bbef1d66b6918e9d11b63b8ede1b5d99d864c32607612ae69321c6d) {
+            // pmlFloorBps
+            old = d.pmlFloorBps;
+            d.pmlFloorBps = v;
+            step = STEP_PML_FLOOR;
+        } else if (k == 0x7462cfa1c7aaa92012c203c98d1f5672fe21f386dab26a263e07b856d8d9af3d) {
+            // maxAssetShareBps
+            old = d.maxAssetShareBps;
+            d.maxAssetShareBps = v;
+        } else if (k == 0xcfe34c2b4bb75c8670b91c673a2f82935421f560d99633e0ce9b2ba39a11f5d4) {
+            // bufferBps
+            old = d.bufferBps;
+            d.bufferBps = v;
+            step = STEP_BUFFER;
+        } else if (k == 0x8fb3fa8a7e718a0f61d4bf2b454651b1dd9b0fdf59e265a3d01b76b31b50c488) {
+            // operationsBps
+            old = d.operationsBps;
+            d.operationsBps = v;
+            step = STEP_RESERVE_STEP;
+        } else if (k == 0x6f92b579facf135440f3e7b3cb494b4350800bb01a28ebf20d424b2a76a0c9d0) {
+            // jurorFeeShareBps
+            old = d.jurorFeeShareBps;
+            d.jurorFeeShareBps = v;
+            step = STEP_CLEARING;
+        } else if (k == 0x92622a8f9ce94f0460f12e1264ea2f7779fe2e563c01f9d64952a349138ee0e6) {
+            // maxEpochMoveBps
+            old = d.maxEpochMoveBps;
+            d.maxEpochMoveBps = v;
+            step = STEP_EPOCH_MOVE;
+        } else if (k == 0xd85141c5ef23caddbcdf4e91a22c5fcc5e4d60fdff6ea11ee6893df1882b0d55) {
+            // fxHaircutMaxBps
+            old = d.fxHaircutMaxBps;
+            d.fxHaircutMaxBps = v;
+            step = STEP_EXPOSURE_FLOOR;
+        } else if (k == 0x0a02324cc8f48db8c325532005d83c2b0f6e2e9b33013cb4a191badcbd7c3fd6) {
+            // fxWindowDays
+            old = d.fxWindowDays;
+            d.fxWindowDays = v;
+        } else if (k == 0xf0df7892f857ac937b2a281b86b9decf1ec360bd804361b1296afd994f950b2b) {
+            // releaseBoundBps
+            old = d.releaseBoundBps;
+            d.releaseBoundBps = v;
+        } else if (k == 0x386120d7c78ce21d0c632ad4aa03c7754e2797cb3a2b8aa468cb1501100eef8d) {
+            // maturityLadderBps
+            old = d.maturityLadderBps;
+            d.maturityLadderBps = v;
+        } else if (k == 0x37212800e1863bd3bb23300684852356785d769b5ee42175a4e4ab4b0fef55fc) {
+            // runoffTriggerBps
+            old = d.runoffTriggerBps;
+            d.runoffTriggerBps = v;
+            step = STEP_RESERVE_FLOOR;
+        } else if (k == 0x355f353adf82fb3a8390bac97a61b5babb957bdead45cf109bbfa5a2ba5c264a) {
+            // runoffBoundBps
+            old = d.runoffBoundBps;
+            d.runoffBoundBps = v;
+            step = STEP_BOND_CEILING;
+        } else if (k == 0x0397df80c80fd6a1b67e9cbaa7dc9ca6084bcf4fd5eb2e447e4ef77480cc5922) {
+            // juniorThicknessBps
+            old = d.juniorThicknessBps;
+            d.juniorThicknessBps = v;
+            step = STEP_JUNIOR_THICKNESS;
+        } else if (k == 0xa9f81449cb8256fb99a4fb0edfcae8732476c0dd58f9af2717aa089e7c63353f) {
+            // seniorCouponBps
+            old = d.seniorCouponBps;
+            d.seniorCouponBps = v;
+            step = STEP_SENIOR_COUPON;
+        } else if (k == 0xa647cf31890718c1d3ccd123f6427abb844ca7a6811c900d3c5bbc6f5e491c67) {
+            // reserveStepBps
+            old = d.reserveStepBps;
+            d.reserveStepBps = v;
+            step = STEP_RESERVE_STEP;
+        } else if (k == 0x2af973eb341a0aa0e04ad6b442927b8426a93e67eae52f5dbad5908c11392d30) {
+            // reserveFloorBps
+            old = d.reserveFloorBps;
+            d.reserveFloorBps = v;
+            step = STEP_RESERVE_FLOOR;
+        } else if (k == 0x3f254cfddf70d1f32b753d8159aab454e532f1cb98b0dcb1c7d04e81cfe5edcf) {
+            // clearingFloorBps
+            old = d.clearingFloorBps;
+            d.clearingFloorBps = v;
+            step = STEP_CLEARING;
+        } else if (k == 0x382fd4aae349a3b87473aa31d687880ff3d76054b55f2001fab25030eb4afc15) {
+            // unsoldEpochs
+            old = d.unsoldEpochs;
+            d.unsoldEpochs = v;
+            step = STEP_PSR_CAP;
+        } else if (k == 0x73e1d0ba301e2730b6e7ee22a8a2b5b7dcc4dbb34d68220cad68262018d2d789) {
+            // graceEpochs
+            old = d.graceEpochs;
+            d.graceEpochs = v;
+        } else if (k == 0xf069c9ec2c1ae71279596ade36571046e065c8236f4c7e4c38009a32c1dca505) {
+            // validatorConcentrationBps
+            old = d.validatorConcentrationBps;
+            d.validatorConcentrationBps = v;
+        } else if (k == 0x52c9e6c0e27fc58c4d89a6ae7828dfa17cb7400ea275e7d34a2d1eec8647e4da) {
+            // exitDeadlineEpochs
+            old = d.exitDeadlineEpochs;
+            d.exitDeadlineEpochs = v;
+        } else if (k == 0x81a1963a69efefcfe22f1b0c708f88ea5d8cfc9282353a9a8b0fe4fbad40e05d) {
+            // operatorBondBps
+            old = d.operatorBondBps;
+            d.operatorBondBps = v;
+        } else if (k == 0xb7dd72e929a32fe3b6b73b6c32de32e4b0c0175d9e1e370a26180a1067240c96) {
+            // rewardRateCapBps
+            old = d.rewardRateCapBps;
+            d.rewardRateCapBps = v;
+        } else if (k == 0x5ea43e7074d26a01671e01b71681c8120b96156769b3d19a3863bda3c666384b) {
+            // stabilizationLevyBps
+            old = d.stabilizationLevyBps;
+            d.stabilizationLevyBps = v;
+            step = STEP_LEVY;
+        } else if (k == 0x2f583b0cfc47d931c380ffe302e74c6405b61dd1525ff7b058c436e8d62911ef) {
+            // commitmentTermEpochs
+            old = d.commitmentTermEpochs;
+            d.commitmentTermEpochs = v;
+            step = STEP_COMMIT_TERM;
+        } else if (k == 0xa4c42c387e4293c66f85e169bacefe8de2091ccfd8082fb102a7f836a457d94a) {
+            // psrCapEpochs
+            old = d.psrCapEpochs;
+            d.psrCapEpochs = v;
+            step = STEP_PSR_CAP;
+        } else if (k == 0x2299d9412ca2c2e875eadbe2b73e5090b2c61c611c6a7c0ec05e1c8d9cb9c359) {
+            // trigger2FloorBps
+            old = d.trigger2FloorBps;
+            d.trigger2FloorBps = v;
+            step = STEP_D0;
+        } else if (k == 0x88f382ebb74f0ac19a0c192f13b7aa94767577ed9c967490d1a215dc1bc0b96b) {
+            // severityFloorBps
+            old = d.severityFloorBps;
+            d.severityFloorBps = v;
+            step = STEP_SEVERITY_FLOOR;
+        } else if (k == 0xd23270639bb49f891cf07a894c63b9ccb79b016365e6714253b5b4e00e040db4) {
+            // assessmentWindowEpochs
+            old = d.assessmentWindowEpochs;
+            d.assessmentWindowEpochs = v;
+            step = STEP_WINDOW;
+        } else if (k == 0xb705607608c828b5de721978aa4664299fa9f1ca39d8a1a7a1957f2901a0b39b) {
+            // queueDecayBps
+            old = d.queueDecayBps;
+            d.queueDecayBps = v;
+            step = STEP_BOND_CEILING;
+        } else if (k == 0xd3ffbe6bd185a451b72ccf1e88fad31c6fd59c6a5c0020cfea55ebcad64bafde) {
+            // queueExposureFloorBps
+            old = d.queueExposureFloorBps;
+            d.queueExposureFloorBps = v;
+            step = STEP_EXPOSURE_FLOOR;
+        } else if (k == 0xa513b1dd2cca98d03d3be025fe8e34e3a8dbc8a992af4885650b84a31e03abf6) {
+            // jurorSlashBps
+            old = d.jurorSlashBps;
+            d.jurorSlashBps = v;
+        } else if (k == 0xfd0d58cec583f8c84852cb195e3a6a82c5b388aa22eb9d6c51caa81a04af48de) {
+            // verdictCoverBps
+            old = d.verdictCoverBps;
+            d.verdictCoverBps = v;
+            step = STEP_VERDICT_COVER;
+        } else if (k == 0xffb9d665006f8e9ea224340754047e22038b0b2856007f7eaf546f4411d57f04) {
+            // bufferEscalatorCapBps
+            old = d.bufferEscalatorCapBps;
+            d.bufferEscalatorCapBps = v;
+            step = STEP_BUFFER;
+        } else if (k == 0x377e04c482f3f45876bd0483a62bccea616127499d7f5ab08441698a0e49ccd3) {
+            // solverBondCeilingBps
+            old = d.solverBondCeilingBps;
+            d.solverBondCeilingBps = v;
+            step = STEP_BOND_CEILING;
+        } else if (k == 0xc389d61bfc8b379f36d2d33e4bf4f8f2e077dcb6b040c40dc3b9ffb85b246f53) {
+            // solverBondFloorBps
+            old = d.solverBondFloorBps;
+            d.solverBondFloorBps = v;
+            step = STEP_FIRST_DISCOUNT;
+        } else if (k == 0xcd59c6004e8cdfcf51859ce896ee58457b8a669430ac091ebc9937e007eefead) {
+            // successorLimit
+            old = d.successorLimit;
+            d.successorLimit = v;
+        } else if (k == 0x23f4611e79344b0e5658f7fdd3ef286f0435c4e66276c19cc98d4da8abb3d9c1) {
+            // challengeWindowDays
+            old = d.challengeWindowDays;
+            d.challengeWindowDays = v;
+        } else if (k == 0x8ebe2f9c9d8801ab9816d9345f347bd141ec0281c32d7a1ea81b6c9710a8ace2) {
+            // evidenceDays
+            old = d.evidenceDays;
+            d.evidenceDays = v;
+        } else if (k == 0x314c2f803d81a524efab8b284fc5946b346f4395991baebefe5b8bdef055243d) {
+            // commitDays
+            old = d.commitDays;
+            d.commitDays = v;
+        } else if (k == 0x17697f9320473705cf20cab5b3b33894a7ca3503f4c93820f654959ccf039ade) {
+            // revealDays
+            old = d.revealDays;
+            d.revealDays = v;
+        } else if (k == 0x879a82cd69e42c6ae06e38584011faec93c72b15c56388fe95726de0b9adb64e) {
+            // appealDays
+            old = d.appealDays;
+            d.appealDays = v;
+        } else if (k == 0x787a85a5a51a771d8baa06d16b8e50d12d9438e60b7bae50e6cccb8effd04eb1) {
+            // firstReserveDiscountBps
+            old = d.firstReserveDiscountBps;
+            d.firstReserveDiscountBps = v;
+            step = STEP_FIRST_DISCOUNT;
+        } else if (k == 0x857f1d434ae661f540719606456db7be4a4131a4aa7b2c93bc3213244a350ae8) {
+            // offeringBatchMultiple
+            old = d.offeringBatchMultiple;
+            d.offeringBatchMultiple = v;
+            step = STEP_BATCH;
+        } else if (k == K_CLAIM_COST) {
+            // claimCostGwei, thirty-two bits
+            old = d.claimCostGwei;
+            d.claimCostGwei = uint32(v0);
+            step = STEP_CLAIM_COST;
+        } else if (k == 0xe2b73119601e1ec0d6b75b186e3d47be249f568ca3251eced736c83e12cd0a95) {
+            // bufferRampThresholdBps
+            old = d.bufferRampThresholdBps;
+            d.bufferRampThresholdBps = v;
+            step = STEP_RAMP;
+        } else {
+            // Including `admittedTermsMask`, `cushionTargetBps` and
+            // `cushionCeilingBps` since 2026-10-07: per phase, keyed
+            // `<field>@<phase>` (`_rowCell`, item 129).
+            revert UnknownParameter(k);
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Ranges and relations                                                */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Every range and relation of whitepaper §6.3, on a whole set: the checks
+     * run in `ArkStakeParamsChecks` by a static call of a fixed selector
+     * (staking CLAUDE.md item 128), because with the Cushion's keys they no
+     * longer fit here beside the rest under EIP-170 on the v3 line. They read
+     * the set, passed by value, and the registry's widest asset exit, so
+     * they need none of this contract's storage. A refusal there is
+     * re-raised here byte for byte, so it reaches the caller with the error
+     * and the arguments it had before the split.
+     */
+    function _check(address module, Params memory p, uint256 rows) private view {
+        (bool ok, ) = module.staticcall(abi.encodeWithSelector(ArkStakeParamsChecks.check.selector, p, registry, rows));
+        if (!ok) {
+            /// @hyperion memory-safe-assembly
+            assembly {
+                let q := mload(0x40)
+                returndatacopy(q, 0, returndatasize())
+                revert(q, returndatasize())
+            }
+        }
+    }
+}

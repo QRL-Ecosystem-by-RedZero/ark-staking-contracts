@@ -1,0 +1,120 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * The account a coupon is paid from, and the only one.
+ *
+ * Whitepaper §4.7 states four conditions that make the coupon self-funding,
+ * and the second is the one this contract exists to satisfy: *bond principal
+ * is never a source of a coupon; the coupon payment path draws from the
+ * delivered-proceeds balance and from no other account* (invariants I7, I8).
+ * That makes a payment out of principal unreachable rather than prohibited.
+ *
+ * "Unreachable rather than prohibited" is the whole design. A single contract
+ * holding both principal and proceeds would need a guard on every path that
+ * moves value, and the guard would be one refactor away from being wrong. Two
+ * contracts need no guard: the coupon path calls into this ledger, this ledger
+ * has never held principal, and there is no expression by which principal
+ * reaches a coupon.
+ *
+ * A SHORTFALL DOES NOT CARRY FORWARD; A RESIDUE DOES
+ * -------------------------------------------------
+ * Whitepaper §4.7: the coupon of an epoch is drawn from the QRL delivered for
+ * that epoch and from nothing else, credited by the premium swap until the
+ * QRL expiry of that epoch's lots, early in the epoch after next. If delivery falls short, that epoch's
+ * coupon is reduced in proportion across every holder rather than being met
+ * from principal, from a reserve, or from a later epoch. What the bond's
+ * truncating divisions leave undrawn is the opposite case, and §4.6
+ * distributes it with the following epoch; the bond carries it there, and only
+ * there.
+ */
+interface IProceedsLedger {
+    /// The premium share of one epoch arrived, converted and net of execution cost.
+    event ProceedsDelivered(uint256 indexed epoch, address indexed from, uint256 amount);
+
+    /// The coupon of an epoch was drawn against that epoch's delivered balance.
+    event ProceedsDrawn(uint256 indexed epoch, address indexed to, uint256 amount);
+
+    /// What the bond left undrawn in one epoch was carried into the next. Whitepaper §4.6.
+    event ResidueCarried(uint256 indexed fromEpoch, uint256 indexed toEpoch, uint256 amount);
+
+    /// Commitment bonds forfeited against an epoch's offering joined its proceeds. Whitepaper §4.7, I33.
+    event BondsForfeited(uint256 indexed epoch, uint256 amount);
+
+    /// A retirement of unsold premium recorded a shortfall carry (I34).
+    event ShortfallCarried(uint256 amount, uint256 outstanding);
+
+    /// The yield of retained shares delivered QRL against the carry (I34).
+    event ShortfallRecovered(uint256 amount, uint256 outstanding);
+
+    /// The bond was named. Emitted once in the life of the contract.
+    event BondSet(address indexed bond);
+
+    /// The premium swap was named. Emitted once in the life of the contract.
+    event SwapSet(address indexed swap);
+
+    /// Only the premium swap may credit proceeds.
+    error OnlySwap(address caller);
+
+    /// The premium swap has already been set and is not re-pointable.
+    error SwapAlreadySet(address current);
+
+    /// Only the bond may draw a coupon or carry a residue.
+    error OnlyBond(address caller);
+
+    /// The bond address has already been set and is not re-pointable.
+    error BondAlreadySet(address current);
+
+    /// Only the deployer may name the bond, and only before it is named.
+    error OnlyDeployer(address caller);
+
+    /// A credit to an epoch outside its settlement window, which closes at the QRL expiry of its lots. Whitepaper §4.7.
+    error CreditWindowShut(uint256 epoch, uint256 opensAt, uint256 closesAt);
+
+    /// A draw or a carry before the epoch's settlement window has closed and its coupon is due.
+    error NotYetPayable(uint256 epoch, uint256 payableAt);
+
+    /// A delivery or a carry arrived after this epoch's coupon had already been drawn.
+    error EpochSealed(uint256 epoch);
+
+    /// The draw exceeds what was delivered for that epoch.
+    error InsufficientProceeds(uint256 epoch, uint256 requested, uint256 available);
+
+    /// QRL delivered for an epoch, gross of anything already drawn.
+    function deliveredIn(uint256 epoch) external view returns (uint256);
+
+    /// What remains drawable for an epoch.
+    function remainingIn(uint256 epoch) external view returns (uint256);
+
+    /// Whether an epoch has been drawn against, and so can no longer receive.
+    function isSealed(uint256 epoch) external view returns (bool);
+
+    /// Credit an epoch's swap proceeds during its settlement window. The premium swap only.
+    function deliver(uint256 epoch) external payable;
+
+    /// Draw part of an epoch's delivered balance. Bond only.
+    function draw(uint256 epoch, address to, uint256 amount) external;
+
+    /// Carry an epoch's undrawn residue into the epoch after it. Bond only.
+    function carryResidue(uint256 epoch) external;
+
+    /// Credit the commitment bonds forfeited against an epoch's offering. The premium swap only.
+    function forfeit(uint256 epoch) external payable;
+
+    /// Pull from the swap what an epoch's offering forfeited. Any sender.
+    function collectForfeits(uint256 epoch) external;
+
+    /// The shortfall carry outstanding, in QRL (I34). Not zero suspends issuance.
+    function shortfallCarry() external view returns (uint256);
+
+    /// Record a retirement's carry. The premium swap only.
+    function carryShortfall(uint256 qrl) external;
+
+    /// Reduce the carry by delivered QRL, never below zero. The premium swap only.
+    function recoverShortfall(uint256 qrl) external;
+}
+
+/// The premium swap, as the ledger asks it for an epoch's forfeited bonds.
+interface IForfeitSource {
+    function releaseForfeits(uint256 epoch) external;
+}

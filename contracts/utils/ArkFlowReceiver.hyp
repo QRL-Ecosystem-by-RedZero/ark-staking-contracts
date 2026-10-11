@@ -1,0 +1,65 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "../interfaces/IArkFlow.hyp";
+
+/**
+ * The receiving half. A contract inherits this, answers `_lane`, and
+ * optionally reacts in `_onDeposit`.
+ *
+ * What it enforces for every inheritor, so that no contract has to remember:
+ * a zero deposit, an unknown lane, a closed lane and a deposit above room all
+ * revert before any state moves, and the event is emitted last.
+ *
+ * `_onDeposit` runs after the lifetime total is written and must not call out
+ * (interface rule 2). It exists for bookkeeping: crediting a pot, advancing a
+ * counter.
+ *
+ * `receive()` is deliberately not defined. A bare transfer names no lane, and
+ * a contract that wants a default lane declares its own `receive()` that
+ * forwards to `_accept`.
+ */
+abstract contract ArkFlowReceiver is IArkFlowReceiver {
+    mapping(bytes32 => uint256) private _laneTotal;
+
+    /// The inheritor's answer for `lane`. `declared == false` for any lane it does not hold.
+    function _lane(bytes32 lane) internal view virtual returns (LaneInfo memory);
+
+    function _onDeposit(bytes32 lane, address from, uint256 amount, bytes32 ref) internal virtual {}
+
+    function deposit(bytes32 lane, bytes32 ref) external payable virtual {
+        _accept(lane, msg.sender, msg.value, ref);
+    }
+
+    function acceptsLane(bytes32 lane) external view returns (bool) {
+        LaneInfo memory info = _lane(lane);
+        return info.declared && info.open && info.room > 0;
+    }
+
+    function laneInfo(bytes32 lane) external view returns (LaneInfo memory) {
+        return _lane(lane);
+    }
+
+    function laneTotal(bytes32 lane) external view returns (uint256) {
+        return _laneTotal[lane];
+    }
+
+    /// For an inheritor's own `_lane`, which cannot call its external getter cheaply.
+    function _received(bytes32 lane) internal view returns (uint256) {
+        return _laneTotal[lane];
+    }
+
+    function _accept(bytes32 lane, address from, uint256 amount, bytes32 ref) internal {
+        if (amount == 0) revert ZeroDeposit();
+
+        LaneInfo memory info = _lane(lane);
+        if (!info.declared) revert LaneUnknown(lane);
+        if (!info.open) revert LaneClosed(lane);
+        if (amount > info.room) revert LaneRoomExceeded(lane, amount, info.room);
+
+        _laneTotal[lane] += amount;
+        _onDeposit(lane, from, amount, ref);
+
+        emit Deposited(lane, from, amount, ref);
+    }
+}

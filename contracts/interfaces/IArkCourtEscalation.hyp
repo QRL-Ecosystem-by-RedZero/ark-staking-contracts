@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * The court's half of the terminal governance step (design §6.7), for the Ark
+ * Staking juror pool's court.
+ *
+ * The losing party of the appeal escalates on the court itself
+ * (`IDisputeCourt.escalateToGovernance`, within 2 days, bond 2x the appeal
+ * bond); the court then reports `escalationPending` and ArkGovernor may open the
+ * 5-day off-round vote. veARK has exactly two answers, and neither is a money
+ * verdict:
+ *
+ *   retrial == false  UPHOLD the appeal verdict — the default when quorum (10%)
+ *                     or approval (66%) is not reached;
+ *   retrial == true   order a retrial before a fresh panel of 28 jurors drawn
+ *                     excluding both earlier panels; that verdict is final.
+ *
+ * The court must hold the drawn jurors' stake from the draw until the case is
+ * finally closed, across this step (G13): otherwise the appeal panel unbonds
+ * while veARK votes and escapes the slash.
+ */
+interface IArkCourtEscalation {
+    /// True while an escalation is open on `caseId` and not yet resolved.
+    function escalationPending(bytes32 caseId) external view returns (bool);
+
+    /// When an open escalation on `caseId` lapses: from then anyone finalizes
+    /// the case on its appeal verdict, and a governance vote can no longer
+    /// decide it. 0 when no escalation is open (audit 2026-10-03, OC-COURT-03).
+    function escalationLapsesAt(bytes32 caseId) external view returns (uint256);
+
+    /// Governor only.
+    function resolveEscalation(bytes32 caseId, bool retrial) external;
+}

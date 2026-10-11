@@ -1,0 +1,107 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * The canonical cross-chain preimage words, on the QRL side.
+ *
+ * The one rule this library exists to enforce: **every hash the origin-chain
+ * escrow verifies is laid out in 32-byte words, exactly as Solidity
+ * `abi.encode` of static fields lays it out, whatever the width of the word
+ * this chain runs on.**
+ *
+ * Since QIP-55 (testnet v3) the QRVM word — and with it this compiler's
+ * `abi.encode` slot — is 64 bytes, while the origin chain's stays 32. A leaf
+ * hashed here with native `abi.encode` therefore stops matching the escrow's
+ * recomputation, and fails silently as `BadProof` rather than loudly as
+ * anything. The escrow is the immutable, keyless half of the agreement, so
+ * its layout is the one that cannot move: this side adapts.
+ *
+ * The adaptation is `abi.encodePacked` over `bytes32` values. Packed encoding
+ * uses a type's exact byte size on both compiler lines — 32 bytes per
+ * `bytes32`, verified against the v3 compiler's IR, where the write position
+ * advances by 32 per field — so a preimage built from bytes32 words is
+ * byte-identical to the origin chain's `abi.encode` of the same fields.
+ *
+ * Two kinds of address cross the relay, and each has one canonical form:
+ *
+ *  - An **origin-chain address** is 20 bytes wherever it truly lives. It is
+ *    one word, right-aligned — the bytes `abi.encode(address)` has always
+ *    produced over there. `evmWord` extracts it from however wide this
+ *    chain's `address` type happens to be.
+ *  - A **QRL account** — a bound owner, a solver — is 64 bytes under QIP-55
+ *    and enters as two words, high half then low half. The legacy 20-byte
+ *    form (the v2 line, and the local harness) is a zero high word and the
+ *    right-aligned low word, so the two widths can never collide: they
+ *    differ in the high word wherever a v3 address has one. `ownerWords` is
+ *    the one place the split is defined on this chain; ArkStakeIds.sol
+ *    (`qrlOwnerWords`) and identifiers.js (`qrlOwnerWords`) state the same
+ *    rule, and the suite asserts the three agree over a table.
+ *
+ * Nothing here reads the word width from a constant. `abi.encodePacked` of an
+ * `address` is 20 bytes on the v2 compiler and 64 on v3, so the width is
+ * measured where it is used and a single source serves both lines.
+ */
+library EvmWords {
+    /**
+     * The raw bytes of an address on this chain: 20 on the v2 line, 64 under
+     * QIP-55. The one width probe every function here derives from.
+     */
+    function addressBytes(address a) internal pure returns (bytes memory) {
+        return abi.encodePacked(a);
+    }
+
+    /**
+     * A QRL account as its two canonical words.
+     *
+     * A byte loop rather than an mload, because the offset of a `bytes`
+     * payload from its length slot is itself word-width-dependent and an
+     * assembly block written for one width silently misreads on the other.
+     * Sixty-four iterations of a pure loop, on the chain whose gas is cheap.
+     */
+    function ownerWords(address a) internal pure returns (bytes32 hi, bytes32 lo) {
+        bytes memory b = abi.encodePacked(a);
+        uint256 n = b.length;
+        uint256 hiAcc;
+        uint256 loAcc;
+        for (uint256 i = 0; i < n; i++) {
+            if (n - i > 32) {
+                hiAcc = (hiAcc << 8) | uint256(uint8(b[i]));
+            } else {
+                loAcc = (loAcc << 8) | uint256(uint8(b[i]));
+            }
+        }
+        return (bytes32(hiAcc), bytes32(loAcc));
+    }
+
+    /**
+     * An origin-chain address as its one canonical word.
+     *
+     * The value reaches this chain zero-extended into whatever width `address`
+     * has here, so the canonical word is simply the low one. The high word of
+     * a genuine origin-chain address is zero by construction; a value with a
+     * nonzero high word hashes to a leaf the escrow never sealed, which is the
+     * same refusal every other malformed field earns — a proof that fails.
+     */
+    function evmWord(address a) internal pure returns (bytes32) {
+        (, bytes32 lo) = ownerWords(a);
+        return lo;
+    }
+
+    /**
+     * Whether `a` is an origin-chain (20-byte) address at all: a zero high word
+     * AND a low word whose upper twelve bytes are zero. `evmWord` drops the
+     * high word and keeps all 32 bytes of the low one, so a value failing this
+     * still hashes — to a leaf no escrow payee can ever match, which on a
+     * release strands the position in transit for good (audit 2026-09-27, D14).
+     * Always true on the 20-byte line.
+     */
+    function isEvmAddress(address a) internal pure returns (bool) {
+        (bytes32 hi, bytes32 lo) = ownerWords(a);
+        return hi == bytes32(0) && (uint256(lo) >> 160) == 0;
+    }
+
+    /// A uint as its canonical word. Spelled out so preimage sites read as their layout.
+    function word(uint256 v) internal pure returns (bytes32) {
+        return bytes32(v);
+    }
+}

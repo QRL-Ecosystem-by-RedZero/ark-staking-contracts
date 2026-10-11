@@ -1,0 +1,77 @@
+{
+  "name": "rehearsal-v3-r6",
+  "chainId": 31337,
+  "profile": "rapid",
+  "evmVersion": "shanghai",
+  "qrlOwnerLength": 64,
+  "rootSigners": {
+    "threshold": 2,
+    "signers": 3
+  },
+  "court": "real",
+  "qday": "MockQDayOracle",
+  "finality": "confirmations",
+  "confirmations": 1,
+  "deliveryMarginSeconds": 10,
+  "deployedFromBlock": 2065,
+  "assets": [
+    {
+      "symbol": "mREB",
+      "mock": "MockRebasingAsset",
+      "address": "0x73511669fd4dE447feD18BB79bAFeAC93aB7F31f",
+      "rebasing": true,
+      "correlationGroup": "group:lido-like",
+      "exitBoundBps": 2500,
+      "escrow": "0x43ca3D2C94be00692D207C6A1e60D8B325c6f12f"
+    },
+    {
+      "symbol": "mUNIT",
+      "mock": "MockAsset",
+      "address": "0xB581C9264f59BF0289fA76D61B2D0746dCE3C30D",
+      "rebasing": false,
+      "correlationGroup": "group:mock-units",
+      "exitBoundBps": 2500,
+      "escrow": "0xb09da8a5B236fE0295A345035287e80bb0008290"
+    }
+  ],
+  "addresses": {
+    "relay": "0xC469e7aE4aD962c30c7111dc580B4adbc7E914DD",
+    "operationsDestination": "0x00000000000000000000000000000000000E2e01"
+  },
+  "bondPrincipal": "15000000000000000000000",
+  "note": "rehearsal lane r6 (scripts/rehearsal-lanes.js): leg-a-close",
+  "shared": false,
+  "authority": {
+    "threshold": 2,
+    "signers": 3,
+    "treeHeight": 11,
+    "generations": [
+      [
+        "0xd7d319b251d417f9f2aa9a9048d272fa95640c48cc1e29cdaf441b49277fcafa",
+        "0x721a80be2429e339bb0885893c6549cc66fddf7b1dd53063d9e29a853287fe26",
+        "0xcbc815a84b880e02afb3c5d350314dec0b0d3870fd0bd41e98400439fd0d176f"
+      ],
+      [
+        "0xa3714703477f2bc02cc7549706e2fdb8004b7f26298ab134e93d5f5f2a61a846",
+        "0x2e5650a1389f2994179a4fd42c291ab3856733eea43f076e6cfdf029f0941a4a",
+        "0x3505de459f2f154699d6faa5bce48a084941c49ea6038cb130dc96071941b409"
+      ],
+      [
+        "0xd9a786daf93437690ab0bc989c3445ba3b897b52b877d3847eed3b467071c9bd",
+        "0x9e4b41737d55015302f12c2fe23421bd8f3a95532c8dd8c188cc1381f9986088",
+        "0x6e991660bafb58c2d31dd2355853acbd0452ace9a4c9ee35d767e61d6c0980d0"
+      ],
+      [
+        "0xefdfe7ed031741f0c24a6e207cb791578809484166a1f72bb8bbb6e198643c65",
+        "0x50f63ad26876897b5986478df24ada7f213fe4ac4d323511bee4562737710946",
+        "0x31c512a7b40dbf38807be7b7534a9ff4abecd70ebfafb824228212399a640977"
+      ]
+    ],
+    "commits": [
+      "0x9fca3719eb0bc247c032fffd98cb591bd5873d7d8d8fc32b7790e6a8ddbaadaa",
+      "0xf1161005e1f2731023dfb1fbff60739eb29232a6f8eee7e0a48065c44bb09951",
+      "0x82dae879fa41f02ec2125f3a11cdef25bdc7f72c61efd9e2acca821b21f0ff13",
+      "0x290decd9548b62a8d60345a988386fc84ba6bc95484008f6362f93160ef3e563"
+    ]
+  }
+}

@@ -1,0 +1,127 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * The juror pool of Ark Staking's dispute court: ARK bonded for this product
+ * alone (whitepaper §6.1, §6.2; yellow paper §4.1).
+ *
+ * A juror stakes ARK — at least `MIN_STAKE` to be listed — and the stake
+ * joins the draw at the next epoch boundary; `unbond` takes it out of every
+ * draw armed after it, and it is withdrawn `UNBONDING_PERIOD` later. A draw is
+ * armed by the court, one at a time, and reads the pool as it stood at the
+ * arm (audit 2026-09-29, QL-01). A draw holds a seat's stake on every juror
+ * it seats until the court settles the case, whatever the case does in
+ * between — an appeal, the terminal step, a retrial (G13) — and the court
+ * alone slashes a held seat.
+ */
+interface IArkJurorPool {
+    struct Juror {
+        /// Stake in the draw from its activation epoch. Includes `held`.
+        uint128 active;
+        /// Stake added in `pendingEpoch`, in the draw from the epoch after it.
+        uint128 pending;
+        uint64 pendingEpoch;
+        /// Seats' stake held for cases not yet settled (G13). Never unbonded.
+        uint128 held;
+        /// Leaving; withdrawable from `unbondAt`. Out of every draw.
+        uint128 unbonding;
+        uint64 unbondAt;
+        /// Slashed ARK credited to this juror as a coherent juror of a case.
+        uint128 reward;
+        /// One-based position in the juror list; zero when not listed.
+        uint32 index;
+        /// The arm (`drawSeq`) this juror's checkpoint was taken for, and its stake and held stake then (QL-01).
+        uint64 ckSeq;
+        uint128 ckStake;
+        uint128 ckHeld;
+    }
+
+    event Staked(address indexed juror, uint256 amount, uint256 activeFromEpoch);
+    event Unbonding(address indexed juror, uint256 amount, uint256 withdrawableAt);
+    event Withdrawn(address indexed juror, uint256 amount);
+    event RewardClaimed(address indexed juror, uint256 amount);
+    event PanelDrawn(bytes32 indexed caseId, uint8 round, address[] jurors, uint256 seatStake);
+    event SeatSettled(bytes32 indexed caseId, address indexed juror, bool coherent, uint256 slashed, uint256 reward);
+    event CourtSet(address court);
+    /// The listed juror with the smallest stake gave its slot to a larger new juror (QL-21; OC-COURT-06).
+    event JurorEvicted(address indexed juror);
+
+    error OnlyCourt(address caller);
+    error OnlyDeployer(address caller);
+    error AlreadySet(address current);
+    error ZeroAmount();
+    error PoolFull(uint256 max);
+    error NotFree(address juror, uint256 requested, uint256 free);
+    error NothingWithdrawable(address juror, uint256 at);
+    error InsufficientJurors(uint256 eligible, uint256 required);
+    error SeatMismatch(bytes32 caseId, uint256 recorded, uint256 given);
+    error TransferFailed();
+    /// A draw is armed and drawable until this block: no other is armed, and nothing of a moved juror's lot leaves.
+    error DrawPending(uint256 untilBlock);
+    /// No draw is armed at this snapshot, or its window has passed.
+    error NotArmed(uint256 snapshotBlock);
+    /// A juror is listed only at the minimum stake.
+    error BelowMinimumStake(uint256 required, uint256 given);
+
+    /// Stake ARK into the pool. In the draw from the next epoch boundary; listed only at `MIN_STAKE` or more; on a full list, in the slot of a smaller stake (OC-COURT-06).
+    function stake(uint256 amount) external;
+
+    /// Leave: out of every draw armed after this, withdrawable after the unbonding period. Held stake cannot leave.
+    function unbond(uint256 amount) external;
+
+    /// Take back what finished unbonding.
+    function withdraw() external;
+
+    /// Take the slashed ARK credited as a coherent juror.
+    function claimReward() external;
+
+    /// Checkpoint veARK in this block, which a draw later reads the bonus at. Anyone.
+    function snapshot() external returns (uint256 snapshotBlock);
+
+    /**
+     * Arm a draw (court only): checkpoint veARK in this block and fix the pool
+     * the draw will read — every juror's stake and held stake as they stand
+     * now — until the draw is taken or `lastDrawBlock` passes. Refused while
+     * another draw is armed (`DrawPending`). Returns the snapshot block.
+     */
+    function arm(uint256 lastDrawBlock) external returns (uint256 snapshotBlock);
+
+    /// The last block the armed draw may be taken in; zero where none is armed.
+    function armedUntil() external view returns (uint256);
+
+    /**
+     * Seat `n` jurors on round `round` of `caseId` (court only), each holding
+     * `seatStake`, none already seated on the case, weighted by
+     * `active + min(active, veARK weight at snapshotBlock)` and capped at
+     * `ADDRESS_CAP_BPS` of the pool's active stake — every figure as recorded
+     * at the arm of `snapshotBlock`, which the call spends — drawn without
+     * replacement from `rand`. Empty where fewer than `n` were eligible.
+     */
+    function drawPanel(bytes32 caseId, uint8 round, uint256 n, uint256 seatStake, uint256 snapshotBlock, bytes32 rand)
+        external
+        returns (address[] memory panel);
+
+    /**
+     * Release every seat of `caseId` (court only): a coherent seat whole, an
+     * incoherent or unrevealed one less `slashBps` of the seat, and the slashed
+     * ARK, with the slash held unallocated before it, credited to the coherent
+     * seats in equal parts where an appeal decided the case (more than the
+     * first panel's seven seats); a case its first panel decided alone pays
+     * its slash to none of its seats and holds it (OC-COURT-07, OC-COURT-09).
+     */
+    function settle(bytes32 caseId, address[] calldata jurors, bool[] calldata coherent, uint256 slashBps) external;
+
+    function court() external view returns (address);
+    function MIN_STAKE() external view returns (uint256);
+    function jurorOf(address juror) external view returns (Juror memory);
+    function activeStakeOf(address juror) external view returns (uint256);
+    function freeStakeOf(address juror) external view returns (uint256);
+    function poolStake() external view returns (uint256);
+    function jurorCount() external view returns (uint256);
+    /// Listed jurors whose free stake is at least `seat` now (the S3 condition's count).
+    function eligibleCount(uint256 seat) external view returns (uint256);
+    function drawWeightOf(address juror, uint256 snapshotBlock) external view returns (uint256);
+    function panelOf(bytes32 caseId, uint8 round) external view returns (address[] memory);
+    function seatRound(bytes32 caseId, address juror) external view returns (uint8);
+    function seatStakeOf(bytes32 caseId) external view returns (uint256);
+}

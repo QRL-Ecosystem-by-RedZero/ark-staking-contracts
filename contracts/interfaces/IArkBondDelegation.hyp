@@ -1,0 +1,201 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./IGovernanceHandover.hyp";
+
+/**
+ * The QRL beacon-chain deposit contract, as this product calls it.
+ *
+ * Zond keeps the Ethereum deposit contract's ABI: `deposit` is selector
+ * 0x22895118 on the contract deployed at genesis (Q4242…42 on the Kurtosis
+ * enclave). What differs is the payload: the validator key is ML-DSA-87, so the
+ * public key is 2,592 bytes and the signature 4,627, and one validator is
+ * 40,000 QRL. The contract checks the deposit data root, through ZVM's
+ * `depositroot` precompile at 0x01, against the four fields it is given; the
+ * signature is checked by the beacon chain. Withdrawal credentials for an
+ * execution address are twelve zero bytes and the address.
+ */
+interface IQrlDepositContract {
+    function deposit(
+        bytes calldata pubkey,
+        bytes calldata withdrawal_credentials,
+        bytes calldata signature,
+        bytes32 deposit_data_root
+    ) external payable;
+
+    function get_deposit_root() external view returns (bytes32);
+
+    function get_deposit_count() external view returns (bytes memory);
+}
+
+/**
+ * Bond principal deployed to QRL staking while it is not called upon.
+ *
+ * The one rule this contract exists to enforce: **principal staked through it
+ * comes back to it — withdrawing to it alone, exiting on request under an
+ * operator bond — and nothing it receives is paid out or counted as returned
+ * before the attester quorum's reconciliation has cleared the challenge
+ * window** (whitepaper §3.4, yellow paper §1.4).
+ */
+interface IArkBondDelegation is IGovernanceHandover {
+    /**
+     * A validator as this contract records it. `status` is the beacon API's
+     * ordinal as the last cleared report gave it: 0 pending_initialized,
+     * 1 pending_queued, 2 active_ongoing, 3 active_exiting, 4 active_slashed,
+     * 5 exited_unslashed, 6 exited_slashed, 7 withdrawal_possible,
+     * 8 withdrawal_done. The ordinal is a wire format: append, never reorder.
+     *
+     * `depositDataRoot` is the one deposit governance admitted the validator for:
+     * 40,000 QRL, this contract's credentials, and the signature the quorum
+     * checked. The root commits to all four fields, so storing it fixes them.
+     */
+    struct Validator {
+        address operator;
+        uint128 bond;
+        bool admitted;
+        bool bondSettled;
+        bool closed;
+        uint8 status;
+        uint64 lastReportEpoch;
+        uint64 exitRequestedEpoch;
+        bytes32 exitCommitment;
+        bytes32 depositDataRoot;
+        uint256 stake;
+        uint256 withdrawn;
+        uint256 principalReturned;
+    }
+
+    /**
+     * One validator's line of the quorum's reconciliation report, as sealed
+     * (`validatorReportLeaf`, domain `ARK_DELEGATION_REPORT_V2`).
+     *
+     * `slashed` is the beacon state's `validator.slashed`, which stays true for
+     * good, so a slashing is visible in every later line and not only under
+     * statuses 4 and 6. `exitInitiatedEpoch` is the epoch of this product's clock
+     * (ArkEpoch) in which the beacon chain processed the validator's exit, zero
+     * while none has been; the quorum derives it from the block that included
+     * the exit. `credentialsHash` is the keccak256 of the raw withdrawal
+     * credentials the beacon state holds for the validator, which the first
+     * deposit for a key fixes. A hash rather than the credentials themselves,
+     * because since QIP-55 the credential is the full 64-byte execution
+     * address (qrysm's `WithdrawalCredentialsAddress` is `addr.Bytes()`, no
+     * prefix) and no longer fits a fixed field; the quorum hashes what it
+     * read, and the contract compares against the hash of its own.
+     */
+    struct Report {
+        uint256 epoch;
+        bytes32 pubkeyHash;
+        uint8 status;
+        bool slashed;
+        uint64 exitInitiatedEpoch;
+        bytes32 credentialsHash;
+        uint256 balance;
+        uint256 cumulativeWithdrawn;
+    }
+
+    event Funded(address indexed from, uint256 amount, uint256 principal);
+    event Returned(address indexed to, uint256 amount, uint256 principal);
+    event ValidatorAdmitted(
+        bytes32 indexed pubkeyHash, address indexed operator, uint256 bond, bytes32 depositDataRoot, bytes32 exitCommitment
+    );
+    event AdmissionWithdrawn(bytes32 indexed pubkeyHash, address indexed operator, uint256 bond);
+    event ExitCommitted(bytes32 indexed pubkeyHash, bytes32 exitCommitment);
+    event Delegated(bytes32 indexed pubkeyHash, uint256 amount, bytes32 depositRoot, uint256 delegated);
+    event ExitRequested(bytes32 indexed pubkeyHash, uint256 epoch, bytes32 exitCommitment);
+    event RootNoted(uint256 indexed epoch, bytes32 root);
+    event Reconciled(bytes32 indexed pubkeyHash, uint256 indexed reportEpoch, uint8 status, uint256 distribution, uint256 principalReturned);
+    event FeesReconciled(uint256 indexed reportEpoch, uint256 fees);
+    event StakeLost(bytes32 indexed pubkeyHash, uint256 loss, uint256 principal);
+    event BondForfeited(bytes32 indexed pubkeyHash, uint256 amount, uint8 reason);
+    event BondReturned(bytes32 indexed pubkeyHash, address indexed operator, uint256 amount);
+    event Distributed(address indexed to, uint256 amount);
+
+    /**
+     * Receipts no report has classified yet, forwarded as distribution up to
+     * the epoch's reward cap (I32). Counted in `distributed`, so a report that
+     * shows them to have been principal withholds as much from later
+     * distributions until it is restored.
+     */
+    event ProvisionallyDistributed(address indexed to, uint256 indexed epoch, uint256 amount, uint256 cap);
+
+    error OnlyBond(address caller);
+    error OnlyGovernance(address caller);
+    error NotOperator(address caller);
+    error ValidatorNotAdmitted(bytes32 pubkeyHash);
+    error ValidatorAlreadyAdmitted(bytes32 pubkeyHash);
+    error AlreadyFunded(bytes32 pubkeyHash);
+    error BadPubkeyLength(uint256 length);
+    error OperatorBondShort(uint256 supplied, uint256 required);
+    error ConcentrationExceeded(bytes32 pubkeyHash, uint256 wouldBe, uint256 bound);
+    error ConcentrationOutOfRange(uint256 bps);
+    error InsufficientIdle(uint256 requested, uint256 idle);
+    error DepositRootChanged(bytes32 checked, bytes32 current);
+    error NotFunded(bytes32 pubkeyHash);
+    error ExitAlreadyRequested(bytes32 pubkeyHash, uint256 epoch);
+    error ValidatorClosed(bytes32 pubkeyHash);
+    error RootMissing(uint256 epoch);
+    error RootAlreadyNoted(uint256 epoch);
+    error RootNotNoted(uint256 epoch);
+    error ReportNotCleared(uint256 reportEpoch, uint256 clearsAt);
+    error ReportNotForward(uint256 reportEpoch, uint256 lastReportEpoch);
+    error WithdrawalsWentBackwards(uint256 reported, uint256 reconciled);
+    error BadStatus(uint8 status);
+    error BadProof(uint256 epoch, bytes32 leaf);
+    error NothingToDistribute();
+    error Insolvent(uint256 balance, uint256 owed);
+    /// No funded validator is left that is neither closed nor already exiting (OC-LEGB-04).
+    error NoValidatorToExit();
+
+    function fund() external payable;
+
+    function returnIdle(uint256 amount) external;
+
+    function admitValidator(bytes calldata pubkey, bytes32 depositDataRoot, bytes32 exitCommitment, address operator)
+        external
+        payable;
+
+    function withdrawAdmission(bytes32 pubkeyHash) external;
+
+    function commitExit(bytes32 pubkeyHash, bytes32 exitCommitment) external;
+
+    function delegate(
+        bytes calldata pubkey,
+        bytes calldata signature,
+        bytes32 depositRoot,
+        bytes32[] calldata checkProof
+    ) external;
+
+    /// Ask the oldest funded validator not already exiting to exit; returns which (OC-LEGB-04).
+    function requestExit() external returns (bytes32 pubkeyHash);
+
+    function noteRoot(uint256 epoch) external;
+
+    function reconcile(Report calldata report, bytes32[] calldata proof) external;
+
+    function reconcileFees(uint256 reportEpoch, uint256 cumulativeFees, bytes32[] calldata proof) external;
+
+    function distribute() external returns (uint256);
+
+    /// Principal placed here, gross of what has been deposited. A public state variable.
+    function principal() external view returns (uint256);
+
+    /// Principal held here and not deposited, including what a cleared report showed returned.
+    function idle() external view returns (uint256);
+
+    /// Stake of validators asked to exit, or reported exiting, and not yet reconciled as returned or lost.
+    function exitsPending() external view returns (uint256);
+
+    /// Slashed validators whose forfeited bond is held until they close; the pool settles nothing while any is (OC-LEGB-03).
+    function slashedOpen() external view returns (uint256);
+
+    /**
+     * The withdrawal credentials a validator funded here carries: since
+     * QIP-55, this contract's raw 64-byte address (qrysm dev,
+     * `WithdrawalCredentialsAddress = addr.Bytes()`); on the v2 line, the
+     * legacy 32 bytes of twelve zeros and the 20-byte address.
+     */
+    function withdrawalCredentials() external view returns (bytes memory);
+
+    /// keccak256 of `withdrawalCredentials()`, the form a Report carries.
+    function credentialsHash() external view returns (bytes32);
+}

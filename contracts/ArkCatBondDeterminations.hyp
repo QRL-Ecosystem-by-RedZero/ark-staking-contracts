@@ -1,0 +1,420 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./ArkCatBondStore.hyp";
+
+/**
+ * The fifth body of `ArkCatBond` (audit OC 2026-10-03, OC-COURT-01): the
+ * court's findings on the bond — a trigger-1 determination's list of
+ * positions and losses (`determineLoss`), the censorship ground
+ * (`determineCensorship`), the m_loss of a held balance (`fixSeverity`) and
+ * the value slices of both (`openSlices`, `closeSlice`) — executed in the
+ * bond's storage by a delegatecall from a stub of the same selector in
+ * `ArkCatBondSettlement` (trigger 1) or `ArkCatBondRecovery` (the rest).
+ *
+ * WHY THIS CONTRACT EXISTS
+ * ------------------------
+ * A finding draws no more than the V the court admitted and bounded it at
+ * (I24, G8): V travels with the verdict, and the bond clamps the draw to it.
+ * The settlement module had 41 bytes of v3 room and the recovery module 150,
+ * and the bound did not fit in either; the bodies moved here, behind stubs
+ * that forward `msg.data` unchanged and return or revert byte for byte, so
+ * no selector, event or refusal moved with them. `ArkCatBondExit`'s pattern:
+ * the recovery module's constructor creates this contract and fixes its
+ * address in an immutable, and the settlement module reads that address
+ * from the recovery module it checks at its own construction. No setter, no
+ * admin, not a proxy. It inherits `ArkCatBondStore`, the one declaration of
+ * the bond's storage layout. Called directly it acts on its own empty
+ * storage and holds no value (`inBond` refuses every state change there).
+ *
+ * THE BOUND ON V (OC-COURT-01)
+ * ----------------------------
+ * V and the seat are fixed at the assertion; the occurrence limit K, the
+ * settlement price and the book are read again at delivery. A trigger-1
+ * finding now takes as bond capital available the lesser of the principal
+ * outstanding and V, so its one haircut spreads what V does not reach over
+ * every position of the window (I14), and no position's loss is taken above
+ * its own notional. The censorship ground's upheld slices add their V to
+ * `_censorshipValue`, which bounds the floor draw the ground makes at its
+ * opening (`ArkCatBondSettlement._openTrigger2`).
+ *
+ * THE COURT'S TRIGGER-2 FINDINGS AND THEIR VALUE SLICES (2026-09-30, EC-04)
+ * ------------------------------------------------------------------------
+ * The censorship ground and the m_loss of a held balance are one fact each,
+ * and a finding worth more than the bound on a first panel at the minimum
+ * seat is heard as `n` slices, each its own case at that seat, each settling
+ * only its fraction φ_i of the finding's object (whitepaper §6.2; the
+ * specification of record `slices-rule.md` of 2026-09-30, the model's
+ * `sliceFraction`, `slicedDrawTarget`, `slicedHeldPrincipal`). The court
+ * opens the group (`openSlices`) and closes each slice, upheld or rejected
+ * (`closeSlice`); an unsliced finding keeps its two calls
+ * (`determineCensorship`, `fixSeverity`), which are the one-slice case of the
+ * same arithmetic. Moved here from the settlement module, whose v3 room
+ * could not take them, and the group's opening (`openSlices`) with them
+ * since the re-audit of 2026-09-30; the measured path (`settleSeverity`)
+ * stays there, and the draw and the hold (`_drawTo`, `_rehold`,
+ * `_settleBalance`) are the store's, shared by both.
+ *
+ *  - The censorship ground: an upheld slice adds φ_i to U, the first one
+ *    fixing T; a rejected one takes φ_i off the open fraction. The ground
+ *    stands when the last slice closes with U above zero (re-audit
+ *    2026-09-30, COURT-04), and draws `floor(S_full * D_0 * U / (BPS *
+ *    SLICE_SCALE))` at its opening (T2_FLOOR), with every slice closed. A
+ *    declaration ratified later is settled on the same record and S_full for
+ *    the fraction 1 - U (`settleDeclaration`, the model's
+ *    `declarationRemainderFraction`).
+ *  - A held balance: an upheld slice at m draws its fraction at
+ *    `D_i = max(D_0, clamp(m, S_floor, BPS))` and releases the rest of it; a
+ *    rejected one moves nothing, its fraction stays held and may be asserted
+ *    again. The measured path settles whatever is open at the reading.
+ */
+contract ArkCatBondDeterminations is ArkCatBondStore {
+    uint256 private constant PRICE_SCALE = 1e18;
+
+    /// This module's own address: under a delegatecall `address(this)` is the bond's.
+    address private immutable SELF;
+
+    constructor(address registry_, address params_, address coupon_, address qday_, address attestation_)
+        ArkCatBondStore(registry_, params_, coupon_, qday_, attestation_)
+    {
+        SELF = address(this);
+    }
+
+    /// Only through the bond: called directly this contract's storage is an empty book.
+    modifier inBond() {
+        if (address(this) == SELF) revert ZeroAddress();
+        _;
+    }
+
+    function _book() private view returns (IArkStakeSettlementBook) {
+        return IArkStakeSettlementBook(address(REGISTRY));
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Trigger 1. Whitepaper §5.1, §5.2; yellow paper §1.4                 */
+    /* ------------------------------------------------------------------ */
+
+    /// The figures of one window, in memory for the legacy code generator's stack.
+    struct Window {
+        uint256 price;
+        uint256 indemnity;
+        uint256 buffer;
+        uint256 obligation;
+        uint256 available;
+        uint256 haircut;
+        uint256 paid;
+        uint256 bufferPaid;
+        uint256 draw;
+        address escrow;
+    }
+
+    /**
+     * Settle a trigger-1 determination through the waterfall of whitepaper
+     * §5.2. Court only, on a determination the court opened.
+     *
+     * `lossUnits` is the realised loss of each affected position in units of
+     * the origin asset, as the court found it, taken at no more than the
+     * position's own notional (OC-COURT-01). Each is made good at the
+     * indemnity in force and multiplied by the position's vesting factor at the
+     * determination (the barrier against anchoring into a known loss, §5.3);
+     * the obligation is summed AFTER vesting; the capital available is the
+     * asset's buffer as its escrow last reported it plus bond principal bounded
+     * by the occurrence limit (I11) and by `value`, the V the court admitted
+     * the finding at (OC-COURT-01, I24); one haircut applies to every position of
+     * the window (I14). The buffer pays first, in the origin asset, by the loss
+     * leaf each beneficiary names a destination for (`nameLossDestination`);
+     * the rest is drawn from the Cushion and then bond principal junior first, converted at the
+     * settlement price of whitepaper §5.5 fixed now (the registry's
+     * `settlementPrice`: the thirty-day series, or under the breaker the
+     * emergency valuation clamped between its floor and the carried price;
+     * phase C3b), and recorded as each beneficiary's settlement entitlement in
+     * QRL. The capital available converts bond principal at the same price.
+     *
+     * One escrow per determination: the loss put to the court is a named
+     * asset's (yellow paper §4.1), and its buffer is the one that pays.
+     */
+    function determineLoss(bytes32 determinationId, bytes32[] calldata ids, uint256[] calldata lossUnits, uint256 value)
+        external
+        inBond
+        closedFirst
+        nonReentrant
+        onlyCourtHere
+    {
+        // Each refusal is the court's one refusal error (re-audit 2026-09-30,
+        // COURT-02): anything else reverts the court's call, which is retried.
+        uint256 n = ids.length;
+        if (n == 0 || n != lossUnits.length) revert FindingRefused(BadDetermination.selector);
+        if (_openedAt[determinationId] == 0) revert FindingRefused(DeterminationNotOpen.selector);
+        if (_settlements[determinationId].kind != 0) revert FindingRefused(AlreadyDetermined.selector);
+        // Exclusive (whitepaper §5.1): once trigger 2 has a ground — a
+        // ratified declaration recorded, or the censorship ground found — the
+        // pool stands behind that settlement and no escrow loss is settled
+        // beside it.
+        if (_t2.stage != 0 || _claim.ground != 0) revert FindingRefused(TriggersExclusive.selector);
+        _syncLoss();
+
+        Window memory w;
+        // A silent series halts no determination (yellow paper §5.2, I40): the
+        // registry strikes at the carried price then, and where the registry
+        // cannot be read at all, the carried rule is read directly.
+        try _book().settlementPrice() returns (uint256 p) {
+            w.price = p;
+        } catch {}
+        if (w.price == 0) w.price = _book().deadOracleOpeningPrice();
+        w.indemnity = _book().effectiveIndemnityBps();
+        {
+            IArkStakeRegistry.Anchor memory first = _book().anchorOf(ids[0]);
+            w.escrow = first.escrow;
+            (w.buffer,) = _book().bufferOf(_book().assetKey(first.chainId, first.asset));
+        }
+
+        // Each position's claim before the haircut: the realised loss, the
+        // indemnity, the vesting factor — three divisions, each truncating
+        // toward the pool, the model's `settlementFor`.
+        uint256[] memory claims = new uint256[](n);
+        for (uint256 i = 0; i < n; i++) {
+            IArkStakeRegistry.Anchor memory a = _book().anchorOf(ids[i]);
+            LossPart storage lp = _lossParts[determinationId][ids[i]];
+            // A loss wider than 128 bits is no loss a position can have, and
+            // would overflow the arithmetic below on every retry: refused.
+            if (a.status == 0 || a.escrow != w.escrow || lp.recorded || lossUnits[i] > type(uint128).max) {
+                revert FindingRefused(BadDetermination.selector);
+            }
+            lp.recorded = true;
+            // No position loses more than its own notional (OC-COURT-01).
+            if (lossUnits[i] < a.anchoredNotional) a.anchoredNotional = lossUnits[i];
+            claims[i] = ArkStakeMath.settlementFor(a.anchoredNotional, w.indemnity, _book().vestingBpsOf(ids[i]), BPS);
+            w.obligation += claims[i];
+        }
+
+        // The bond principal the finding can move is V as the court admitted
+        // and bounded it at the assertion (OC-COURT-01; I24, G8), not what
+        // the occurrence limit, the price or the book became since: the
+        // haircut spreads the rest over every position of the window (I14).
+        uint256 out = outstandingPrincipal();
+        w.available = ArkStakeMath.availableCapital(
+            w.buffer, ArkStakeMath.bondNotionalInOrigin(out < value ? out : value, w.price), _book().requiredCapital()
+        );
+        w.haircut = ArkStakeMath.settlementHaircutBps(w.available, w.obligation);
+        for (uint256 i = 0; i < n; i++) {
+            claims[i] = (claims[i] * w.haircut) / BPS;
+            w.paid += claims[i];
+        }
+        // The buffer first (whitepaper §5.2 step 1), the bond the rest.
+        w.bufferPaid = w.paid < w.buffer ? w.paid : w.buffer;
+
+        for (uint256 i = 0; i < n; i++) {
+            // The buffer's part truncates, so the parts never ask the escrow
+            // for more than it reported; the wei falls to the bond's part.
+            uint256 b = w.paid == 0 ? 0 : (claims[i] * w.bufferPaid) / w.paid;
+            // Converted at the price fixed at the determination; truncates,
+            // toward bond principal.
+            uint256 q = ((claims[i] - b) * w.price) / PRICE_SCALE;
+            LossPart storage lp = _lossParts[determinationId][ids[i]];
+            lp.bufferUnits = uint128(b);
+            lp.qrl = uint128(q);
+            // The buffer's part waits for its loss leaf: the seed return is
+            // held until every such part is sealed (re-audit 2026-09-30, BOND-03).
+            _bufferUnnamed += b;
+            w.draw += q;
+            emit LossPartRecorded(determinationId, ids[i], b, q);
+        }
+
+        // The parts' truncations can leave a wei per position above V; never
+        // drawn. The Cushion first, then junior first (yellow paper §4.5,
+        // I42): it pays inside the bond contribution and adds nothing to it.
+        (uint256 dc, uint256 dj, uint256 ds) = _drawLayers(determinationId, w.draw < value ? w.draw : value, true);
+        _record(determinationId, KIND_T1, dc + dj + ds, 0);
+        emit LossDetermined(determinationId, w.obligation, w.available, w.haircut, w.bufferPaid, dc + dj + ds, dj, ds);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The censorship ground. Whitepaper §3.6, §5.1, §6.2                  */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * The censorship ground, unsliced (whitepaper §3.6, §5.1): the court found
+     * published roots unadmitted for the censorship window. The escrow is
+     * unimpaired, so no severity is measured and the floor D_0 is the whole
+     * draw (item 25b). Its claimants are the positions and the qualifying
+     * releases recorded as of this determination (§5.2), so T is now: the
+     * anchored notional is read here for the record to be completed against,
+     * with `transitUnits`, the releases past unbonding and unsettled for want
+     * of a root. The draw waits for the record (`settleDeclaration`); until
+     * then no principal leaves and nothing is issued, as under a ratified
+     * declaration. The one-slice case of `closeSlice`: the whole upheld.
+     */
+    function determineCensorship(bytes32 determinationId, uint256 transitUnits, uint256 value)
+        external
+        inBond
+        closedFirst
+        nonReentrant
+        onlyCourtHere
+    {
+        if (_openedAt[determinationId] == 0) revert FindingRefused(DeterminationNotOpen.selector);
+        _t2.phiOpen = SLICE_WHOLE;
+        _t2.z = 0;
+        _censorshipValue = 0;
+        // Refused once trigger 2 has a ground, or a declaration is ratified
+        // (OC-ECON-04): the declaration is then the whole ground.
+        if (!_censorshipSlice(SLICE_WHOLE, true, transitUnits, true, value)) {
+            revert FindingRefused(DeclarationAlreadySettled.selector);
+        }
+    }
+
+    /// The whole of a finding's object, in SLICE_SCALE units.
+    uint256 private constant SLICE_WHOLE = 1e18;
+
+    /**
+     * One slice of the censorship ground closing (re-audit 2026-09-30,
+     * COURT-04): upheld, its fraction joins U, held in z until the opening,
+     * and the first upheld slice fixes T (the anchored notional read now, the
+     * payload's transit); rejected, its fraction leaves the open part. The
+     * ground itself stands only when the last slice of the group closes with
+     * at least one upheld: no slice of it grounds anything alone, so a
+     * declaration ratified meanwhile is still the whole ground, and one
+     * ratified after draws on the part U did not reach. Returns whether it
+     * applied; nothing moves once a declaration is the ground.
+     */
+    function _censorshipSlice(uint256 phi, bool upheld, uint256 transitUnits, bool last, uint256 value)
+        private
+        returns (bool)
+    {
+        // A declaration ratified while the slices are open is the whole ground
+        // (yellow paper §3.4; OC-ECON-04), whether or not anyone has grounded
+        // it yet: a slice closing after the ratification establishes nothing.
+        if (_claim.ground != 0 || QDAY.declared()) return false;
+        Declaration storage t = _t2;
+        if (upheld) {
+            if (t.z == 0) {
+                _fixT(uint64(block.timestamp));
+                _claim.baseAtT = _book().totalAnchored();
+                _claim.transitFound = transitUnits;
+            }
+            t.z += phi;
+            // The V this slice was admitted at bounds its part of the floor draw (OC-COURT-01).
+            _censorshipValue += value;
+        }
+        t.phiOpen -= phi;
+        if (last && t.z != 0) {
+            Claimants storage c = _claim;
+            c.ground = GROUND_CENSORSHIP;
+            emit Trigger2Grounded(GROUND_CENSORSHIP, c.at, c.baseAtT, c.transitFound);
+        }
+        return upheld;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The severity balance. Whitepaper §4.6, §5.2; I37                    */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * The court's m_loss for a held balance, unsliced (whitepaper §4.6, §6.2):
+     * the whole of what is open. Court only, and only once the series has
+     * stayed silent for 2 x W_a epochs after the window closed — the model's
+     * `holdDeterminationOpen`. The hold has no other limit in time.
+     */
+    function fixSeverity(uint256 measuredLossBps) external inBond closedFirst nonReentrant onlyCourtHere {
+        bytes4 cause = _severitySlice(T2_BALANCE, _t2.phiOpen, measuredLossBps);
+        if (cause != 0) revert FindingRefused(cause);
+    }
+
+    /**
+     * An upheld finding of m_loss on the fraction `phi` of a held balance: the
+     * fraction drawn at `D = max(D_0, clamp(m, S_floor, BPS))` — no clamp at
+     * the ceiling, a severity the court fixes being bounded by the whole only
+     * — and the rest of it released. Not applied where nothing is held or the
+     * series has resumed (the measured path then settles it): returns the
+     * selector of the refusal, zero where it applied.
+     */
+    function _severitySlice(bytes32 id, uint256 phi, uint256 measuredLossBps) private returns (bytes4) {
+        Declaration storage t = _t2;
+        if (t.stage != T2_HELD) return NothingHeld.selector;
+        uint256 closes = uint256(t.epoch) + uint256(t.windowEpochs);
+        (bool resumed,) = _measure();
+        if (!ArkStakeMath.holdDeterminationOpen(t.windowEpochs, ArkEpoch.current() - closes, resumed)) {
+            return SeverityCourtTooEarly.selector;
+        }
+        _syncLoss();
+        _settleBalance(id, phi, measuredLossBps, true);
+        return 0;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Value slices. Whitepaper §6.2 (EC-04)                               */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Open the `n` value slices of a finding the court heard as a group `g`
+     * (whitepaper §6.2, EC-04): court only, one group at a time of a kind.
+     * The censorship ground's group covers the whole ground (Φ = the whole)
+     * and needs the determination `g` open and no ground yet; a severity
+     * group covers the fraction of the held balance still open (Φ = φ_open)
+     * and needs the balance held. A group of the other kind still standing is
+     * superseded: its slices closing later are refused as the group gone.
+     * Each slice then closes by `closeSlice`, below.
+     */
+    function openSlices(bytes32 g, uint8 kind, uint8 n) external inBond closedFirst nonReentrant onlyCourtHere {
+        if (n == 0 || n > MAX_SLICES) revert BadSlices(g, n);
+        if (_group.id != bytes32(0) && _group.kind == kind) revert SliceGroupOpen(_group.id);
+        Declaration storage t = _t2;
+        uint256 phi;
+        if (kind == SLICE_CENSORSHIP) {
+            if (_openedAt[g] == 0) revert DeterminationNotOpen(g);
+            // Nor once a declaration is ratified, which is then the whole ground (OC-ECON-04).
+            if (t.stage != 0 || _claim.ground != 0 || QDAY.declared()) revert DeclarationAlreadySettled();
+            phi = ArkStakeMath.SLICE_SCALE;
+            t.phiOpen = phi;
+            t.z = 0;
+            _censorshipValue = 0;
+        } else if (kind == SLICE_SEVERITY) {
+            if (t.stage != T2_HELD) revert NothingHeld();
+            phi = t.phiOpen;
+        } else {
+            revert BadSlices(g, n);
+        }
+        _group = SliceGroup(g, kind, n, 0, 0, phi);
+        emit SlicesOpened(g, kind, n, phi);
+    }
+
+    /**
+     * Close slice `i` of the group `g` on its verdict (whitepaper §6.2): court
+     * only, once per slice, a rejection delivered as an upheld finding is. The
+     * group was opened by `openSlices`, above. Its
+     * fraction `φ_i = sliceFraction(Φ, n, i)`; a severity slice's draw is
+     * recorded under `keccak256(abi.encode(g, uint8(i)))`, its case id. The
+     * group is cleared when its last slice closes.
+     *
+     * Every slice of the group closes (re-audit 2026-09-30, BOND-07): an
+     * upheld slice the bond's record no longer admits — a declaration became
+     * the ground, the held balance settled or the series resumed — closes as
+     * rejected, moving nothing, and `applied` is false, on which the court
+     * forfeits that slice's deposit as a refused finding's. Only a slice that
+     * is not open is refused (`FindingRefused(NoSuchSlice)`). A group
+     * refused by a transient revert used to strand its open fraction and the
+     * principal held for it for good.
+     */
+    function closeSlice(bytes32 g, uint8 i, bool upheld, bytes calldata payload, uint256 value)
+        external
+        inBond
+        closedFirst
+        nonReentrant
+        onlyCourtHere
+        returns (bool applied)
+    {
+        SliceGroup storage grp = _group;
+        uint16 bit = uint16(1) << i;
+        if (grp.id != g || i >= grp.n || grp.finalMask & bit != 0) revert FindingRefused(NoSuchSlice.selector);
+        grp.finalMask |= bit;
+        bool last = grp.finalMask == uint16((uint256(1) << grp.n) - 1);
+        uint256 phi = ArkStakeMath.sliceFraction(grp.phi, grp.n, i);
+        if (grp.kind == SLICE_CENSORSHIP) {
+            applied = _censorshipSlice(phi, upheld, upheld ? abi.decode(payload, (uint256)) : 0, last, value);
+        } else if (upheld) {
+            applied = _severitySlice(keccak256(abi.encode(g, i)), phi, abi.decode(payload, (uint256))) == 0;
+        }
+        if (applied) grp.upheldMask |= bit;
+        emit SliceClosed(g, i, applied, phi);
+        if (last) delete _group;
+    }
+}

@@ -1,0 +1,134 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/security/ReentrancyGuard.hyp";
+
+import "./interfaces/IPremiumSwap.hyp";
+import "./interfaces/IArkCatBond.hyp";
+import "./interfaces/IArkStakeExternal.hyp";
+import "./interfaces/IArkStakeParams.hyp";
+import "./interfaces/IProceedsLedger.hyp";
+import "./utils/QuantumErrors.hyp";
+
+/**
+ * The storage of the premium swap, declared once for `PremiumSwap` and the
+ * module that judges and retires its offerings, `PremiumSwapJudge`, which
+ * runs in the swap's storage by `delegatecall` (audit OC 2026-10-03,
+ * OC-ORC-04; staking CLAUDE.md item 123).
+ *
+ * WHY THIS BASE EXISTS
+ * --------------------
+ * The rule of yellow paper §4.6 on suspended pricing did not fit in the
+ * swap's v3 room (20 bytes after item 122). The judgement and the
+ * retirement moved to a module, `ArkCatBondStore`'s pattern: both contracts
+ * inherit this base, so the storage layout is shared BY CONSTRUCTION — the
+ * declarations of the one contract `PremiumSwap` was, `ReentrancyGuard`
+ * first, in the original order, appended to and never reordered.
+ * `PremiumSwap is IPremiumSwap, PremiumSwapStore` linearises to
+ * `ReentrancyGuard`, this base, `PremiumSwap`, as `IPremiumSwap,
+ * ReentrancyGuard` did, and an interface holds no storage: every slot is
+ * where it was before the split.
+ *
+ * WHY THE DEPENDENCIES STAY IMMUTABLE
+ * -----------------------------------
+ * An immutable is not storage: under the delegatecall the module reads its
+ * own, so the swap's constructor creates it with the swap's own arguments
+ * (`new PremiumSwapJudge(...)`), and both hold the same five. No owner, no
+ * setter.
+ */
+abstract contract PremiumSwapStore is ReentrancyGuard {
+    IArkStakeBook public immutable REGISTRY;
+    IArkStakeParams public immutable PARAMS;
+    IProceedsLedger public immutable LEDGER;
+    IAttestationVerifier public immutable ATTESTATION;
+
+    /// The court whose fee pool the juror fraction's QRL funds; zero: none, the ledger takes it (R41 (4)).
+    address public immutable FEE_POOL;
+
+    mapping(bytes32 => IPremiumSwap.Lot) internal _lots;
+    mapping(bytes32 => mapping(uint256 => IPremiumSwap.Offering)) internal _offerings;
+    mapping(bytes32 => mapping(uint256 => bytes32[])) internal _lotIds;
+    /// Keyed by (hashlock, solver): see `quote`.
+    mapping(bytes32 => bool) internal _hashlockUsed;
+
+    // The five bytes32-keyed mappings below are internal behind the explicit
+    // views at the end: hypc's QRVM auto-getter cleans a key as uint256 before
+    // hashing, and a left-aligned bytes32 becomes zero (OC-V3-02).
+    /// Consecutive offerings of an asset that sold below the clearing floor (OC-SWAP-06).
+    mapping(bytes32 => uint256) internal _failedOfferings;
+
+    /// Shares of an asset retained as buffer and offered no more (whitepaper §4.7).
+    mapping(bytes32 => uint256) internal _retainedShares;
+
+    /// The units those shares stood for when they retired: held constant, so their yield is what exceeds it (I34).
+    mapping(bytes32 => uint256) internal _retainedUnits;
+
+    /// Shares released from the retained stock's yield and not yet sold: the first sold of each offering (I34).
+    mapping(bytes32 => uint256) internal _carryShares;
+
+    /// The shortfall carry of an asset, in QRL (I34). The ledger holds the total the bond reads.
+    mapping(bytes32 => uint256) internal _shortfallCarry;
+
+    /// Bonds of the lots of an offered epoch selected and not yet claimed: forfeited at its QRL expiry (I33).
+    mapping(uint256 => uint256) public bondsAtRisk;
+
+    /// The premium share noted in each epoch, plus one (zero: not noted). QL-15.
+    mapping(uint256 => uint256) internal _shareAt;
+
+    /// Lots of an offering each solver holds, keyed by (asset key, epoch, solver). QL-17.
+    mapping(bytes32 => uint256) internal _solverLots;
+
+    /// The quantity each asset carries below the batching threshold (whitepaper §4.7). See `IPremiumSwap.Carry`.
+    mapping(bytes32 => IPremiumSwap.Carry) internal _carries;
+
+    /// One more than the epoch of each asset's last recorded offering (zero: none). The offering after it judges it.
+    mapping(bytes32 => uint256) internal _lastOfferPlusOne;
+
+    /**
+     * Offerings in whose quote window a quote was refused for suspended
+     * pricing, the series silent or the breaker active (yellow paper §4.6,
+     * OC-ORC-04): the refusal recorded, which the judgement reads. Appended
+     * after the layout of 2026-10-05.
+     */
+    mapping(bytes32 => mapping(uint256 => bool)) internal _quoteRefused;
+
+    constructor(address registry_, address params_, address ledger_, address attestation_, address feePool_) {
+        if (registry_ == address(0) || params_ == address(0) || ledger_ == address(0) || attestation_ == address(0)) {
+            revert ZeroAddress();
+        }
+        REGISTRY = IArkStakeBook(registry_);
+        PARAMS = IArkStakeParams(params_);
+        LEDGER = IProceedsLedger(ledger_);
+        ATTESTATION = IAttestationVerifier(attestation_);
+        FEE_POOL = feePool_;
+    }
+
+    /// What `epoch`'s offering may sell: its snapshot less the previous offering's selected lots and the retained quantity.
+    function _available(bytes32 key, uint256 epoch) internal view returns (uint256) {
+        IPremiumSwap.Offering storage o = _offerings[key][epoch];
+        if (!o.recorded) return 0;
+        uint256 taken = _retainedShares[key];
+        if (epoch != 0) taken += _offerings[key][epoch - 1].sold;
+        return o.offered > taken ? o.offered - taken : 0;
+    }
+
+    function failedOfferings(bytes32 key) external view returns (uint256) {
+        return _failedOfferings[key];
+    }
+
+    function retainedShares(bytes32 key) external view returns (uint256) {
+        return _retainedShares[key];
+    }
+
+    function retainedUnits(bytes32 key) external view returns (uint256) {
+        return _retainedUnits[key];
+    }
+
+    function carryShares(bytes32 key) external view returns (uint256) {
+        return _carryShares[key];
+    }
+
+    function shortfallCarry(bytes32 key) external view returns (uint256) {
+        return _shortfallCarry[key];
+    }
+}

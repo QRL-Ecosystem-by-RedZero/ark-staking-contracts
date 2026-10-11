@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * Centralised file-level custom errors shared by every Ark Staking contract.
+ *
+ * File-level errors keep duplicated revert-string data out of the deployed
+ * bytecode, which matters more here than on Ethereum: an ML-DSA-87 signature
+ * plus public key adds ~7.2KB to every Zond transaction, so creation code above
+ * ~18KB can no longer be deployed in a single request.
+ *
+ * ONLY THE ERRORS THIS PRODUCT ACTUALLY RAISES BELONG HERE. The version this
+ * was cut down from carried 25 declarations, 22 of which named insurance
+ * conditions (policy status, attestation deadlines, Merkle epochs, Q-Day) that
+ * nothing in this repository can reach. Unused declarations cost no bytecode,
+ * which is exactly why they accumulate unnoticed — and a shared error file that
+ * lists conditions the code cannot produce is a map of a system that is not
+ * here. Anything specific to one contract stays in that contract's interface,
+ * next to the rule it enforces.
+ */
+
+/// A zero address was supplied where a live account or contract is required.
+error ZeroAddress();
+
+/// A zero value was supplied where a non-zero amount or identifier is required.
+error ZeroValue();
+
+/// A token or native-value transfer returned false or reverted.
+error TransferFailed(address recipient, uint256 amount);

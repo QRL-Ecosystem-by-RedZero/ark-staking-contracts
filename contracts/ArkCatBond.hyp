@@ -1,0 +1,998 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./ArkCatBondExit.hyp";
+import "./ArkCatBondSettlement.hyp";
+import "./interfaces/IObjectionSource.hyp";
+import "./ArkCatBondStore.hyp";
+
+import "./interfaces/IArkCatBond.hyp";
+import "./interfaces/IArkStakeExternal.hyp";
+import "./interfaces/IArkStakeParams.hyp";
+import "./utils/ArkEpoch.hyp";
+import "./utils/ArkStakeMath.hyp";
+import "./utils/QuantumErrors.hyp";
+import "./utils/ArkFlowReceiver.hyp";
+
+/**
+ * The catastrophe bond of Ark Staking, on QRL.
+ *
+ * See IArkCatBond for the rule this contract exists to enforce: bond principal
+ * leaves the pool at maturity, by the measured condition of whitepaper §5.3, or
+ * to settle a trigger of §5.1, and never on request.
+ *
+ * WHY THE PRICE OF COVER DEPENDS ON A PERMISSIONLESS CALL
+ * ------------------------------------------------------
+ * `ArkStakeRegistry.premiumCeilingInForceBps` reads `runoffGateClosed()` on its
+ * pricing path, and `_markPremium` sits at the end of `recordAnchor` and
+ * `instructRelease` — so every anchoring pays for that read. It is therefore one
+ * SLOAD of stored state, never a computation, and in particular never a read
+ * back into the registry, which would be a loop on the hot path.
+ *
+ * That makes the gate state rather than a view, and state at an epoch boundary
+ * has to be advanced by somebody. `closeEpoch` is permissionless for
+ * `markPremium`'s reason: the figures are computed here and supplied by nobody,
+ * so the caller changes when the gate is measured and nothing about the result.
+ * `_close()` also runs at the START of every path that changes outstanding
+ * principal, so the ring records what an epoch closed at rather than what the
+ * calling transaction is about to make it.
+ *
+ * THE FOUR POTS, AND WHAT THEY MAKE CHECKABLE
+ * -------------------------------------------
+ * `ProceedsLedger` makes a coupon out of principal unreachable. The opposite
+ * direction is this contract's to guard, because this one balance holds
+ * principal, drawn coupon and the staking distribution at once, and, since
+ * 2026-10-06, the Cushion. So each is counted, every path that moves principal
+ * out is bounded by what is left over, and the suite asserts after every
+ * operation that the balance still covers all four. A guard that can be
+ * checked from outside the contract is worth more than one that cannot.
+ *
+ * THE CUSHION (yellow paper §4.5; technical reference §1.7; I42)
+ * --------------------------------------------------------------
+ * QRL beneath junior, deposited by any account on `ArkLanes.CUSHION` through
+ * the inherited IArkFlow receiver: the Quantum Ark Treasury below its target,
+ * Qurrl's revenue splitter, anyone. A deposit confers no claim, coupon, vote or
+ * refund. It is never staked and never a coupon source; each draw of either
+ * trigger takes it first, the censorship ground apart, and once a
+ * declaration's settlement is whole `drawCushionResidual` pays what remains to
+ * the claimants and closes the lane. Nothing else debits it. `ArkFlowReceiver`
+ * is inherited AFTER `ArkCatBondStore`, so the store stays the prefix of this
+ * contract's layout, which the modules share.
+ *
+ * ONE CONTRACT IN TWO BODIES OF CODE
+ * ----------------------------------
+ * The QIP-55 compiler's 64-byte-word ABI plumbing grew every external function
+ * here by about 21%, and EIP-170 did not move: the v3 runtime came out at
+ * 27,226 bytes against 24,576, and no compiler flag closes a gap that size. So
+ * the exit machinery — `redeem`, `claimQueued`, `claimTail`, `transferHolding`,
+ * `conditionalRelease`, the coldest paths on the book — executes in
+ * `ArkCatBondExit` via `delegatecall`, behind the thin stubs below. This
+ * contract's constructor creates the module and fixes its address in an
+ * immutable: no linking, no setter, no admin, so the target is exactly as
+ * immutable as this bytecode and this is NOT a proxy in the upgradeability
+ * sense the escrow forbids. `ArkCatBondStore` is the one declaration of the
+ * storage both bodies share; see its header, and the module's, for the rest of
+ * the argument.
+ */
+contract ArkCatBond is IArkCatBondPrincipal, IObjectionSource, ArkCatBondStore, ArkFlowReceiver {
+    /**
+     * The account allowed to call the two one-shot setters. An argument and never
+     * `msg.sender`, because this contract is larger than one QRL transaction can
+     * carry and is created by `ChunkedDeployer` — whose address `msg.sender` would
+     * be, and which can make no call with the right. See IChunkedDeployer.
+     */
+    address private immutable _deployer;
+
+    /**
+     * Where the exit machinery runs. Created below, by this constructor, and
+     * fixed for ever: nothing on either side can repoint it. See the header.
+     */
+    address internal immutable EXIT_MODULE;
+
+    /**
+     * Where build 2 runs (phase C3): the trigger settlement, the settlement
+     * entitlement, the subrogation recovery and the objection source, reached
+     * through `fallback` — every selector this contract does not declare is
+     * executed there, on this storage.
+     *
+     * A CONSTRUCTOR ARGUMENT, NOT CREATED HERE, AND WHY. The exit module's
+     * creation code already sits inside this contract's; the settlement's
+     * beside it would put this contract's initcode past EIP-3860's 49,152
+     * bytes on either compiler line (57,351 on the harness build), and
+     * `ChunkedDeployer` creates under that same limit. So the module is
+     * deployed first and named here, and the constructor checks it was built
+     * on this bond's five dependencies (`ModuleMismatch`). It is fixed for
+     * ever like every other dependency: an immutable, no setter, no admin —
+     * and its code, which anyone can compare with the source, is the one
+     * thing a reviewer of this deployment must read beside this contract's.
+     */
+    address public immutable SETTLEMENT_MODULE;
+
+    /* ------------------------------------------------------------------ */
+    /* Construction and wiring                                             */
+    /* ------------------------------------------------------------------ */
+
+    constructor(
+        address registry_,
+        address params_,
+        address coupon_,
+        address qday_,
+        address attestation_,
+        address deployer_,
+        address settlement_
+    ) ArkCatBondStore(registry_, params_, coupon_, qday_, attestation_) {
+        if (deployer_ == address(0)) revert ZeroAddress();
+        _deployer = deployer_;
+
+        // The module is a consequence of this deployment and of nothing else:
+        // created here, from the same five dependencies, its address readable
+        // by nobody and changeable by nothing. The creation code it adds to
+        // this contract's own is what `ChunkedDeployer` exists to carry.
+        EXIT_MODULE = address(new ArkCatBondExit(registry_, params_, coupon_, qday_, attestation_));
+        ArkCatBondSettlement s = ArkCatBondSettlement(settlement_);
+        if (
+            settlement_.code.length == 0 || address(s.REGISTRY()) != registry_ || address(s.PARAMS()) != params_
+                || address(s.COUPON()) != coupon_ || address(s.QDAY()) != qday_
+                || address(s.ATTESTATION()) != attestation_
+        ) revert ModuleMismatch(settlement_);
+        SETTLEMENT_MODULE = settlement_;
+
+        // The epoch this contract is deployed in has not closed yet, and it is a
+        // real epoch of the book: its close is the first one `_close()` evaluates.
+        // Starting at the current epoch would treat it as already closed, and a
+        // ground holding from the first block — a bond deployed at the fourth
+        // threat stage — would not close the gate until an epoch later.
+        uint256 nowEpoch = ArkEpoch.current();
+        _lastClosed = uint64(nowEpoch == 0 ? 0 : nowEpoch - 1);
+        _nextId = 1;
+    }
+
+    modifier onlyStaking() {
+        if (msg.sender != staking) revert OnlyStaking(msg.sender);
+        _;
+    }
+
+    modifier onlyCourt() {
+        if (msg.sender != court) revert OnlyCourt(msg.sender);
+        _;
+    }
+
+    /// Name the contract bond principal is placed through. One-shot; see the field.
+    function setStaking(address staking_) external {
+        if (msg.sender != _deployer) revert OnlyDeployer(msg.sender);
+        if (staking != address(0)) revert AlreadySet(staking);
+        if (staking_ == address(0)) revert ZeroAddress();
+
+        staking = staking_;
+        emit StakingSet(staking_);
+    }
+
+    /// Name the dispute court that opens and closes a determination. One-shot.
+    function setCourt(address court_) external {
+        if (msg.sender != _deployer) revert OnlyDeployer(msg.sender);
+        if (court != address(0)) revert AlreadySet(court);
+        if (court_ == address(0)) revert ZeroAddress();
+
+        court = court_;
+        emit CourtSet(court_);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The epoch boundary                                                  */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Advance the book to the last epoch that has closed.
+     *
+     * Permissionless and idempotent, for `ArkStakeRegistry.markPremium`'s
+     * reason: every figure below is computed from state this contract already
+     * holds, so the caller decides when the boundary is crossed and nothing
+     * about what is found there.
+     *
+     * Called at the START of every path that changes outstanding principal. That
+     * ordering is the whole correctness of the ring: an epoch's entry must be
+     * what the epoch closed at, not what the calling transaction is about to
+     * make it. It also means outstanding principal cannot move without the
+     * boundary having been crossed first, which is why a gap of several epochs
+     * can be filled with one figure rather than needing a reading for each.
+     *
+     * Refuses a gap longer than `MAX_CLOSE` by name, as every internal path
+     * does: `closeEpochs` closes it in batches.
+     */
+    function closeEpoch() external nonReentrant {
+        _close();
+    }
+
+    /// Close at most `max` of the epochs still unclosed, oldest first. For a gap `closeEpoch` refuses.
+    function closeEpochs(uint256 max) external nonReentrant {
+        if (max == 0) revert ZeroValue();
+        _closeVia(max, false);
+    }
+
+    /**
+     * The boundary runs in the exit module, on this storage (see
+     * `ArkCatBondExit.closeBatch`): the code is there once, and this contract
+     * carries a delegatecall in its place. Every path here that calls it holds
+     * the guard already.
+     */
+    function _close() internal override {
+        _closeVia(MAX_CLOSE, true);
+    }
+
+    function _closeVia(uint256 max, bool strict) private {
+        uint64 was = _lastClosed;
+        _delegate(EXIT_MODULE, abi.encodeWithSelector(ArkCatBondExit.closeBatch.selector, max, strict));
+        // c_max as in force at the boundary just closed (technical reference
+        // §1.7): the cushion lane's room reads it, so `deposit` reads no other
+        // contract (IArkFlow rule 2).
+        if (_lastClosed != was) (,,,,,,, _cushionCeilingBps) = PARAMS.bondParams();
+    }
+
+    /**
+     * Utilisation of the book, in bps: the capital the book requires against the
+     * bond principal and the origin-asset buffer behind it, on the settlement
+     * series (whitepaper §4.3, I38). Whitepaper §5.3 gates the conditional
+     * release on it staying below 2,500 bps. Measured by the registry; see
+     * `_utilisationBelow`.
+     */
+    function utilisationBps() external view returns (uint256) {
+        return REGISTRY.utilisationBps();
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Issuance. Whitepaper §3.4, §4.7, §5.3                               */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Subscribe bond principal into a term and a class.
+     *
+     * The amount is `msg.value`: the bond is bought with native QRL and there is
+     * no ERC20 anywhere in this design, so a second statement of the amount would
+     * be a check rather than a fact. A shape departure from yellow paper §1.4's
+     * `subscribe(term, amount, class)`, of the kind R20 records.
+     *
+     * `term` is a plain `uint8` and not an `enum`: an ordinal outside an enum's
+     * range reverts with a `Panic`, and §10.3 already lists "reverts with a panic
+     * rather than a named error" as a defect of the inherited contracts.
+     *
+     * The run-off gate being closed does NOT suspend issuance. Issuance is what
+     * repairs a contraction of the book, and whitepaper §5.3 raises the ceiling
+     * on the target share to the surge value precisely to attract it.
+     */
+    function subscribe(uint8 term, uint8 class_) external payable nonReentrant returns (uint256 id) {
+        if (class_ > SENIOR) revert ClassUnknown(class_);
+        uint16 termEpochs = _termEpochs(term);
+        if (msg.value < MIN_SUBSCRIPTION) revert SubscriptionTooSmall(msg.value, MIN_SUBSCRIPTION);
+
+        _close();
+
+        uint256 maturity = ArkEpoch.current() + uint256(termEpochs);
+        {
+            (uint16 ladderBps,,, uint16 thicknessBps,, uint16 floorBps,, uint16 ceilingBps) = PARAMS.bondParams();
+            // c_max in force now, for the cushion lane's room (technical reference §1.7).
+            _cushionCeilingBps = ceilingBps;
+            _requireIssuable(uint256(floorBps));
+
+            uint256 poolAfter = _nominal() + msg.value;
+            _requireLadderAdmits(uint256(ladderBps), maturity, poolAfter);
+            _requireThicknessHolds(uint256(thicknessBps), uint256(ceilingBps), class_, poolAfter);
+        }
+
+        // The cliff attaches to the ISSUANCE (I20), and rounds UP to the next
+        // whole epoch: a holding is never paid for an epoch any part of which
+        // fell inside its cliff, so the residual of the rounding stays with the
+        // holders already in the class.
+        uint256 cliff = ArkEpoch.epochOf(block.timestamp + uint256(ArkEpoch.COUPON_CLIFF)) + 1;
+
+        uint128 minted = _mint(class_, msg.value);
+        // After `_mint`, which may have started a new generation of the class.
+        _cliffEntering[_key(cliff, class_)] += minted;
+
+        id = _nextId++;
+        Holding storage h = _holdings[id];
+        h.owner = msg.sender;
+        h.class_ = class_;
+        h.termEpochs = termEpochs;
+        h.maturityEpoch = uint32(maturity);
+        h.cliffEpoch = uint32(cliff);
+        h.shares = minted;
+        // The cursor starts the epoch before the cliff, so the first epoch this
+        // holding is paid for is exactly `cliff`.
+        h.claimedThrough = uint32(cliff - 1);
+        h.gen = _gen[class_];
+        // Out of this epoch's staking distribution; it joins at the next
+        // (whitepaper §3.4, D16). `_mint` has run, so a new generation has
+        // already cleared the count this adds to.
+        h.freeFrom = _noteNewShares(class_, minted);
+        h.freeDebt = uint256(minted) * _accFree[class_];
+        h.releaseDebt = uint256(minted) * _accRelease[class_];
+
+        if (_maturing[_key(maturity, JUNIOR)] == 0 && _maturing[_key(maturity, SENIOR)] == 0) {
+            // Monotone, and never decremented. It exists to decide whether the
+            // ladder can be satisfied at all, which is a fact about whether the
+            // book has started rather than about what it holds now.
+            _maturityEpochsUsed += 1;
+        }
+        _maturing[_key(maturity, class_)] += minted;
+        _ckHolder(msg.sender, class_, minted, true);
+
+        emit Subscribed(msg.sender, id, class_, msg.value, minted, maturity);
+    }
+
+    /// Count `minted` shares of `c` as created this epoch, the count restarting with the epoch. Returns the epoch they join at.
+    function _noteNewShares(uint8 c, uint128 minted) private returns (uint32) {
+        uint256 nowEpoch = ArkEpoch.current();
+        if (uint256(_newEpoch) != nowEpoch) {
+            _newEpoch = uint64(nowEpoch);
+            _newShares[JUNIOR] = 0;
+            _newShares[SENIOR] = 0;
+        }
+        _newShares[c] += minted;
+        return uint32(nowEpoch + 1);
+    }
+
+    /// Shares of `c` recorded at the opening of the epoch in progress: the base of its distribution.
+    function _openingShares(uint8 c) private view returns (uint256) {
+        uint256 sc = uint256(_shares[c]);
+        if (uint256(_newEpoch) != ArkEpoch.current()) return sc;
+        uint256 n = uint256(_newShares[c]);
+        return sc > n ? sc - n : 0;
+    }
+
+    /// The admitted terms of whitepaper §6.3, in epochs. Named, never an enum ordinal.
+    function _termEpochs(uint8 term) private view returns (uint16) {
+        // The admitted subset in force (whitepaper §6.3, yellow paper §4.5):
+        // bit `term` of the mask. A withdrawn term stops issuance at it from
+        // the boundary the vote takes effect at, and shortens nothing already
+        // issued — the maturity is fixed below, at issuance.
+        if (term > 2 || (PARAMS.admittedTermsMask() >> term) & 1 == 0) revert TermNotAdmitted(term);
+        if (term == 0) return TERM_QUARTER_EPOCHS;
+        if (term == 1) return TERM_YEAR_EPOCHS;
+        return TERM_THREE_YEAR_EPOCHS;
+    }
+
+    /**
+     * The four suspensions of whitepaper §4.7, plus the two this tree adds.
+     *
+     * The declaration and the protective freeze are NOT among the conditions
+     * yellow paper §1.4 lists for issuance. Selling cover after the event that
+     * consumes the whole pool is not a case the listing contemplated, and
+     * refusing it is the only defensible direction; recorded as a departure.
+     */
+    function _requireIssuable(uint256 tailPremiumFloorBps) private view {
+        if (QDAY.declared()) revert Declared();
+        if (QDAY.frozen()) revert Frozen();
+        if (_open != 0) revert DeterminationOpen(_open);
+        // The censorship ground found and its draw not yet taken (phase C3b):
+        // new principal would be drawn by a finding it was not subscribed under.
+        if (_claim.ground != 0 && _t2.stage == 0) revert DeclaredPendingSettlement();
+        if (_shortfallUnrecovered()) revert CouponShortfallUnrecovered();
+        if (REGISTRY.breakerActive()) revert BreakerActive();
+        // Issuance is suspended while the series is silent (yellow paper
+        // §6.1, the table of silence: capacity and cover carry the last mark,
+        // and no principal is sold against a price nobody is reporting; I40).
+        IReferencePriceOracle oracle = IReferencePriceOracle(REGISTRY.priceOracle());
+        if (oracle.silent(0, address(0))) revert IReferencePriceOracle.OracleSilent(0);
+
+        // Whitepaper §4.7 condition 4, read at exact cover as §4.5 requires
+        // wherever the floor is applied. The realised origin yield is external
+        // and is not a protocol parameter, so it is read at the oracle's
+        // book-wide key — the same `(0, address(0))` the registry already reads
+        // the reference price, the breaker and the conversion haircut at.
+        uint256 y = oracle.realisedYieldBps(0, address(0));
+        uint256 coupon = REGISTRY.couponAtExactCoverBps(y);
+        if (coupon < tailPremiumFloorBps) revert CouponBelowFloor(coupon, tailPremiumFloorBps);
+    }
+
+    /**
+     * Whitepaper §5.3: issuance into a maturity epoch is refused once the
+     * principal maturing there reaches the ladder fraction of the book it is sold
+     * into, so the book cannot mature at one time. A refusal at issuance rather
+     * than a default at maturity, and never re-evaluated afterwards — §4.7 fixes
+     * the base at "the principal outstanding when it was sold into".
+     *
+     * Cross-multiplied, so there is no rounding direction to defend; the
+     * precedent is the registry's admission condition.
+     *
+     * THE LADDER IS WAIVED WHILE IT CANNOT BE SATISFIED. The whitepaper states no
+     * launch rule, and without one the first subscription into an empty book is
+     * refused by its own arithmetic — every wei of it matures in one epoch, which
+     * is the whole book. R7 waives the admission cap on exactly this ground, and
+     * with the same consequence: the waiver decides what may be sold and never
+     * what must be held.
+     */
+    function _requireLadderAdmits(uint256 ladderBps, uint256 maturity, uint256 poolAfter) private view {
+        if (_maturityEpochsUsed < ArkStakeMath.runoffHorizonEpochs(ladderBps)) return;
+
+        uint256 maturing = maturingQrl(maturity);
+        if ((maturing + msg.value) * BPS > poolAfter * ladderBps) {
+            revert MaturityLadderFull(maturity, (poolAfter * ladderBps) / BPS);
+        }
+    }
+
+    /**
+     * Whitepaper §4.6 promises senior that junior absorbs a loss to the whole of
+     * its thickness before senior is reached. The promise is only true if junior
+     * is actually at least that thick, so the thickness binds ONE-SIDEDLY, at
+     * issuance: a senior subscription that would take junior's share of the pool
+     * below it is refused.
+     *
+     * A junior subscription is always admitted. It only deepens senior's
+     * protection, and the junior subscriber pays for an over-thick class in a
+     * lower rate — price correcting the composition rather than a rule. Nothing
+     * is clawed back either: a junior maturity may carry junior below the
+     * thickness, and the only consequence is that no senior subscription is
+     * admitted until junior deepens again.
+     *
+     * Cross-multiplied, so no division and no rounding to defend. Nothing on the
+     * coupon path reads the thickness at all.
+     *
+     * The Cushion counts beside junior, to its ceiling (yellow paper §4.5;
+     * technical reference §1.7, subscribe): `J + min(N_C, c_max * N_B) >= w *
+     * N_B`, N_B after the subscription, the model's
+     * `seniorSubscriptionAdmissible`. With c_max at most 3,000 and w at least
+     * 5,000, junior is still at least 2,000 bps of the pool at issuance.
+     * `JuniorTooThin` reports junior with its credit.
+     */
+    function _requireThicknessHolds(uint256 thicknessBps, uint256 ceilingBps, uint8 class_, uint256 poolAfter)
+        private
+        view
+    {
+        if (class_ != SENIOR) return;
+        uint256 credit = (ceilingBps * poolAfter) / BPS;
+        if (credit > uint256(_cushion)) credit = uint256(_cushion);
+        uint256 pj = uint256(_principal[JUNIOR]) + credit;
+        if (pj * BPS < thicknessBps * poolAfter) revert JuniorTooThin(pj, (thicknessBps * poolAfter) / BPS);
+    }
+
+    /**
+     * Mint shares of a class for `amount` of QRL.
+     *
+     * Truncates, and the residual falls on the SUBSCRIBER: a new subscription
+     * must not dilute the holders already in the class by a rounding wei. A class
+     * whose principal has been drawn to zero starts a new generation, so shares
+     * that are worth nothing cannot dilute the subscription that recapitalises
+     * it.
+     *
+     * So does a class drawn to DUST (`DEAD_RATIO`): minting against one part
+     * in a billion of principal per share would issue more shares than 128 bits
+     * hold. The new subscriber takes the dust with the class, which is less than
+     * a billionth of what it paid; the old generation is void either way.
+     */
+    function _mint(uint8 c, uint256 amount) private returns (uint128 minted) {
+        uint256 sc = uint256(_shares[c]);
+        uint256 pc = uint256(_principal[c]);
+
+        if (sc == 0 || pc * DEAD_RATIO < sc) {
+            if (sc != 0) _newGeneration(c);
+            minted = _u128(amount);
+            _shares[c] = minted;
+        } else {
+            minted = _u128((amount * sc) / pc);
+            if (minted == 0) revert SubscriptionTooSmall(amount, MIN_SUBSCRIPTION);
+            _shares[c] = _u128(sc + minted);
+        }
+        _principal[c] = _u128(pc + amount);
+        _ckClass(c);
+    }
+
+    /**
+     * Void every holding of a class. Its shares are gone, so nothing counted in
+     * them — the coupon base, principal due — survives into the next generation;
+     * the per-epoch maps need no clearing because their key carries the
+     * generation.
+     */
+    function _newGeneration(uint8 c) private {
+        _gen[c] += 1;
+        _shares[c] = 0;
+        _newShares[c] = 0;
+        _eligible[c] = 0;
+        _dueShares[c] = 0;
+        // The queue's buckets are keyed by generation; these are its totals.
+        _queuedShares[c] = 0;
+        _floorShares[c] = 0;
+        _weightedShares[c] = 0;
+    }
+
+    /// QRL maturing in an epoch, across both classes. Truncates, toward the pool.
+    function maturingQrl(uint256 epoch) public view returns (uint256) {
+        return _worth(JUNIOR, _maturing[_key(epoch, JUNIOR)]) + _worth(SENIOR, _maturing[_key(epoch, SENIOR)]);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Claiming                                                            */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Pay a holding everything it is owed: the coupon of every epoch since it was
+     * last paid, the staking distribution of whitepaper §3.4, and principal a
+     * conditional release has returned.
+     *
+     * One function and one transfer rather than three. Three would be three
+     * reentrancy prologues, three transfers and three encodings of the same
+     * bound, in the contract nearest the deployment ceiling of CLAUDE.md §3.1 — and
+     * three paths that move value where one will do.
+     */
+    function claim(uint256 id) external nonReentrant returns (uint256 amount) {
+        Holding storage h = _holdings[id];
+        if (h.owner != msg.sender) revert NotHolder(id, msg.sender);
+
+        (uint256 coupon, uint256 free, uint256 release) = _settle(h, true);
+        // The coupon was sent by `COUPON` itself; only the other two are ours to
+        // send. A claim that found only a coupon has still paid something, so it
+        // is refused only where all three streams were empty.
+        amount = free + release;
+        if (coupon + amount == 0) revert NothingDue(id);
+
+        emit Claimed(msg.sender, id, coupon, free + release);
+        _send(msg.sender, amount);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The exit machinery, in `ArkCatBondExit`. Whitepaper §5.3            */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Run the calling function's body in the exit module, on this contract's
+     * own storage, and hand back exactly what it produced.
+     *
+     * `msg.data` is forwarded whole — the module declares the same signatures —
+     * and a revert is re-raised byte for byte, so every named error below the
+     * seam surfaces here unchanged. Each moved function returns one uint256,
+     * which is why one helper serves all five stubs. The stubs carry NO
+     * `nonReentrant`: the guard sits on the moved bodies, on the shared
+     * `_status` slot, and a guarded stub would deadlock against it.
+     */
+    function _viaExit() private returns (uint256) {
+        return abi.decode(_delegate(EXIT_MODULE, msg.data), (uint256));
+    }
+
+    /// Delegatecall `data` into `module` and hand back its return data, or re-raise its revert byte for byte.
+    function _delegate(address module, bytes memory data) private returns (bytes memory ret) {
+        bool ok;
+        (ok, ret) = module.delegatecall(data);
+        if (!ok) {
+            /// @hyperion memory-safe-assembly
+            assembly {
+                // The payload of `bytes memory` sits one native word past the
+                // pointer, and the native word is 32 bytes on the v2 line and
+                // 64 under QIP-55. `shl(256, 1)` is zero exactly on a 256-bit
+                // word — a shift at or past the width — so it distinguishes
+                // the two at run time and one source serves both compilers.
+                let word := 0x20
+                if iszero(iszero(shl(256, 1))) { word := 0x40 }
+                revert(add(ret, word), mload(ret))
+            }
+        }
+    }
+
+    /// Return a matured holding's principal at par. See `ArkCatBondExit.redeem`.
+    function redeem(uint256 id) external returns (uint256 amount) {
+        return _viaExit();
+    }
+
+    /// Draw this holding's part of its maturity cohort. See `ArkCatBondExit.claimQueued`.
+    function claimQueued(uint256 id) external returns (uint256 amount) {
+        return _viaExit();
+    }
+
+    /// Take the coupon of a tail as far as distributed. See `ArkCatBondExit.claimTail`.
+    function claimTail(uint256 tailId) external returns (uint256 amount) {
+        return _viaExit();
+    }
+
+    /// Move a holding, whole or in part. See `ArkCatBondExit.transferHolding`.
+    function transferHolding(uint256 id, address to, uint256 shares_) external returns (uint256 newId) {
+        return _viaExit();
+    }
+
+    /// Return principal above the capital requirement. See `ArkCatBondExit.conditionalRelease`.
+    function conditionalRelease() external returns (uint256 release) {
+        return _viaExit();
+    }
+
+    function tailOf(uint256 tailId) external view returns (CouponTail memory) {
+        return _tails[tailId];
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Bond principal at QRL staking. Whitepaper §3.4                      */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Place idle principal with staking.
+     *
+     * Permissionless: the destination was fixed at wiring and the caller receives
+     * nothing, which is the pattern §7.11 records for every sweep and drain in this
+     * product. What may be placed is bounded by `unencumbered`, so a distribution
+     * owed to a holder, or principal a release or the queue has already promised,
+     * can never be staked.
+     */
+    function placeWithStaking(uint256 amount) external nonReentrant {
+        if (amount == 0) revert ZeroValue();
+        uint256 free = unencumbered();
+        if (amount > free) revert PrincipalNotLiquid(free);
+
+        _placed += amount;
+        IArkBondStaking(staking).place{value: amount}();
+    }
+
+    /// @inheritdoc IArkCatBondPrincipal
+    function returnPrincipal() external payable onlyStaking {
+        uint256 back = msg.value > _placed ? _placed : msg.value;
+        _placed -= back;
+    }
+
+    /// @inheritdoc IArkCatBondPrincipal
+    function creditDistribution() external payable onlyStaking {
+        _creditDistribution(msg.value);
+    }
+
+    /**
+     * A validator returned less than its stake: a loss of bond principal, borne
+     * pro rata by every holding then outstanding. Whitepaper §3.4.
+     *
+     * One storage write per class serves the whole book: every holding's worth
+     * falls in proportion because it is a share of principal and not a balance,
+     * which is the lesson §8.3 draws from `StakingVault.slash` costing less than
+     * `stake`. A design that walked the holdings would fail at exactly the moment
+     * it was needed.
+     */
+    function recordLoss(uint256 amount) external onlyStaking {
+        // Principal is about to move, and the base of an epoch already closed must
+        // record what that epoch closed at rather than what this loss leaves.
+        _close();
+        if (amount > _placed) amount = _placed;
+        _placed -= amount;
+
+        uint256 pool = _nominal();
+        if (pool == 0 || amount == 0) return;
+        if (amount > pool) amount = pool;
+
+        // Junior is the first-loss class, so the rounding wei of a LOSS falls on
+        // it: senior truncates and junior takes the remainder. The mirror of the
+        // conditional release, where the wei of a payment falls on senior.
+        uint256 toS = (amount * uint256(_principal[SENIOR])) / pool;
+        _drawPrincipal(SENIOR, toS);
+        _drawPrincipal(JUNIOR, amount - toS);
+
+        emit PrincipalLost(amount, outstandingPrincipal());
+    }
+
+    /**
+     * Take principal out of a class without crediting anybody: a loss now, and a
+     * trigger draw when the settlement of whitepaper §5.1 is written.
+     *
+     * A class drawn to nothing while shares remain starts a new generation, or a
+     * later subscription would be diluted by shares that are worth nothing. Every
+     * holding of the old generation is then void — worth nothing and owed nothing,
+     * which is exactly what it is.
+     */
+    function _drawPrincipal(uint8 c, uint256 amount) private {
+        if (amount == 0) return;
+        uint256 pc = uint256(_principal[c]);
+        uint256 taken = amount > pc ? pc : amount;
+        _principal[c] = uint128(pc - taken);
+
+        // Not once trigger 2 has drawn: nothing is issued after it, and the
+        // holdings of record at the draw keep their claim on the recovery of
+        // whitepaper §5.4 whatever a later loss leaves their class.
+        if (_principal[c] == 0 && _shares[c] != 0 && _t2.stage == 0) _newGeneration(c);
+        _ckClass(c);
+    }
+
+    /**
+     * Reject a bare transfer.
+     *
+     * Every other contract of this product refuses one, and this one can too: the
+     * delegation's raw calls land on `ArkBondStaking`, which forwards them through
+     * `returnPrincipal` and `creditDistribution` — functions that name what the
+     * value is for. Value with nothing attached cannot be booked as principal or as
+     * a distribution, and booking it as either by default would let a mistimed send
+     * silently become somebody's return.
+     */
+    receive() external payable {
+        revert ZeroValue();
+    }
+
+    /**
+     * Build 2, in `ArkCatBondSettlement` (see `SETTLEMENT_MODULE`): any
+     * selector this contract does not declare runs there, on this storage,
+     * with its result or its revert returned byte for byte. Views reach it
+     * too: a delegatecall under a static call reads and writes nothing more
+     * than the view it runs. Not payable: no function of the module takes
+     * value, and a bare transfer is still `receive`'s to refuse.
+     */
+    fallback() external {
+        address m = SETTLEMENT_MODULE;
+        /// @hyperion memory-safe-assembly
+        assembly {
+            let p := mload(0x40)
+            calldatacopy(p, 0, calldatasize())
+            let ok := delegatecall(gas(), m, p, calldatasize(), 0, 0)
+            returndatacopy(p, 0, returndatasize())
+            if iszero(ok) { revert(p, returndatasize()) }
+            return(p, returndatasize())
+        }
+    }
+
+    /**
+     * Credit the staking distribution of whitepaper §3.4 to every holding.
+     *
+     * Pro rata by PRINCIPAL and across both classes undivided. §4.6 divides the
+     * coupon between the classes and says nothing about a seniority over a return
+     * on principal, which this is; recorded as a departure, because the whitepaper
+     * does not state it either way. It carries no cliff: the cliff of §5.3 is a
+     * property of the coupon, which is the price of cover, and this is not that.
+     *
+     * What the index divisions truncate away is held in `_freeDust` and folded
+     * into the next credit, so nothing accumulates without an owner. `VeArk`
+     * carries this term and `StakingVault` does not, which is defect 2 of the
+     * inherited contracts.
+     *
+     * ONLY THE HOLDINGS OF RECORD AT THE EPOCH'S OPENING SHARE IT (whitepaper
+     * §3.4, audit D16): the base is the shares less those minted in this
+     * epoch, and so is the principal the classes divide on. The index still
+     * moves for every share of the class; a holding created this epoch is
+     * lifted past this epoch's steps when it joins (`_settle`, `_accClose`),
+     * so what the step pays it is never drawn and the pot never owes it.
+     */
+    function _creditDistribution(uint256 value) private {
+        uint256 amount = value + _freeDust;
+        _freeDust = 0;
+
+        uint256 pj = _worth(JUNIOR, _openingShares(JUNIOR));
+        uint256 pool = pj + _worth(SENIOR, _openingShares(SENIOR));
+        if (pool == 0) {
+            _freeDust = amount;
+            return;
+        }
+
+        uint256 toJ = (amount * pj) / pool;
+        uint256 paid = _creditFree(JUNIOR, toJ) + _creditFree(SENIOR, amount - toJ);
+        _freePool += paid;
+        _freeDust = amount - paid;
+
+        emit DistributionCredited(paid);
+    }
+
+    function _creditFree(uint8 c, uint256 money) private returns (uint256 paid) {
+        uint256 step;
+        (step, paid) = _perShare(money, _openingShares(c));
+        if (step == 0) return 0;
+        _accFree[c] += step;
+        _accClose[_key(ArkEpoch.current(), c)] = _accFree[c];
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The dispute court. Whitepaper §5.1, §6.2                            */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Record that a trigger determination is open, or that it has closed.
+     *
+     * Pushed by the court rather than pulled from it, and the reason is the clock:
+     * a view would tell this contract that a determination is open and not WHEN it
+     * opened, and whitepaper §5.3 caps a maturity hold at the dispute cycle with
+     * its appeal — which is measured from exactly that moment.
+     *
+     * Several may be open at once: invariant I24 hears a claim above the verdict
+     * bound as several determinations, concurrently, so the cap runs from the
+     * earliest. And it is NOT renewed by closing the last and opening another:
+     * the hold restarts only on an opening that follows a whole cap with none
+     * open, so a maturity is always redeemable for at least that long between
+     * two holds. Whitepaper §5.3 caps a hold at twenty days and states nothing
+     * about a sequence of determinations; this reads the cap as one a court
+     * cannot extend by cycling, which is the direction that keeps it a cap.
+     */
+    /// Guarded (re-audit 2026-09-30, COURT-02): a court call re-entered from a payout of this bond reverts here, and is retried.
+    function openDetermination(bytes32 determinationId) external onlyCourt nonReentrant {
+        if (_openedAt[determinationId] != 0) revert DeterminationAlreadyOpen(determinationId);
+        _close();
+
+        _openedAt[determinationId] = uint64(block.timestamp);
+        // The clean-age clock does not advance for this epoch (whitepaper §5.3).
+        _detEpoch = uint64(ArkEpoch.current());
+        if (
+            _open == 0
+                && (_firstOpenedAt == 0
+                    || block.timestamp >= uint256(_lastClearedAt) + uint256(ArkEpoch.DISPUTE_CYCLE_APPEAL))
+        ) {
+            _firstOpenedAt = uint64(block.timestamp);
+        }
+        _open += 1;
+
+        emit DeterminationOpened(determinationId, block.timestamp);
+    }
+
+    function closeDetermination(bytes32 determinationId) external onlyCourt nonReentrant {
+        if (_openedAt[determinationId] == 0) revert NoSuchDetermination(determinationId);
+        _close();
+
+        delete _openedAt[determinationId];
+        _open -= 1;
+        _detEpoch = uint64(ArkEpoch.current());
+        if (_open == 0) _lastClearedAt = uint64(block.timestamp);
+
+        emit DeterminationClosed(determinationId);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Views                                                               */
+    /* ------------------------------------------------------------------ */
+
+    function holdingOf(uint256 id) external view returns (Holding memory) {
+        return _holdings[id];
+    }
+
+    /**
+     * Whether a seed-return leaf may be sealed now (whitepaper §4.2, yellow
+     * paper §2.2 `seedReturnLeafKey`; PV-17 of 2026-09-30): no determination
+     * is open, no declaration is ratified, and no censorship ground has been
+     * found. The relayer seals an escrow's seed return for the epoch only
+     * while this holds; the escrow cannot see any of the three. Global, not
+     * per escrow: a determination is not recorded here against one escrow,
+     * so any open determination holds every escrow's seed.
+     */
+    function seedReturnSealable() external view returns (bool) {
+        // No trigger-1 buffer part determined and not yet sealed as its loss
+        // leaf (re-audit 2026-09-30, BOND-03): the escrow sees such a part
+        // only once its leaf is presented there. A part sealed and not yet
+        // presented is the relayer's to check before it seals the return.
+        return _open == 0 && _claim.ground == 0 && _bufferUnnamed == 0 && !QDAY.declared();
+    }
+
+    /// Everything a reader needs about the book, in one call. See IArkCatBond.BondState.
+    function state() external view returns (BondState memory) {
+        return BondState({
+            juniorShares: _shares[JUNIOR],
+            seniorShares: _shares[SENIOR],
+            juniorPrincipal: _principal[JUNIOR],
+            seniorPrincipal: _principal[SENIOR],
+            outstanding: outstandingPrincipal(),
+            gateClosed: _gateClosed,
+            atGateClose: _atGateClose,
+            queueTotal: _queueTotal,
+            queueServed: _served,
+            lastClosedEpoch: _lastClosed,
+            clearEpochs: _clearEpochs,
+            belowEpochs: _belowEpochs,
+            determinationsOpen: _open,
+            firstOpenedAt: _firstOpenedAt,
+            shortfallOpen: _shortfallUnrecovered(),
+            // Held by the coupon account and not by this contract: read there, so
+            // the three pots a holder is owed from appear side by side.
+            couponPool: COUPON.pool(),
+            freePool: _freePool,
+            principalOwed: _principalOwed
+        });
+    }
+
+    /// @inheritdoc IArkCatBondPrincipal
+    function placedWithStaking() external view returns (uint256) {
+        return _placed;
+    }
+
+    /// @inheritdoc IArkCatBondPrincipal
+    function principalOwedNow() external view returns (uint256) {
+        // Settlement entitlements unpaid are owed too (yellow paper §1.4): an
+        // exit is requested where they exceed principal not deployed; so is
+        // the relief queued holdings are owed back from a draw (I26′). And the
+        // Cushion (I42): `ArkBondStaking._bondCover` counts the whole balance
+        // outside the staking distribution as cover, so an undrawn Cushion,
+        // which no maturity may be paid from, is netted out here or `recall`
+        // would refuse an exit a maturity needs.
+        return _principalOwed + _dueQrl() + (_settleTotal - _settlePaid) + _reliefOwed + uint256(_cushion);
+    }
+
+    /// @inheritdoc IArkCatBondPrincipal
+    function unencumbered() public view returns (uint256) {
+        return _unencumbered();
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The cushion lane. Yellow paper §4.5; technical reference §1.7; I42  */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Credit the Cushion. Any account (IArkFlow rule 3); refused at zero, on
+     * any lane but `ArkLanes.CUSHION`, once the residual draw has closed the
+     * lane, and above its room, the sender keeping the value. Guarded: a
+     * deposit re-entered from a payout of this bond reverts, which
+     * `ArkFlowSend.push` reads as nothing sent. Makes no external call.
+     */
+    function deposit(bytes32 lane, bytes32 ref) external payable override nonReentrant {
+        _accept(lane, msg.sender, msg.value, ref);
+    }
+
+    /**
+     * The cushion lane from storage alone (IArkFlow rule 2): declared,
+     * one-way and defensive, so the protective freeze and a ratified
+     * declaration close nothing; open until the residual draw; room
+     * `max(0, floor(c_max * N_B / BPS) - N_C)`, N_B at face and c_max as in
+     * force at the last boundary the bond closed (the model's `cushionRoom`).
+     */
+    function _lane(bytes32 lane) internal view override returns (LaneInfo memory info) {
+        if (lane != ArkLanes.CUSHION) return info;
+        uint256 ceiling = (uint256(_cushionCeilingBps) * _nominal()) / BPS;
+        uint256 c = uint256(_cushion);
+        info = LaneInfo(true, !_cushionClosed, true, true, ceiling > c ? ceiling - c : 0);
+    }
+
+    /// The one credit path of the Cushion (I42).
+    function _onDeposit(bytes32, address, uint256 amount, bytes32) internal override {
+        _cushion = _u128(uint256(_cushion) + amount);
+    }
+
+    /// N_C, the Cushion.
+    function cushion() external view returns (uint256) {
+        return _cushion;
+    }
+
+    /**
+     * `max(0, floor(c_tgt * N_B / BPS) - N_C)`, c_tgt in force now: the figure
+     * a sender tops the Cushion up to (the model's `cushionShortfall`). The
+     * bond acts on nothing it returns.
+     */
+    function cushionShortfall() external view returns (uint256) {
+        (,,,,,, uint16 targetBps,) = PARAMS.bondParams();
+        uint256 target = (uint256(targetBps) * _nominal()) / BPS;
+        uint256 c = uint256(_cushion);
+        return target > c ? target - c : 0;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The objection source. Core's IObjectionSource, decision GD6         */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * The principal `holder` held at the boundary that OPENED `epoch`: its
+     * shares of each class at the end of `epoch - 1`, at the principal per
+     * share the class stood at then — never a live balance, so principal
+     * subscribed after a proposal was queued cannot object to it and a
+     * transfer inside the objection window counts once.
+     */
+    function principalAt(address holder, uint256 epoch) external view returns (uint256 p) {
+        for (uint8 c = 0; c < 2; c++) {
+            HolderCk[] storage hs = _holderCk[holder][c];
+            uint256 i = _holderBefore(hs, epoch);
+            if (i == 0) continue;
+            HolderCk storage hk = hs[i - 1];
+            ClassCk[] storage cs = _classCk[c];
+            uint256 j = _classBefore(cs, epoch);
+            if (j == 0) continue;
+            ClassCk storage ck = cs[j - 1];
+            if (ck.gen != hk.gen || ck.shares == 0) continue;
+            // Truncates, toward the objection threshold.
+            p += (uint256(hk.shares) * uint256(ck.principal)) / uint256(ck.shares);
+        }
+    }
+
+    /// The sum of the same quantity over all holders: the principal of both classes at that boundary.
+    function totalPrincipalAt(uint256 epoch) external view returns (uint256 p) {
+        for (uint8 c = 0; c < 2; c++) {
+            ClassCk[] storage cs = _classCk[c];
+            uint256 j = _classBefore(cs, epoch);
+            if (j != 0) p += uint256(cs[j - 1].principal);
+        }
+    }
+
+    /// One past the last checkpoint written before `epoch`; zero where none was.
+    function _classBefore(ClassCk[] storage a, uint256 epoch) private view returns (uint256 lo) {
+        uint256 hi = a.length;
+        while (lo < hi) {
+            uint256 mid = (lo + hi) / 2;
+            if (uint256(a[mid].epoch) < epoch) lo = mid + 1;
+            else hi = mid;
+        }
+    }
+
+    function _holderBefore(HolderCk[] storage a, uint256 epoch) private view returns (uint256 lo) {
+        uint256 hi = a.length;
+        while (lo < hi) {
+            uint256 mid = (lo + hi) / 2;
+            if (uint256(a[mid].epoch) < epoch) lo = mid + 1;
+            else hi = mid;
+        }
+    }
+}

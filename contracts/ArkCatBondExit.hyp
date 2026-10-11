@@ -1,0 +1,614 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./ArkCatBondStore.hyp";
+
+/**
+ * The exit machinery of `ArkCatBond`, executed in the bond's own storage via
+ * `delegatecall`.
+ *
+ * WHY THIS CONTRACT EXISTS
+ * ------------------------
+ * The QIP-55 compiler's 64-byte-word ABI plumbing grew every external function
+ * of the bond by about 21%, and EIP-170 did not move: the bond's v3 runtime
+ * came out at 27,226 bytes against 24,576. No compiler flag closes a gap that
+ * size, so a slice of the bond's external surface runs here instead, behind
+ * thin stubs that forward `msg.data` and bubble the result unchanged. Nothing
+ * about a function's behaviour, signature, event or revert moves with it — an
+ * event emitted under a delegatecall logs against the BOND's address, exactly
+ * as before.
+ *
+ * WHY THIS ADDS NO AUTHORITY
+ * --------------------------
+ * The bond's own constructor creates this contract and fixes its address in an
+ * immutable. There is no setter, no admin and no path on either side that can
+ * ever point the stubs anywhere else, so this module is exactly as immutable
+ * as the bond's bytecode: it is a compiler-ceiling workaround, not a proxy in
+ * the upgradeability sense the escrow forbids. It inherits `ArkCatBondStore` —
+ * the one declaration of the bond's storage layout — so the two contracts
+ * agree on every slot by construction, and its dependencies are the same five
+ * immutables, handed over by the only constructor that ever constructs it.
+ *
+ * WHY THE SLICE IS THE EXIT MACHINERY
+ * -----------------------------------
+ * These are the coldest paths on the book. The hot path — every anchoring —
+ * pays for `runoffGateClosed()` and nothing here; `subscribe`, `claim` and the
+ * epoch-close ring stay in the bond untouched. A redemption, a queue draw, a
+ * tail claim, a transfer and the conditional release each happen at most a few
+ * times per holding per term, so they are where a delegatecall's indirection
+ * (~one warm CALL plus one return-copy per call) costs nobody anything that
+ * matters. The `nonReentrant` prologues stay HERE, on the moved bodies:
+ * `ReentrancyGuard._status` is shared storage through the store base, so the
+ * guard still spans both contracts — and the bond's stubs are deliberately not
+ * guarded, which would deadlock against these.
+ *
+ * Called only by the bond's stubs in practice. Calling it directly is harmless
+ * by construction rather than by a guard: its own storage is an empty book (no
+ * holdings, no principal, `staking` unset), so there is nothing here to pay,
+ * and its balance is nothing because it refuses value the way the bond does —
+ * no receive, and its one payable function, `closeBatch`, refuses to run
+ * outside the bond (`SELF`), value or none.
+ */
+contract ArkCatBondExit is ArkCatBondStore {
+    /// This module's own address: under the bond's delegatecall `address(this)` is the bond's.
+    address private immutable SELF;
+
+    constructor(address registry_, address params_, address coupon_, address qday_, address attestation_)
+        ArkCatBondStore(registry_, params_, coupon_, qday_, attestation_)
+    {
+        SELF = address(this);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The epoch boundary, for the bond                                    */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * The epoch boundary of `ArkCatBondStore._closeBatch`, run in the bond's
+     * storage: the bond's own `_close` delegatecalls here (phase C3), so the
+     * boundary's code — the ring, the gate, the queue and its weights, the
+     * coupon base — sits in this module once rather than in the bond as well,
+     * where the queue's weights no longer fit under EIP-170 on the v3 line.
+     *
+     * Unguarded, deliberately: every bond path that reaches it already holds
+     * the shared `nonReentrant` guard, which a guard here would deadlock
+     * against. It is not reachable from outside through the bond — the bond
+     * declares no such selector and its `fallback` sends undeclared ones to
+     * the settlement module, which has none either — and called on this
+     * module directly it is refused (`SELF`).
+     *
+     * PAYABLE, AND WHY. A delegatecall carries the calling frame's value, and
+     * `subscribe` crosses the boundary with the subscription attached: a
+     * non-payable function here reverts every subscription with no data. The
+     * value is the bond's, credited to it before this runs; nothing here
+     * reads or moves it, and a call carrying value straight to this module is
+     * refused before it could leave any here.
+     */
+    function closeBatch(uint256 max, bool strict) external payable {
+        if (address(this) == SELF) revert ZeroAddress();
+        _closeBatch(max, strict);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Maturity, the hold, and the run-off queue. Whitepaper §5.3          */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Return a matured holding's principal at par.
+     *
+     * Pull and never push: a redemption that walked the holders would stop
+     * working on exactly the book that needed it. Nothing redeems before its
+     * maturity epoch, which is invariant I9 — the protocol offers no redemption
+     * at par on demand on either leg.
+     *
+     * THE HOLD IS THE ABSENCE OF A WRITE. Principal whose maturity falls while a
+     * determination is open or the protective freeze is active is not returned
+     * and not queued; it simply stays where it is, which is what makes whitepaper
+     * §5.3's "held principal stays outstanding, earns the coupon and is
+     * transferable" true at no cost per holding. The hold under a determination
+     * expires after the dispute cycle with its appeal, so a court that never
+     * closes one cannot hold a maturity for ever.
+     */
+    function redeem(uint256 id) external nonReentrant returns (uint256 amount) {
+        Holding storage h = _live(id);
+        uint256 m = _beginPayout(id);
+        if (ArkEpoch.current() <= m) revert NotMatured(id, m);
+        // Whitepaper §5.3: principal maturing while the gate is closed is not
+        // returned at maturity. `_close()` opened the cohort; `claimQueued` pays.
+        if (_queued[m].opened) revert InRunoffQueue(id, m);
+
+        (, uint256 free, uint256 release) = _settle(h, true);
+        amount = principalOf(id);
+        _openTail(h, _burn(h, m, amount));
+
+        emit Redeemed(msg.sender, id, amount);
+        _pay(amount, free, release);
+    }
+
+    /**
+     * Draw this holding's part of its maturity cohort, as far as the queue has
+     * reached it.
+     *
+     * The queue is served in order of maturity (whitepaper §5.3): a cohort's
+     * `cumBefore` is the nominal QRL of every cohort ahead of it, so the order is
+     * a property of the ledger rather than of a cursor a silent holder could
+     * stall. Truncates; what is not paid stays queued and is paid in a later
+     * epoch, so no wei leaves the queue's account.
+     *
+     * Held exactly as a redemption is, by the freeze and by an open
+     * determination: queued principal is outstanding and "a settlement
+     * determined against it is drawn from it in full" (§5.3), which a holder who
+     * could draw it ahead of the court's opening would escape.
+     */
+    function claimQueued(uint256 id) external nonReentrant returns (uint256 amount) {
+        Holding storage h = _live(id);
+        uint256 m = _beginPayout(id);
+        if (!_queued[m].opened) revert NotQueued(id);
+
+        // Fixed at the first draw, which is the shares the holding had when the
+        // cohort opened: nothing but a draw burns a matured holding's shares.
+        if (h.queueShares == 0) h.queueShares = h.shares;
+
+        uint256 entitled = _queueEntitlement(h);
+        uint256 already = uint256(h.queueDrawn);
+        if (entitled <= already) revert NothingDue(id);
+        amount = entitled - already;
+
+        (, uint256 free, uint256 release) = _settle(h, true);
+        // A draw on principal during a run-off shrinks what a queued holding
+        // receives, and whitepaper §5.3 says so: "a settlement determined against
+        // it is drawn from it in full". The entitlement is nominal; what the
+        // holding is still worth is the most it can be paid.
+        uint256 mine = principalOf(id);
+        if (amount > mine) amount = mine;
+
+        h.queueDrawn = uint128(already + amount);
+        // Before the burn: the relief is per share of what the holding held
+        // through the draws (whitepaper §5.3, I26′).
+        uint256 relief = _takeRelief(h, m, id);
+        _openTail(h, _burn(h, m, amount));
+
+        emit Redeemed(msg.sender, id, amount);
+        _pay(amount + relief, free, release);
+    }
+
+    /**
+     * What the trigger draws on this holding's class took above its weight
+     * while it waited in the queue: for each draw since its cursor that found
+     * its cohort already queued, `BPS - x` of the class's uniform fall per
+     * share, `x` its weight at that draw's clean age. Taken out of
+     * `_reliefOwed`, never more than it holds. Truncates, toward the pot.
+     */
+    function _takeRelief(Holding storage h, uint256 m, uint256 id) private returns (uint256 total) {
+        uint256 n = _reliefs.length;
+        uint256 i = uint256(h.reliefCursor);
+        if (i >= n) return 0;
+        uint256 k = uint256(_queued[m].clock);
+        uint8 c = h.class_;
+        for (; i < n; i++) {
+            Relief storage r = _reliefs[i];
+            if (m >= uint256(r.epoch)) continue;
+            uint256 x = ArkStakeMath.queueExposureBps(r.decay, r.floor, uint256(r.clock) - k);
+            total += (uint256(h.shares) * r.perShare[c] * (BPS - x)) / (BPS * ACC);
+        }
+        h.reliefCursor = uint32(n);
+        if (total > _reliefOwed) total = _reliefOwed;
+        _reliefOwed -= total;
+        if (total != 0) emit ReliefPaid(id, total);
+    }
+
+    /**
+     * How much of this holding's cohort the queue has reached: the reached part
+     * of the cohort's value at opening, pro rata to what this holding was worth
+     * in it. Both factors are fixed at the opening, so drawing often and drawing
+     * once come to the same total. Two truncating divisions, toward the queue.
+     *
+     * NOMINAL, AND WHAT THAT COSTS (OC-ECON-07, recorded). A cohort's `due`
+     * and `cumBefore` are its QRL at the opening and are not re-marked when a
+     * trigger draw later lowers what its shares are worth: the holding is
+     * paid the lesser of its entitlement and `principalOf`, so the queue
+     * serves the drawn part of an earlier cohort on paper and pays it to
+     * nobody, and a later cohort waits behind it. Nothing is lost or paid
+     * twice — the unpaid part stays principal, outstanding in its class — and
+     * the wait is bounded: the bound is taken on the principal at the gate's
+     * closing, so `_served` reaches `_queueTotal` within the drain horizon of
+     * I26 whatever the draws. Re-marking would walk every open cohort on each
+     * draw; the queue keeps its one-write nominal ledger instead.
+     */
+    function _queueEntitlement(Holding storage h) private view returns (uint256) {
+        Cohort storage co = _queued[uint256(h.maturityEpoch)];
+        uint256 due = uint256(co.due);
+        uint256 served = uint256(_served);
+        if (served <= uint256(co.cumBefore)) return 0;
+        uint256 reached = served - uint256(co.cumBefore);
+        if (reached > due) reached = due;
+
+        uint8 c = h.class_;
+        uint256 nominal = (uint256(h.queueShares) * uint256(co.qrl[c])) / uint256(co.shares[c]);
+        return (reached * nominal) / due;
+    }
+
+    /// The holder's own holding, of the class's current generation. A void one is refused by name.
+    function _live(uint256 id) private view returns (Holding storage h) {
+        h = _holdings[id];
+        if (h.owner != msg.sender) revert NotHolder(id, msg.sender);
+        if (h.gen != _gen[h.class_]) revert HoldingVoid(id);
+    }
+
+    /**
+     * What every path that pays principal does first: cross the boundary, book
+     * a loss the delegation already shows, and refuse while the coupon is
+     * unfixed or the principal is held. Returns the maturity epoch.
+     *
+     * The loss is synced HERE rather than left to whoever calls `syncLoss`:
+     * otherwise a holder who sees a validator come back short redeems at par
+     * first, and the loss falls on the holdings that stay. `_placed` is only
+     * non-zero once a staking contract with a delegation has taken principal.
+     *
+     * THE HOLD IS THE ABSENCE OF A WRITE. Principal held under a determination or
+     * the protective freeze is not returned and not queued; it stays where it
+     * is, which is what makes whitepaper §5.3's "held principal stays
+     * outstanding, earns the coupon and is transferable" true at no cost per
+     * holding. The hold under a determination expires after the dispute cycle
+     * with its appeal, so a court that never closes one cannot hold it for ever.
+     */
+    function _beginPayout(uint256 id) private returns (uint256 m) {
+        _close();
+        _syncLoss();
+        _requireCouponCurrent();
+
+        m = uint256(_holdings[id].maturityEpoch);
+        // Principal behind trigger 2 does not leave once the event is declared
+        // until the settlement has drawn the floor and judged the severity
+        // (whitepaper §5.2, §5.3; audit 2026-09-27, D6): without it a holder who
+        // read the declaration first left ahead of the draw, and the draw fell
+        // on the holders who stayed. After it, principal the draw did not reach
+        // leaves on the terms of its class, and a class holding a balance
+        // against an unmeasured severity waits for it whole (phase C3;
+        // re-audit 2026-09-30, BOND-01).
+        _requirePayable(_holdings[id].class_);
+        if (QDAY.frozen()) revert HeldByFreeze(id);
+        if (_open != 0) {
+            uint256 until = uint256(_firstOpenedAt) + uint256(ArkEpoch.DISPUTE_CYCLE_APPEAL);
+            if (block.timestamp < until) revert HeldByDetermination(until);
+        }
+    }
+
+    /**
+     * Send a payout of principal and of the two per-share streams.
+     *
+     * The streams were taken out of their own pots by `_settle`. Principal is
+     * bounded by the balance NOT in a pot, so a redemption can never be paid out
+     * of another holder's distribution or released principal; where it cannot
+     * be met the path refuses by name, which is the shortfall
+     * `ArkBondStaking.requestExit` answers by recalling principal from staking.
+     */
+    function _pay(uint256 principal_, uint256 free, uint256 release) private {
+        uint256 liquid = _liquid();
+        uint256 streams = free + release;
+        uint256 total = principal_ + streams;
+        if (total > liquid) revert PrincipalNotLiquid(liquid > streams ? liquid - streams : 0);
+        _send(msg.sender, total);
+    }
+
+    /**
+     * Retire `amount` of principal and the shares that stood behind it.
+     *
+     * Shares are removed in the same proportion as the principal, so what is left
+     * of a partly-paid holding is worth what it was less what it was paid, and
+     * the class's other holdings are untouched. `_eligible` falls with them only
+     * where the holding had passed its cliff — once the epoch its cliff lands in
+     * has CLOSED, which is when `_close` moved them into the base; before it,
+     * those shares are still waiting in `_cliffEntering`.
+     *
+     * Only a matured holding is burned, so its shares always leave `_dueShares`.
+     */
+    function _burn(Holding storage h, uint256 m, uint256 amount) private returns (uint256 burn) {
+        if (amount == 0) return 0;
+        uint8 c = h.class_;
+        uint256 pc = uint256(_principal[c]);
+        uint256 sc = uint256(_shares[c]);
+        if (pc == 0 || sc == 0) return 0;
+
+        burn = (amount * sc) / pc;
+        if (burn > uint256(h.shares)) burn = uint256(h.shares);
+        uint128 b = uint128(burn);
+        _fixDeclShares(h);
+
+        h.shares -= b;
+        // The debts are re-based on the shares left (OC-ECON-03): `_settle`
+        // ran just before on the whole holding, and debts left on shares
+        // that are gone would withhold every later distribution and release
+        // from the shares that stay, stranded in the pots.
+        h.freeDebt = uint256(h.shares) * _accFree[c];
+        h.releaseDebt = uint256(h.shares) * _accRelease[c];
+        _shares[c] = uint128(sc - burn);
+        _principal[c] = uint128(pc - amount);
+        _dueShares[c] = _sub(_dueShares[c], b);
+
+        uint256 km = _key(m, c);
+        _maturing[km] = _sub(_maturing[km], b);
+        // A draw from the run-off queue leaves its weights (I26′).
+        Cohort storage co = _queued[m];
+        if (co.opened) _unqueue(c, uint256(co.clock), b);
+
+        uint256 cliff = uint256(h.cliffEpoch);
+        if (cliff <= uint256(_lastClosed)) {
+            _eligible[c] = _sub(_eligible[c], b);
+        } else {
+            uint256 kc = _key(cliff, c);
+            _cliffEntering[kc] = _sub(_cliffEntering[kc], b);
+        }
+        _ckClass(c);
+        _ckHolder(h.owner, c, burn, false);
+    }
+
+    function _sub(uint128 a, uint128 b) private pure returns (uint128) {
+        return b > a ? 0 : a - b;
+    }
+
+    /**
+     * Refuse a path that changes a holding's shares while an epoch whose
+     * settlement window has closed is still undistributed.
+     *
+     * The coupon of epoch t is fixed only at `settlementCloses(t)`, four days
+     * into t + 2 (whitepaper §4.7), so at every instant at least one epoch is
+     * unfixed and blocking on that would block for ever. What happens to the
+     * unfixed epochs instead: on a transfer they follow the shares, since the
+     * holding's cursor moves with them — the buyer takes the coupons not yet
+     * fixed, as a bond bought cum-coupon does; on a payout they stay with the
+     * holder who was paid, by `_openTail`. What this still refuses is a keeper
+     * behind: an epoch payable and not distributed, whose coupon would be
+     * attributed on stale cursors. Anyone lifts it by calling `distribute`.
+     */
+    function _requireCouponCurrent() private view {
+        uint256 next = uint256(COUPON.lastDistributed()) + 1;
+        uint256 payableAt = ArkEpoch.settlementCloses(next);
+        if (block.timestamp >= payableAt) revert CouponPending(next);
+    }
+
+    /**
+     * Record the coupon owed on shares a payout just retired.
+     *
+     * Those shares stood in the coupon base of every epoch up to the last one
+     * closed, and `_settle` paid them only through the last one distributed;
+     * the epochs between are in their settlement windows. Their coupon is the
+     * paid holder's, so it is recorded here and claimed by `claimTail` as each
+     * epoch is distributed. Nothing is recorded where nothing is between, or
+     * where the holding had not reached its cliff: its cursor already stands
+     * past the last closed epoch.
+     */
+    function _openTail(Holding storage h, uint256 burned) private {
+        uint256 from = uint256(h.claimedThrough);
+        uint256 through = uint256(_lastClosed);
+        if (burned == 0 || through <= from) return;
+        uint256 tailId = ++_nextTail;
+        Cohort storage co = _queued[uint256(h.maturityEpoch)];
+        _tails[tailId] = CouponTail({
+            owner: h.owner,
+            class_: h.class_,
+            fromEpoch: uint32(from),
+            throughEpoch: uint32(through),
+            shares: uint128(burned),
+            queuedAfter: co.opened ? h.maturityEpoch : 0,
+            clock: co.clock
+        });
+        emit CouponTailOpened(tailId, h.owner, h.class_, burned, from, through);
+    }
+
+    /**
+     * Take the coupon of a tail as far as it has been distributed. The owner
+     * only; the coupon account sends it. A tail is deleted once paid through
+     * its last epoch.
+     */
+    function claimTail(uint256 tailId) external nonReentrant returns (uint256 amount) {
+        CouponTail storage t = _tails[tailId];
+        if (t.owner != msg.sender || t.shares == 0) revert NotTailOwner(tailId, msg.sender);
+        uint64 reached;
+        (amount, reached) =
+            COUPON.payThrough(t.class_, t.fromEpoch, t.throughEpoch, t.shares, msg.sender, t.queuedAfter, t.clock);
+        if (uint256(reached) <= uint256(t.fromEpoch)) revert NothingDue(tailId);
+        if (reached >= t.throughEpoch) delete _tails[tailId];
+        else t.fromEpoch = uint32(reached);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Transfer. Whitepaper §3.4, invariant I20                            */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Move a holding, whole or in part.
+     *
+     * The new record carries the SAME class, term, maturity epoch and cliff. That
+     * is invariant I20 — a transfer does not reset the coupon cliff — made a
+     * property of the copy rather than a rule anyone has to remember, because the
+     * cliff was stored as the epoch it ends in and not as the moment it began.
+     *
+     * A holding is transferable in every state whitepaper §5.3 names: before
+     * maturity, while held against a determination, and while queued in a
+     * run-off. The seller is settled first, so what was earned before the
+     * transfer stays with whoever earned it.
+     *
+     * The seller's coupon is withheld in the coupon account for `withdraw`. Its
+     * staking distribution and released principal — the two streams `_settle`
+     * takes out of this contract's own pots — are SENT to the seller, last,
+     * after every write. An earlier version took them out of the pots and sent
+     * nothing, so every transfer erased the seller's share of both and left the
+     * QRL in the balance owned by nobody.
+     */
+    function transferHolding(uint256 id, address to, uint256 shares_) external nonReentrant returns (uint256 newId) {
+        Holding storage h = _live(id);
+        if (to == address(0)) revert ZeroAddress();
+        if (shares_ == 0) revert ZeroValue();
+        if (shares_ > uint256(h.shares)) revert AmountExceedsHolding(uint256(h.shares));
+
+        _close();
+        _requireCouponCurrent();
+        (, uint256 free, uint256 release) = _settle(h, false);
+        newId = id;
+        // The objection source counts the shares where they stand at the next
+        // boundary (GD6), so a transfer inside the window counts once.
+        _ckHolder(msg.sender, h.class_, shares_, false);
+        _ckHolder(to, h.class_, shares_, true);
+        if (shares_ == uint256(h.shares)) h.owner = to;
+        else newId = _split(h, to, shares_);
+
+        emit HoldingTransferred(msg.sender, to, id, newId, shares_);
+        _send(msg.sender, free + release);
+    }
+
+    /// Carve `shares_` of a settled holding into a new record owned by `to`.
+    function _split(Holding storage h, address to, uint256 shares_) private returns (uint256 newId) {
+        uint256 whole = uint256(h.shares);
+        uint8 c = h.class_;
+        _fixDeclShares(h);
+        h.shares = uint128(whole - shares_);
+        // The seller's debts are re-based on the shares it keeps. `_settle` wrote
+        // them on the whole holding, and left there they would withhold the
+        // kept shares' distribution and release until the indices had grown
+        // back past a debt no longer theirs.
+        h.freeDebt = uint256(h.shares) * _accFree[c];
+        h.releaseDebt = uint256(h.shares) * _accRelease[c];
+
+        newId = _nextId++;
+        Holding storage n = _holdings[newId];
+        n.owner = to;
+        n.class_ = c;
+        n.termEpochs = h.termEpochs;
+        n.maturityEpoch = h.maturityEpoch;
+        n.cliffEpoch = h.cliffEpoch;
+        n.shares = uint128(shares_);
+        n.claimedThrough = h.claimedThrough;
+        n.gen = h.gen;
+        // A holding not yet in the distribution passes that on: carving it up
+        // cannot buy its shares into the epoch they were created in (D16).
+        n.freeFrom = h.freeFrom;
+        n.freeDebt = shares_ * _accFree[c];
+        n.releaseDebt = shares_ * _accRelease[c];
+        // The queue draw and the shares it is measured on follow the split in
+        // proportion, so neither half can present the same entitlement twice.
+        // Both truncate for the buyer; the remainder stays with the seller.
+        n.queueDrawn = uint128((uint256(h.queueDrawn) * shares_) / whole);
+        h.queueDrawn -= n.queueDrawn;
+        n.queueShares = uint128((uint256(h.queueShares) * shares_) / whole);
+        h.queueShares -= n.queueShares;
+        // The reliefs the seller has taken were taken on these shares too
+        // (OC-ECON-02): the new record starts where the seller's cursor stands.
+        n.reliefCursor = h.reliefCursor;
+        // The recovery claim (whitepaper §5.4) is "by holding of record at
+        // the opening determination" (OC-ECON-01): once the draw is taken it
+        // stays whole with this record, which a claim seals once, and the
+        // carved record is fixed at none. Moved with the shares, a claim
+        // sealed on the record was presented again by every record carved
+        // from it. `_fixDeclShares` above has fixed the record wherever the
+        // draw is taken.
+        n.declFixed = h.declFixed;
+
+        // Touches no aggregate: a split moves neither shares nor principal out of
+        // the class, so every base, every cohort and every index is unchanged.
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The conditional release. Whitepaper §5.3, invariant I10             */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Return principal above the capital requirement, at par, pro rata.
+     *
+     * Takes no amount and has no per-holding entry point, because whitepaper §5.3
+     * says it is "never available on request": it is a measured condition, and the
+     * only thing a caller decides is when the measurement is read. That is what
+     * keeps it outside the redemption invariant I9 denies.
+     *
+     * Without regard to term, so it does not touch the maturity ladder: what is
+     * released is a fraction of every holding, and every maturity cohort reprices
+     * by the same fraction without a write, because a cohort is recorded in shares.
+     */
+    function conditionalRelease() external nonReentrant returns (uint256 release) {
+        _close();
+        _syncLoss();
+
+        if (_belowEpochs < RELEASE_EPOCHS) revert UtilisationNotLow(_belowEpochs);
+        if (_open != 0) revert DeterminationOpen(_open);
+        if (_shortfallUnrecovered()) revert CouponShortfallUnrecovered();
+        if (_gateClosed) revert RunoffGateShut();
+        // As in `_beginPayout`: nothing leaves ahead of the trigger-2 settlement
+        // (D6), and a balance held against an unmeasured severity is outside
+        // the release (whitepaper §4.6) — so none runs until the hold settles.
+        if (_awaitingT2(T2_SETTLED)) revert DeclaredPendingSettlement();
+        if (QDAY.frozen()) revert Frozen();
+
+        uint256 prev = uint256(_lastClosed);
+        // Whitepaper §5.3 holds the release back until the book "has closed one
+        // epoch inside its operating range" (R27). Read as ever-once, a single
+        // delivery at launch would satisfy it for good; it is read here as one
+        // of the epochs the utilisation condition itself spans, the last
+        // RELEASE_EPOCHS closed. A recorded departure in the safe direction.
+        // Widened by the two epochs a coupon waits for its settlement window
+        // (`ArkEpoch.settlementCloses`, whitepaper §4.7): whether the last
+        // RELEASE_EPOCHS closed were operating is not yet known when they close.
+        uint256 op = uint256(COUPON.lastOperatingEpoch());
+        if (op == 0 || op + RELEASE_EPOCHS + SETTLEMENT_LAG_EPOCHS < prev) revert NoOperatingEpoch();
+
+        if (ATTESTATION.rootOf(prev) == bytes32(0)) revert RootUnadmitted(prev);
+
+        // Principal above the requirement is measured at the weight the
+        // requirement is covered at (I26′), on the capacity conversion — the
+        // reference price and the conversion haircut (whitepaper §4.3, §5.3;
+        // SP-05) — so what stays still meets the requirement at the cover it
+        // is measured on; it is returned at face, pro rata.
+        release = ArkStakeMath.conditionalReleaseQrl(
+            outstandingPrincipal(), REGISTRY.referencePrice(), REGISTRY.requiredCapital(), REGISTRY.fxHaircutBps()
+        );
+        if (release == 0) revert NothingToRelease();
+
+        uint256 free = _unencumbered();
+        if (release > free) revert PrincipalNotLiquid(free);
+
+        // Pro rata by principal and not by thickness: a return of principal is
+        // not a loss, and seniority ranks losses and recoveries rather than
+        // returns (whitepaper §4.6). Junior truncates and senior takes the
+        // remainder, so the two sum to `release` exactly and the rounding wei of
+        // a PAYMENT falls on senior.
+        uint256 pool = _nominal();
+        uint256 toJ = (release * uint256(_principal[JUNIOR])) / pool;
+
+        uint256 paid = _release(JUNIOR, toJ) + _release(SENIOR, release - toJ);
+        _belowEpochs = 0;
+
+        // The contraction ground is net of this release (whitepaper §5.3,
+        // audit 2026-09-22 B-M3; the model's `runoffContractionBps` with its
+        // `conditionallyReleased`). Measured gross, a release of more than the
+        // run-off trigger — every release on a book below 2,500 bps of
+        // utilisation returns more than that — closed the gate it is itself
+        // suspended by. The readings two closes can still compare against
+        // (the closes of `prev` and `prev - 1`) are lowered by what was paid,
+        // as though it had left before them; floored at zero.
+        for (uint256 k = 0; k < 2; k++) {
+            uint256 lane = (prev + 3 - k) % 3;
+            uint256 was = uint256(_ring[lane]);
+            _ring[lane] = uint128(was > paid ? was - paid : 0);
+        }
+
+        emit ConditionalReleased(uint256(_lastClosed), toJ, release - toJ);
+        return paid;
+    }
+
+    /**
+     * Reduce a class's principal by what its holders are owed back, and credit the
+     * per-share series they draw it from.
+     *
+     * Principal falls by exactly what is credited, never by more: the wei the
+     * index division truncates away stays principal, so the pool keeps it and no
+     * quantity floats outside both. Returns what was actually credited.
+     */
+    function _release(uint8 c, uint256 amount) private returns (uint256 paid) {
+        uint256 step;
+        (step, paid) = _perShare(amount, uint256(_shares[c]));
+        if (step == 0) return 0;
+        _accRelease[c] += step;
+        _principal[c] = uint128(uint256(_principal[c]) - paid);
+        _principalOwed += paid;
+        _ckClass(c);
+    }
+}

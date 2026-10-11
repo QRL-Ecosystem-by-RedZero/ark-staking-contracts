@@ -1,0 +1,496 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./IGovernanceHandover.hyp";
+import "./IArkStakeGovernable.hyp";
+import "./IArkPhase.hyp";
+
+/**
+ * The governable parameters of Ark Staking, in one set of record.
+ *
+ * The one rule this contract exists to enforce: **a vote outside a range, or a
+ * pair of parameters outside a relation, does not execute** (whitepaper §6.3).
+ * Control of the governance process therefore does not confer control of the
+ * arithmetic.
+ *
+ * WHY ONE SET, IN ITS OWN CONTRACT
+ * --------------------------------
+ * Nine relations bind parameters jointly, and several cross the line between
+ * the contracts that consume them — the senior coupon against the floor under
+ * the tail-risk premium, the retention period against the reserve ladder, the
+ * maturity ladder against the release bound. A relation can only be checked
+ * where both of its terms are written, so the terms live together. The
+ * registry prices from this set; the bond, the auction and the court's
+ * settlement path read the rest of it.
+ *
+ * It is also the seam that keeps the registry deployable in one transaction:
+ * the ranges and relations are the largest block of code the product carries,
+ * and whitepaper §3.1's deployment ceiling is a property of each contract.
+ */
+interface IArkStakeParams is IGovernanceHandover, IArkStakeGovernable {
+    /**
+     * The parameters of whitepaper §6.3. Every one has an admissible range
+     * fixed in code; the relations are named on the fields they bind.
+     *
+     * Several are read by contracts not yet in this tree (the bond, the
+     * auction, the court's settlement path). They are held here so that the
+     * set of record exists, and is range-checked, before anything consumes it.
+     */
+    struct Params {
+        /// The threat-stage ladder of §4.4: the target share at each stage, ascending, 1,850 - 4,000.
+        uint16 threatStage1Bps;
+        uint16 threatStage2Bps;
+        uint16 threatStage3Bps;
+        uint16 threatStage4Bps;
+        /**
+         * rho: the scarcity slope as a ratio of the target share in force, 2,500 - 10,000 (EC-07,
+         * 2026-09-30). The slope priced is alpha_t = floor(sigma_t * rho / BPS), so a ratio at or
+         * below BPS is I13 at every stage at once. Was `premiumSlopeBps`, an absolute slope.
+         */
+        uint16 premiumSlopeRatioBps;
+        /// sigma_max: above every stage, within the yield the fixed shares leave (I22).
+        uint16 premiumCeilingBps;
+        /// sigma_surge, while the run-off gate is closed: above the ceiling, within the seeding-value yield.
+        uint16 surgeCeilingBps;
+        /// Delta_min: the floor under the tail-risk premium. 100 - 500.
+        uint16 tailPremiumFloorBps;
+        /// Share of a realised loss made good, before the §4.3 cap. 5,000 - 10,000.
+        uint16 indemnityBps;
+        /// Ceiling on the diversification credit a book can earn. 1,500 - 5,000.
+        uint16 pmlFloorBps;
+        /// Admission cap per correlation group. Not above pmlFloorBps.
+        uint16 maxAssetShareBps;
+        /// Buffer share of gross yield. 250 - 1,500.
+        uint16 bufferBps;
+        /// Operations share of gross yield. 250 - 1,000.
+        uint16 operationsBps;
+        /// The fraction of the operations share sold for the juror fee pool. 0 - 5,000.
+        uint16 jurorFeeShareBps;
+        /// m_epoch: the per-epoch price bound. 1,500 - 3,000.
+        uint16 maxEpochMoveBps;
+        /// h_max: the cap on the conversion haircut. 0 - 3,000.
+        uint16 fxHaircutMaxBps;
+        /// W_fx: the window the haircut's drawdown is measured over, in days. 30 - 180.
+        uint16 fxWindowDays;
+        /// The per-epoch release bound. Not below any asset's exit bound; not above the escrow's constant.
+        uint16 releaseBoundBps;
+        /// The maturity ladder fraction. Not above BPS over the settlement horizon (I25).
+        uint16 maturityLadderBps;
+        /// The run-off trigger: contraction across two epochs. 1,500 - 5,000.
+        uint16 runoffTriggerBps;
+        /// The run-off bound per epoch. 1,500 - 2,500, draining in no fewer epochs than 1.5x unbonding.
+        uint16 runoffBoundBps;
+        /// w: junior thickness. 5,000 - 9,000.
+        uint16 juniorThicknessBps;
+        /// c_S: the stated senior coupon. 0 - 500, not above the floor under the tail-risk premium.
+        uint16 seniorCouponBps;
+        /// The reserve step per failed auction. 250 - 1,000.
+        uint16 reserveStepBps;
+        /// d_floor: the reserve floor, as a discount. 2,500 - 6,000.
+        uint16 reserveFloorBps;
+        /// The clearing floor defining a failed auction. 2,500 - 7,500.
+        uint16 clearingFloorBps;
+        /// The retention period for unsold premium share, in epochs. 2 - 12 (PV-24), not below the reserve ladder (I28).
+        uint16 unsoldEpochs;
+        /// The grace period, in epochs. Not above the first-round dispute cycle.
+        uint16 graceEpochs;
+        /// The most of bond principal delegated to one validator. 1 - 1,000. Enforced at delegation.
+        uint16 validatorConcentrationBps;
+        /// Epochs after an exit request within which a validator must have begun to exit. 1 - 4.
+        uint16 exitDeadlineEpochs;
+        /// The operator bond, in bps of the stake a validator may carry. 500 - 2,500.
+        uint16 operatorBondBps;
+        /// r_max: the reward rate cap for classifying receipts before a report, a year. 500 - 2,000.
+        uint16 rewardRateCapBps;
+        /// lambda: the stabilization levy while the threat stage is below its fourth value. 100 - 500. §4.2.
+        uint16 stabilizationLevyBps;
+        /// T_c: the commitment term, in epochs. 4 - 26. §4.4.
+        uint16 commitmentTermEpochs;
+        /// The cap on the premium stabilization reserve, in epochs of the worst-case gap. 2 - 12. §4.4.
+        uint16 psrCapEpochs;
+        /// D_0: the immediate trigger-2 draw, of the obligation. Not below severityFloorBps (relation 8). §4.6.
+        uint16 trigger2FloorBps;
+        /// S_floor: the floor under the measured severity. 5,000 - 8,000. §4.6.
+        uint16 severityFloorBps;
+        /// W_a: the assessment window before the severity balance settles, in epochs. 2 - 6. §4.6.
+        uint16 assessmentWindowEpochs;
+        /// Delta_X: the decay of a queued position's exposure per epoch of clean queue age. 1,000 - 2,000. §5.3.
+        uint16 queueDecayBps;
+        /// X_FLOOR: the exposure floor of the run-off queue. 2,000 - 5,000, not above BPS - (n_d - 1) x decay, n_d = ceil(BPS / runoff bound) (relation 9).
+        uint16 queueExposureFloorBps;
+        /// The slash of a minority or unrevealed juror vote, of the stake drawn. 500 - 3,000. §6.1, §6.2.
+        uint16 jurorSlashBps;
+        /// kappa: the verdict cover, of the stake the deciding majority forfeits. 3,333 - 8,000. §6.2.
+        uint16 verdictCoverBps;
+        // Appended 2026-09-28 (phase C1b) so that every key of the timelock's
+        // table in contracts/core names a field here (design §6.2).
+        /// The cap of the buffer escalator of §4.2. Not below bufferBps; not above the escrow's BUFFER_MAX_BPS, 1,500.
+        uint16 bufferEscalatorCapBps;
+        /// B_0: the solver's commitment bond at no discount, of the lot. 500 - 1,500. §4.7, I33. Read by nothing yet (gap item 17).
+        uint16 solverBondCeilingBps;
+        /// B_MIN: the solver's commitment bond at the reserve floor, of the lot. 100 - 300. §4.7. Read by nothing yet (gap item 17).
+        uint16 solverBondFloorBps;
+        /// F_max: successor states admitted per origin chain. 1 - 3. §5.4, I36. Read by `admitSuccessor` (phase C3).
+        uint16 successorLimit;
+        /// The court's windows for this product's pool, in days (§6.2). Each at least one day; the
+        /// cycle with its one appeal below the unbonding period, and the grace period not above the
+        /// first-round cycle. The court is not in this tree: read by nothing yet.
+        uint16 challengeWindowDays;
+        uint16 evidenceDays;
+        uint16 commitDays;
+        uint16 revealDays;
+        uint16 appealDays;
+        // Appended 2026-09-28 (phase C3): the last key of core's timelock table.
+        /**
+         * The admitted bond terms of whitepaper §6.3 (yellow paper §4.5): one
+         * bit per term of the fixed set, bit 0 three months, bit 1 one year,
+         * bit 2 three years — the ordinal `subscribe` takes. Clearing a bit
+         * stops new issuance at that term from the boundary it takes effect
+         * at and shortens no holding already issued (the maturity is fixed at
+         * issuance).
+         *
+         * Per phase since 2026-10-07 (staking CLAUDE.md item 129), with the
+         * Cushion's two fields below: the value is the `PhaseRow` of the
+         * phase in force, which `params()` and `pendingParams()` write into
+         * these three fields when they answer. The set's own copy is never
+         * read, a constructor value is ignored, and the flat key is refused
+         * (`UnknownParameter`); a change names the per-phase key below.
+         */
+        uint16 admittedTermsMask;
+        // Appended 2026-09-30 (the papers' EC revision, EC-03, EC-05; PV-05, PV-13, PV-19).
+        /// d_first: the reserve discount of a quantity's first offering. 300 - 500, below m_epoch by the ranges. §4.7.
+        uint16 firstReserveDiscountBps;
+        /// The batching multiple: no offering below this many times the claim cost. 0 - 100 (0: no batching). §4.7.
+        uint16 offeringBatchMultiple;
+        /// The cost of settling one lot on the origin chain, in 1e-9 of a whole unit of the asset. 0 - 10,000,000. §4.7.
+        uint32 claimCostGwei;
+        /// The buffer ramp threshold, of K: below it the buffer share is at least its seeding value. 500 - 2,000. §4.2.
+        uint16 bufferRampThresholdBps;
+        // Appended 2026-10-06: the Cushion (yellow paper §4.5; technical reference §1.7, §3.2).
+        /// c_tgt: the target of the Cushion, of bond principal at face; read by `cushionShortfall`. Per phase (`PhaseRow`).
+        uint16 cushionTargetBps;
+        /// c_max: the ceiling of the Cushion, of bond principal at face: the lane's room and the thickness credit. Per phase (`PhaseRow`).
+        uint16 cushionCeilingBps;
+    }
+
+    /**
+     * The fields that vary with the ecosystem phase (`QuantumArk-Phases.md`
+     * §4; staking CLAUDE.md item 129), one row per phase 0 - 4, all five
+     * written at construction and checked there, and on every diff, by the
+     * ranges and relation below. A cell moves by a keyed diff whose key is
+     * keccak256 of the field name, an at sign and the phase digit; the key of
+     * c_tgt in phase 3 is the hash of the name `cushionTargetBps`, the
+     * at sign and `3` (the literals are in `ArkStakeParams._rowCell`).
+     *
+     *  - `admittedTermsMask`: 1 - 7, a non-empty subset of the three terms;
+     *    in row 3 (Q-Day) 0 - 7, because 0 is that phase's rule: no new
+     *    principal, settlement only.
+     *  - `cushionTargetBps`: 0 - 2,000, not above the ceiling (relation 10).
+     *  - `cushionCeilingBps`: not above 3,000.
+     */
+    struct PhaseRow {
+        uint16 admittedTermsMask;
+        uint16 cushionTargetBps;
+        uint16 cushionCeilingBps;
+    }
+
+    /**
+     * The fields the registry prices from, in force for the current epoch
+     * (2026-09-30). The registry decodes this and never the whole set: the
+     * decoder of fifty-six fields cost it more than its v3 room, and every
+     * field appended to `Params` grew it again.
+     */
+    struct RegistryParams {
+        uint16 threatStage1Bps;
+        uint16 threatStage4Bps;
+        uint16 premiumSlopeRatioBps;
+        uint16 premiumCeilingBps;
+        uint16 surgeCeilingBps;
+        uint16 tailPremiumFloorBps;
+        uint16 indemnityBps;
+        uint16 pmlFloorBps;
+        uint16 maxAssetShareBps;
+        uint16 bufferBps;
+        uint16 bufferEscalatorCapBps;
+        uint16 bufferRampThresholdBps;
+        uint16 operationsBps;
+        uint16 jurorFeeShareBps;
+        uint16 maxEpochMoveBps;
+        uint16 fxHaircutMaxBps;
+        uint16 fxWindowDays;
+        uint16 releaseBoundBps;
+        uint16 stabilizationLevyBps;
+        uint16 commitmentTermEpochs;
+        uint16 psrCapEpochs;
+    }
+
+    /// The fields the premium swap snapshots into an offering (G8), in force now. See `RegistryParams`.
+    struct SwapParams {
+        uint16 maxEpochMoveBps;
+        uint16 firstReserveDiscountBps;
+        uint16 reserveStepBps;
+        uint16 reserveFloorBps;
+        uint16 tailPremiumFloorBps;
+        uint16 clearingFloorBps;
+        uint16 unsoldEpochs;
+        uint16 solverBondCeilingBps;
+        uint16 solverBondFloorBps;
+        uint16 operationsBps;
+        uint16 jurorFeeShareBps;
+        uint16 offeringBatchMultiple;
+        uint32 claimCostGwei;
+    }
+
+    /// The whole set the product launches with, written at construction and never again.
+    event ParamsSet(Params params);
+
+    /// The five phase rows the product launches with, written at construction (item 129).
+    event PhaseRowsSet(PhaseRow[5] rows);
+
+    /**
+     * One change of a keyed diff was staged: `key` moves from `previous` to
+     * `value` for every epoch from `effectiveEpoch` on (design §6.4, G8).
+     */
+    event ParamChangeStaged(bytes32 indexed key, uint256 previous, uint256 value, uint256 effectiveEpoch);
+
+    /// The threat stage was voted one step; it is in force from `effectiveEpoch`. Whitepaper §4.4.
+    event ThreatStageSet(uint8 fromStage, uint8 toStage, uint256 effectiveEpoch);
+
+    /// The registry whose admitted assets bound the release bound from below. Emitted once.
+    event RegistrySet(address indexed registry);
+
+    error OnlyGovernance(address caller);
+    error OnlyDeployer(address caller);
+    error AlreadySet(address current);
+
+    /// A parameter was set outside the range fixed for it in whitepaper §6.3.
+    error ParameterOutOfRange(string name, uint256 supplied);
+
+    /**
+     * A parameter was set outside a relation of whitepaper §6.3. `bound` is the
+     * value the relation admits at the other terms supplied.
+     */
+    error RelationViolated(string relation, uint256 supplied, uint256 bound);
+
+    /// The threat stage moves one step per vote, inside the ladder. Whitepaper §4.4.
+    error ThreatStageStep(uint8 current, uint8 requested);
+
+    /// The threat stage already moved in this epoch; at most one step per epoch (2026-09-27, D9).
+    error ThreatStageAlreadyStepped(uint256 epoch);
+
+    /// A stage vote names the stage it moves from, and that is not the stage in force (design §6.3).
+    error ThreatStageMismatch(uint8 current, uint8 fromStage);
+
+    /**
+     * The stage is the phase's (item 129): a vote moves it only inside the
+     * band of phase 2 (Classical Sunset), 2 <-> 3. `phase` is the phase in force.
+     */
+    error StageFixedByPhase(uint8 phase);
+
+    /// The phase contract reported an index outside 0 - 4, or a row was asked for one.
+    error UnknownPhase(uint8 phase);
+
+    /**
+     * The phase contract counts epochs of another length: its `phaseAt` would
+     * key this contract's epochs to the wrong boundaries (`ArkEpoch`, G12).
+     */
+    error PhaseEpochMismatch(uint256 phaseEpochLength, uint256 epochLength);
+
+    /// A diff named a value it expected to replace, and the key holds another (compare-and-swap, design §6.2).
+    error StaleParameter(bytes32 key, uint256 expected, uint256 current);
+
+    /// No field of `Params` has this key. There is no default: an unknown key is refused, never ignored.
+    error UnknownParameter(bytes32 key);
+
+    /// A diff named the same key twice; one operation moves a key once.
+    error DuplicateParameter(bytes32 key);
+
+    /// A diff with no change in it.
+    error EmptyDiff();
+
+    /// A value wider than the field it would be written into.
+    error ParameterValueTooLarge(bytes32 key, uint256 value);
+
+    /**
+     * A value-transfer key moved further than a quarter of its governable range
+     * in one change (design §6.9, decision D7). `maxStep` is that quarter.
+     */
+    error ParameterStepTooLarge(bytes32 key, uint256 current, uint256 value, uint256 maxStep);
+
+    /**
+     * The bound would be set below an admitted asset's own published exit path.
+     * Whitepaper §6.3 states the range in that direction: a protocol throttle
+     * tighter than the origin chain's own would hold a position more tightly
+     * than the asset it consists of does.
+     */
+    error ReleaseBoundBelowAssetExit(uint256 boundBps, uint256 assetExitBps);
+
+    /// The parameters in force for the current epoch; a staged diff counts from its effective epoch on.
+    function params() external view returns (Params memory);
+
+    /// The registry's fields of `params()`, in force for the current epoch.
+    function registryParams() external view returns (RegistryParams memory);
+
+    /// The premium swap's fields of `params()`, in force for the current epoch.
+    function swapParams() external view returns (SwapParams memory);
+
+    /**
+     * The diff staged and not yet in force, and the epoch it takes effect;
+     * `effectiveEpoch` is zero when nothing is waiting.
+     */
+    function pendingParams() external view returns (Params memory staged, uint256 effectiveEpoch);
+
+    /**
+     * The value a change to `key` must name as `expected`: the latest staged
+     * value where a diff is waiting, the value in force otherwise.
+     */
+    function paramOf(bytes32 key) external view returns (uint256);
+
+    /**
+     * The six parameters the catastrophe bond reads, as a flat tuple.
+     *
+     * `params()` returns fifty-two fields and the bond consumes six of them;
+     * decoding the whole set costs the bond bytecode it does not have, in the one
+     * contract of this product that carries a state machine as well as a price.
+     * A narrow view is cheaper on the consumer's side and costs one accessor
+     * here, where there is room for it.
+     */
+    /// The stated senior coupon in force in `epoch`, past or present (G8); see `ArkStakeParams`.
+    function seniorCouponBpsAt(uint256 epoch) external view returns (uint16);
+
+    /**
+     * What the run-off gate and the queue read for `epoch`, past or present
+     * (G8, whitepaper §6.5): the run-off trigger, bound and threat stage in
+     * force IN that epoch — the epoch the gate observes, never the one it is
+     * closed in — and the queue's decay and exposure floor (whitepaper §5.3).
+     */
+    function runoffParamsAt(uint256 epoch)
+        external
+        view
+        returns (
+            uint16 runoffTriggerBps,
+            uint16 runoffBoundBps,
+            uint8 stage,
+            uint16 queueDecayBps,
+            uint16 queueExposureFloorBps
+        );
+
+    /// The admitted bond terms in force for the current epoch, one bit per term (whitepaper §6.3): the row of the phase in force.
+    function admittedTermsMask() external view returns (uint16);
+
+    /// The ecosystem phase contract the stage and the rows are read from. Fixed at construction.
+    function arkPhase() external view returns (IArkPhase);
+
+    /// The row of phase `phase` in force for the current epoch; a staged cell counts from its effective epoch on.
+    function phaseRow(uint8 phase) external view returns (PhaseRow memory);
+
+    /**
+     * The progressive trigger-2 settlement's parameters in force now (whitepaper
+     * §4.6): D_0, S_floor and W_a, and m_epoch, which with W_a fixes the clamp
+     * on a measured severity (PV-03, 2026-09-30). Read once, at the opening,
+     * and fixed with the draw (G8: a draw already determined keeps the values
+     * it was determined under).
+     */
+    function trigger2Params()
+        external
+        view
+        returns (uint16 trigger2FloorBps, uint16 severityFloorBps, uint16 assessmentWindowEpochs, uint16 maxEpochMoveBps);
+
+    /**
+     * The dispute court's parameters in force now (whitepaper §6.2, §6.3): κ
+     * in bps, the slash of a minority or unrevealed vote, and the five windows
+     * in days. Read once, when a case opens, and fixed for it (G8: "a claim or
+     * a determination keeps the values in force at its opening").
+     */
+    function courtParams()
+        external
+        view
+        returns (
+            uint16 verdictCoverBps,
+            uint16 jurorSlashBps,
+            uint16 challengeWindowDays,
+            uint16 evidenceDays,
+            uint16 commitDays,
+            uint16 revealDays,
+            uint16 appealDays
+        );
+
+    /**
+     * Admit a successor state of an origin chain (whitepaper §5.4, §6.3,
+     * yellow paper §4.3, I36). Governance: the four-stage procedure, a
+     * 48-hour timelock (core's `ArkGovTables.ADMIT_SUCCESSOR`). At most
+     * `successorLimit` per origin chain, each once, in the order admitted —
+     * the order the subrogation residual is applied in.
+     */
+    function admitSuccessor(uint256 chainId, bytes32 successorId) external;
+
+    /// The admission order of a successor state, one-based; zero where it is not admitted.
+    function successorIndex(uint256 chainId, bytes32 successorId) external view returns (uint256);
+
+    /// Successor states admitted for an origin chain.
+    function successorCount(uint256 chainId) external view returns (uint256);
+
+    event SuccessorAdmitted(uint256 indexed chainId, bytes32 indexed successorId, uint256 index);
+
+    /// A successor admitted twice, or a zero identifier (zero is the origin chain itself).
+    error SuccessorNotAdmissible(uint256 chainId, bytes32 successorId);
+
+    /// The successor limit of whitepaper §6.3 is reached for this origin chain.
+    error SuccessorLimitReached(uint256 chainId, uint256 limit);
+
+    function bondParams()
+        external
+        view
+        returns (
+            uint16 maturityLadderBps,
+            uint16 runoffTriggerBps,
+            uint16 runoffBoundBps,
+            uint16 juniorThicknessBps,
+            uint16 seniorCouponBps,
+            uint16 tailPremiumFloorBps,
+            uint16 cushionTargetBps,
+            uint16 cushionCeilingBps
+        );
+
+    /**
+     * The stage of the threat ladder in force for the current epoch, 1 - 4:
+     * the ecosystem phase's, `[1, 1, 2 or 3, 4, 1]` (item 129), the band of
+     * phase 2 moved by `setThreatStage`.
+     */
+    function threatStage() external view returns (uint8);
+
+    /**
+     * The stage a step on its way will put in force, and its effective epoch;
+     * zero when none: a band step staged here, or the stage a phase step
+     * pending in the phase contract implies, where it differs from the stage
+     * in force.
+     */
+    function pendingThreatStage() external view returns (uint8 stage, uint256 effectiveEpoch);
+
+    /**
+     * A step of the threat stage on its way (QL-25, PV-20): a band step staged
+     * here, or a phase step pending in the phase contract that changes the
+     * stage, for the next boundary; or an operation queued in the timelock
+     * that is `governance` (`stageStepQueued()` of contracts/core's
+     * ArkTimelock). The registry writes it into the allocation's `stepQueued`.
+     */
+    function stageStepQueued() external view returns (bool);
+
+    /// The epoch of the last stage vote; zero before any (epoch zero is 1970).
+    function lastStageEpoch() external view returns (uint256);
+
+    /// The target share in force: the ladder at the current stage.
+    function sigmaTargetBps() external view returns (uint256);
+}
+
+/// What the parameter set reads from its governance, where that is contracts/core's ArkTimelock.
+interface IStageStepQueue {
+    /// True while an operation stepping the threat stage is queued: not executed, cancelled or expired.
+    function stageStepQueued() external view returns (bool);
+}
+
+/// What the parameter set reads back from the registry.
+interface IArkStakeAdmissions {
+    /// The widest exit bound any admitted asset published. A high-water mark.
+    function maxAssetExitBps() external view returns (uint16);
+}

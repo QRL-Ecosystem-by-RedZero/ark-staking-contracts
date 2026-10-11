@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * A place bond principal earns QRL staking rewards: native QRL in, a position
+ * whose value follows the validators behind it, native QRL out through a
+ * withdrawal queue.
+ *
+ * `ArkBondStaking` speaks only this, so what stands behind it can change
+ * without the bond changing: `ArkStakingPool` on a private network today, an
+ * adapter over QuantaPool (DigitalGuards) on the public testnet later. The
+ * shape is QuantaPool's: a position of non-transferable shares, a value per
+ * share that rewards raise and slashing lowers, and a two-step withdrawal
+ * whose shares keep earning, and keep bearing loss, until it is settled.
+ */
+interface IStakingVenue {
+    event Deposited(address indexed account, uint256 amount, uint256 shares);
+    event WithdrawalRequested(uint256 indexed requestId, address indexed account, uint256 shares);
+    event WithdrawalSettled(uint256 indexed requestId, uint256 amount);
+    event WithdrawalClaimed(uint256 indexed requestId, address indexed account, uint256 amount);
+
+    /// Stake the QRL sent, for the sender. Returns the shares credited.
+    function deposit() external payable returns (uint256 shares);
+
+    /// The sender's shares not locked in a withdrawal.
+    function sharesOf(address account) external view returns (uint256);
+
+    /// What `account`'s shares are worth now, in QRL.
+    function positionValue(address account) external view returns (uint256);
+
+    /// The shares worth at least `amount` QRL now, rounding up.
+    function sharesFor(uint256 amount) external view returns (uint256);
+
+    /// What `shares` are worth now, in QRL, rounding down: locked shares included (OC-LEGB-07).
+    function valueOfShares(uint256 shares) external view returns (uint256);
+
+    /// Lock `shares` of the sender's for withdrawal, in order of request. Returns its id.
+    function requestWithdrawal(uint256 shares) external returns (uint256 requestId);
+
+    /// QRL a settled request pays, zero while it waits.
+    function withdrawalAmount(uint256 requestId) external view returns (uint256);
+
+    /// Pay a settled request to the account that made it. Returns what was paid.
+    function claimWithdrawal(uint256 requestId) external returns (uint256 amount);
+}

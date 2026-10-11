@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * The replacement path for a contract's governance account (2026-09-27).
+ *
+ * The one rule this interface exists to state: **governance is handed over in
+ * two steps, and never to an account that has not taken it.** The incumbent
+ * proposes; only the proposed account completes the handover by accepting. A
+ * one-step setter lets a typo or a wrong-width address make the contract
+ * ungoverned for ever, which on a contract with no upgrade path is permanent.
+ *
+ * Why it exists at all: the parameter set, the registry and the delegation
+ * were built with governance as an immutable, so the deployer that held it at
+ * construction held it for the contract's life. Whitepaper §6.3 hands interim
+ * governance to the governor once it exists; without a replacement path that
+ * would have been a redeployment of every contract naming governance. The
+ * governor itself (quorum, approval, the timelocks of §6.3) is not in this
+ * tree; whatever account holds governance is the whole of that authority
+ * until it is, and the handover is how it passes to the governor.
+ */
+interface IGovernanceHandover {
+    /// The incumbent named `proposed` as its successor. Zero withdraws a proposal.
+    event GovernanceProposed(address indexed current, address indexed proposed);
+
+    /// The proposed account accepted; `next` is governance from this call on.
+    event GovernanceTransferred(address indexed previous, address indexed next);
+
+    /// Only the account governance proposed may accept it.
+    error NotPendingGovernance(address caller);
+
+    /// The account every governance-gated call on this contract answers to.
+    function governance() external view returns (address);
+
+    /// The account proposed and not yet accepted; zero when none.
+    function pendingGovernance() external view returns (address);
+
+    /// Governance only. Name a successor, or zero to withdraw a proposal.
+    function proposeGovernance(address next) external;
+
+    /// The proposed account only. Completes the handover.
+    function acceptGovernance() external;
+}

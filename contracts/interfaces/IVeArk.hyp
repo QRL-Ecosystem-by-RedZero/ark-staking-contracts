@@ -1,0 +1,164 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * veARK — time-locked ARK, the unit of governance weight and jury eligibility.
+ *
+ * WHY LOCKING IS MANDATORY FOR GOVERNANCE
+ * ---------------------------------------
+ * An insurance protocol's liabilities are long-dated: a policy written today
+ * may pay out years from now, and Q-Day itself is an event nobody can schedule.
+ * A voter whose position can be sold tomorrow has no reason to weigh a loss
+ * that lands in year four. Locking forces the voter's horizon to match the
+ * protocol's, which is the only alignment mechanism available that does not
+ * rely on goodwill.
+ *
+ * DESIGN LIMITS, AND WHY EACH EXISTS
+ * ----------------------------------
+ *   - Boost is capped at 4x. Uncapped boost turns governance into a contest
+ *     between a handful of maximum-duration lockers.
+ *   - Lock positions are NON-TRANSFERABLE. A transferable lock is just a
+ *     tradable vote with extra steps, and it re-creates the vote-buying market
+ *     that locking was meant to close.
+ *   - Delegation stays revocable at any time (see IArkToken), so weight lent to
+ *     a briber can be withdrawn before it is used.
+ *
+ * Weight decays linearly as the lock approaches expiry: a lock with one week
+ * left should not vote like a lock with four years left, because it no longer
+ * carries the same exposure to the consequences.
+ */
+interface IVeArk {
+    /// A single non-transferable lock position.
+    struct Lock {
+        uint256 amount;
+        uint64 start;
+        uint64 end;
+    }
+
+    event LockCreated(address indexed account, uint256 amount, uint64 unlockTime);
+    event LockIncreased(address indexed account, uint256 addedAmount, uint256 newAmount);
+    event LockExtended(address indexed account, uint64 previousUnlock, uint64 newUnlock);
+    event Withdrawn(address indexed account, uint256 amount);
+
+    /// Requested lock duration is outside [MIN_LOCK, MAX_LOCK].
+    error LockDurationOutOfRange(uint64 requested, uint64 minimum, uint64 maximum);
+
+    /// The account already holds a lock; use `increaseAmount` or `extendLock`.
+    error LockAlreadyExists(address account);
+
+    /// No lock exists for the account.
+    error NoLock(address account);
+
+    /// Withdrawal was attempted before the lock matured.
+    error LockNotExpired(uint64 unlockTime, uint64 currentTime);
+
+    /// A lock may only be extended, never shortened.
+    error LockCannotShorten(uint64 currentUnlock, uint64 requestedUnlock);
+
+    /// veARK positions cannot be transferred; the token is soulbound by design.
+    error NonTransferable();
+
+    /// Aggregate weight was queried for a block that has not been mined yet.
+    error FutureLookup(uint256 requestedBlock, uint256 currentBlock);
+
+    /// Shortest permitted lock.
+    function MIN_LOCK() external view returns (uint64);
+
+    /// Longest permitted lock, and the duration that earns the maximum boost.
+    function MAX_LOCK() external view returns (uint64);
+
+    /// Maximum weight multiplier, in basis points (40000 = 4x).
+    function MAX_BOOST_BPS() external view returns (uint16);
+
+    /**
+     * Locks `amount` of ARK until `unlockTime`.
+     *
+     * @param amount ARK to lock; transferred from the caller.
+     * @param unlockTime Absolute timestamp at which the lock matures.
+     */
+    function createLock(uint256 amount, uint64 unlockTime) external;
+
+    /// @notice Adds ARK to an existing lock without changing its unlock time.
+    function increaseAmount(uint256 amount) external;
+
+    /// @notice Extends an existing lock. Shortening is impossible by design.
+    function extendLock(uint64 newUnlockTime) external;
+
+    /// @notice Withdraws a matured lock in full. Partial early exit does not exist.
+    function withdraw() external;
+
+    /// @param account The locker being queried.
+    /// @return The stored lock position.
+    function lockOf(address account) external view returns (Lock memory);
+
+    /**
+     * Current governance weight, after boost and time decay.
+     *
+     * @param account The locker being queried.
+     * @return Weight in the same units as ARK, scaled by the boost multiplier.
+     */
+    function weightOf(address account) external view returns (uint256);
+
+    /**
+     * Weight used when drawing jurors for a dispute.
+     *
+     * @dev Read together with IStakingVault: jury draw weight is a function of
+     *      BOTH tier-scoped stake and veARK. A large veARK position with no
+     *      stake in a tier cannot judge that tier's disputes, because it would
+     *      not lose anything if the verdict were wrong.
+     * @param account The candidate juror.
+     * @return The veARK component of that account's draw weight.
+     */
+    function juryWeightOf(address account) external view returns (uint256);
+
+    /// @param blockNumber A block that has already been mined.
+    /// @return Total veARK weight at that block, for quorum evaluation.
+    function totalWeightAt(uint256 blockNumber) external view returns (uint256);
+
+    event DividendDistributed(uint256 amount, uint256 accQrlPerUnit, uint256 totalUnits);
+    event DividendClaimed(address indexed account, uint256 amount);
+    event WeightSynced(address indexed account, uint256 previousUnits, uint256 newUnits);
+
+    /// Nothing is currently claimable for this account.
+    error NothingToClaim(address account);
+
+    /// A dividend arrived while no lock exists to receive it.
+    error NoLockedWeight();
+
+    /**
+     * Pays the veARK dividend slice into the contract.
+     *
+     * @dev This is the 5% of premium that tokenomics assigns to lockers, settled
+     *      in NATIVE QRL rather than in newly minted ARK. A locker's return is a
+     *      share of real revenue, not dilution of everyone else — which is the
+     *      whole basis for ARK having value without being the claim-paying asset.
+     *
+     *      In production the caller is ICapitalPool, and only after the
+     *      solvency-first rule has decided this slice is payable at all: below
+     *      the reserve target, or while recovery debt is outstanding, nothing
+     *      reaches here.
+     */
+    function distributeDividend() external payable;
+
+    /// @notice Pays out everything accrued to the caller.
+    function claimDividend() external returns (uint256 amount);
+
+    /// @param account The locker being queried.
+    /// @return QRL claimable right now.
+    function pendingDividend(address account) external view returns (uint256);
+
+    /**
+     * Brings an account's weight units in line with its decayed live weight.
+     *
+     * @dev Permissionless. Dividends and quorum are denominated in units, which
+     *      move only when a transaction touches the lock, so an untouched lock
+     *      keeps its opening weight and over-earns. Anyone may correct that, and
+     *      every other locker gains when they do.
+     * @param account The locker to refresh.
+     */
+    function syncWeight(address account) external;
+
+    /// @param account The locker being queried.
+    /// @return Weight as of that account's last sync — the unit dividends are paid on.
+    function unitsOf(address account) external view returns (uint256);
+}

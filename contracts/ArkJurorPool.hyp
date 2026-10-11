@@ -1,0 +1,566 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/security/ReentrancyGuard.hyp";
+import "./lib/openzeppelin/token/ERC20/IERC20.hyp";
+
+import "./interfaces/IArkJurorPool.hyp";
+import "./interfaces/IArkVeArkSnapshot.hyp";
+import "./utils/ArkEpoch.hyp";
+
+/**
+ * ArkJurorPool — the ARK bonded behind Ark Staking's dispute court, and the
+ * draw of its panels (whitepaper §6.1, §6.2; yellow paper §4.1, G13).
+ *
+ * THE ONE RULE
+ * ------------
+ * **The stake a draw seats is held until the court settles the case**, through
+ * the appeal, the terminal governance step and a retrial (G13): the escalation
+ * outlasts the unbonding period, so a juror of the appeal panel who could
+ * unbond while veARK votes would escape the slash its verdict risks, and the
+ * cost of a purchased verdict (I24) would rest on stake that had already left.
+ * `unbond` reaches only stake no seat holds; `settle` is the one release.
+ *
+ * THE DRAW WEIGHT (whitepaper §6.1; yellow paper §4.1)
+ * ----------------------------------------------------
+ *   weight = min(active + min(active, veARK weight at the snapshot), 10% of pool stake)
+ * The veARK bonus is the juror's own lock at a checkpointed block
+ * (`IArkVeArkSnapshot.weightAt`, contracts/core's VeArk), capped at the same
+ * again, so a lock with no stake behind it seats nobody; the per-address cap
+ * is on the pool's active stake, so no address is drawn with more than a
+ * tenth of the pool's weight however it splits its ARK — within one address.
+ *
+ * NEW STAKE WAITS ONE BOUNDARY
+ * ----------------------------
+ * Stake joins the draw from the epoch after it is added. Without the wait, an
+ * account that saw a draw coming — the draw block is fixed two blocks ahead,
+ * and the randomness of a block is public one block before it — could stake
+ * into it.
+ *
+ * A DRAW IS TAKEN ON THE POOL AS IT STOOD WHEN IT WAS ARMED (audit 2026-09-29, QL-01)
+ * --------------------------------------------------------------------------------
+ * The court arms one draw at a time (`arm`); until it is drawn or its
+ * blockhash window passes, no other draw is armed. The panel's weights, its
+ * eligibility and the per-address cap are the jurors' stake and held stake as
+ * recorded at the arm: a juror whose stake moves after the arm (`unbond`,
+ * `stake`, a settlement) is checkpointed first, at the arm epoch, so the draw
+ * reads the checkpoint. Unbonding therefore changes no armed draw — it used
+ * to, and `unbond(1 wei)` in the draw block re-shuffled every pick (C-1) —
+ * and the stake a juror unbonds after the arm still counts for that draw and
+ * is taken back from the unbonding lot if the juror is seated (it cannot be
+ * withdrawn while the draw is armed). The list is not reordered while a draw
+ * is armed: nobody is delisted or evicted until it is drawn or lapses.
+ *
+ * A LISTED JUROR HOLDS AT LEAST THE MINIMUM STAKE (QL-21)
+ * --------------------------------------------------------
+ * A juror enters the list only with stake of at least `MIN_STAKE`; where the
+ * list is full, the listed juror with the smallest stake is evicted to make
+ * room for a larger one (audit 2026-10-03, OC-COURT-06; one fallen below the
+ * minimum is always the smallest), so stakes below the minimum hold no slot
+ * of `MAX_JURORS` and 256 minimum stakes cannot keep every seat. An evicted
+ * juror keeps its stake, its held stake, its unbonding and its reward, and
+ * leaves the draw and the pool's stake until it stakes in again.
+ *
+ * WHERE SLASHED ARK GOES
+ * ----------------------
+ * To the coherent seats of a case an appeal decided, in equal parts with
+ * everything held unallocated before it, claimable as ARK (audit 2026-10-03,
+ * OC-COURT-07). A case its first panel decided alone — unappealed, or its
+ * appeal unseatable — pays its slash to none of its own seats (OC-COURT-09:
+ * an unappealed bribed 4–3 was paid its three dissenters' stake, which the
+ * I24 cost assumes an appeal takes back from it); that slash, and any case's
+ * where no seat was coherent and the division's remainder, are held as
+ * `unallocatedSlash` until the next appealed case's coherent seats take it.
+ * The papers say who is slashed and not where the stake goes (a spec
+ * question reported with phase C4).
+ *
+ * THE DRAW IS LINEAR IN THE POOL
+ * ------------------------------
+ * The bonus decays with time and is read per juror at the snapshot, so no
+ * sum tree can be kept; each draw reads every listed juror once and walks the
+ * weights once per seat. `MAX_JURORS` bounds that walk (256 jurors, a
+ * twenty-eight-seat retrial: about 7,200 memory steps and 256 veARK reads).
+ *
+ * No owner, no setter but the one-shot `setCourt`; ARK is the constructor's.
+ */
+contract ArkJurorPool is IArkJurorPool, ReentrancyGuard {
+    uint256 private constant BPS = 10_000;
+
+    /// The largest draw weight of one address, in bps of the pool's active stake (whitepaper §6.2).
+    uint256 public constant ADDRESS_CAP_BPS = 1_000;
+
+    /// Listed jurors, which bounds every draw's walk.
+    uint256 public constant MAX_JURORS = 256;
+
+    /// The court's first panel: a case of this many seats was decided by it alone (OC-COURT-09).
+    uint256 private constant FIRST_PANEL = 7;
+
+    IERC20 public immutable ARK;
+    IArkVeArkSnapshot public immutable VEARK;
+
+    /**
+     * The minimum juror stake of the product pool (whitepaper §6.2, §6.3): the
+     * stake one seat holds and slashes against, `s_min` of yellow paper §4.1.
+     * A reference value, not calibrated; §6.3 makes it governable, and no
+     * `ArkStakeParams` field can carry a token amount (every field is 16
+     * bits), so a change is a redeployment of the pool and the court.
+     */
+    uint256 public immutable MIN_STAKE;
+
+    address private immutable _deployer;
+    address public court;
+
+    mapping(address => Juror) private _jurors;
+    address[] private _list;
+
+    // Private behind an explicit view: hypc's QRVM auto-getter cleans a
+    // mapping key as uint256 before hashing, so a 64-byte address or a
+    // left-aligned bytes32 key reads another slot (OC-V3-02).
+    mapping(bytes32 => mapping(address => uint8)) private _seatRound;
+    mapping(bytes32 => mapping(uint8 => address[])) private _panels;
+    mapping(bytes32 => uint256) private _seatStake;
+    mapping(bytes32 => uint256) private _seats;
+    mapping(bytes32 => bool) private _settled;
+
+    /// Slashed ARK held for the coherent seats of the next case an appeal decides (OC-COURT-07, -09).
+    uint256 public unallocatedSlash;
+
+    /// Draws armed so far; a juror's checkpoint belongs to the arm of this number (QL-01).
+    uint64 public drawSeq;
+    /// The epoch, the block and the last drawable block of the draw armed now; `_armedUntil` zero once drawn.
+    uint64 private _armEpoch;
+    uint64 private _armBlock;
+    uint64 private _armedUntil;
+
+    /**
+     * @param ark_ contracts/core's ArkToken in a deployment; the tree's copy in the suite.
+     * @param veArk_ contracts/core's VeArk, read at a snapshot for the draw bonus.
+     * @param minStake_ The minimum juror stake, a reference value (above).
+     * @param deployer_ The account that names the court, once — not
+     *        `msg.sender`, which is `ChunkedDeployer` where the pool is
+     *        assembled on chain (CLAUDE.md §3.1).
+     */
+    constructor(address ark_, address veArk_, uint256 minStake_, address deployer_) {
+        if (ark_ == address(0) || veArk_ == address(0) || deployer_ == address(0)) revert OnlyDeployer(address(0));
+        if (minStake_ == 0) revert ZeroAmount();
+        ARK = IERC20(ark_);
+        VEARK = IArkVeArkSnapshot(veArk_);
+        MIN_STAKE = minStake_;
+        _deployer = deployer_;
+    }
+
+    /// Name the court that draws, slashes and releases. Once.
+    function setCourt(address court_) external {
+        if (msg.sender != _deployer) revert OnlyDeployer(msg.sender);
+        if (court != address(0)) revert AlreadySet(court);
+        if (court_ == address(0)) revert OnlyDeployer(address(0));
+        court = court_;
+        emit CourtSet(court_);
+    }
+
+    modifier onlyCourt() {
+        if (msg.sender != court) revert OnlyCourt(msg.sender);
+        _;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Stake                                                               */
+    /* ------------------------------------------------------------------ */
+
+    /// @inheritdoc IArkJurorPool
+    function stake(uint256 amount) external nonReentrant {
+        if (amount == 0) revert ZeroAmount();
+        Juror storage j = _roll(msg.sender);
+        if (j.index == 0) {
+            // Listed only at the minimum stake (QL-21): a dust stake takes no slot.
+            uint256 total = uint256(j.active) + j.pending + amount;
+            if (total < MIN_STAKE) revert BelowMinimumStake(MIN_STAKE, total);
+            if (_list.length < MAX_JURORS) {
+                _list.push(msg.sender);
+                j.index = uint32(_list.length);
+            } else {
+                // Full: the slot of the smallest stake, where the newcomer's is
+                // larger (audit 2026-10-03, OC-COURT-06), never while a draw is
+                // armed. A juror below the minimum is always the smallest.
+                if (_drawOpen()) revert PoolFull(MAX_JURORS);
+                uint256 i = _smallest(total);
+                address out = _list[i];
+                _jurors[out].index = 0;
+                _list[i] = msg.sender;
+                j.index = uint32(i + 1);
+                emit JurorEvicted(out);
+            }
+        }
+        j.pending += uint128(amount);
+        j.pendingEpoch = uint64(ArkEpoch.current());
+        if (!ARK.transferFrom(msg.sender, address(this), amount)) revert TransferFailed();
+        emit Staked(msg.sender, amount, ArkEpoch.current() + 1);
+    }
+
+    /**
+     * @inheritdoc IArkJurorPool
+     * @dev Pending stake first, then active stake no seat holds. A second
+     *      unbonding restarts the clock for the whole amount leaving: one
+     *      lot per juror, and never earlier than the period after the last
+     *      stake to leave the draw. A draw armed before it still reads the
+     *      stake it takes (the checkpoint in `_roll`, QL-01).
+     */
+    function unbond(uint256 amount) external nonReentrant {
+        if (amount == 0) revert ZeroAmount();
+        Juror storage j = _roll(msg.sender);
+        uint256 free = uint256(j.active) - j.held;
+        if (amount > free + j.pending) revert NotFree(msg.sender, amount, free + j.pending);
+        uint256 fromPending = amount < j.pending ? amount : j.pending;
+        j.pending -= uint128(fromPending);
+        j.active -= uint128(amount - fromPending);
+        j.unbonding += uint128(amount);
+        j.unbondAt = uint64(block.timestamp + ArkEpoch.UNBONDING_PERIOD);
+        emit Unbonding(msg.sender, amount, j.unbondAt);
+    }
+
+    /// @inheritdoc IArkJurorPool
+    function withdraw() external nonReentrant {
+        Juror storage j = _jurors[msg.sender];
+        // A juror whose stake moved after the armed draw may be seated on it
+        // from the unbonding lot: nothing of the lot leaves until it is drawn (QL-01).
+        if (_drawOpen() && j.ckSeq == drawSeq) revert DrawPending(_armedUntil);
+        uint256 amount = j.unbonding;
+        if (amount == 0 || block.timestamp < j.unbondAt) revert NothingWithdrawable(msg.sender, j.unbondAt);
+        j.unbonding = 0;
+        _delistIfEmpty(msg.sender);
+        if (!ARK.transfer(msg.sender, amount)) revert TransferFailed();
+        emit Withdrawn(msg.sender, amount);
+    }
+
+    /// @inheritdoc IArkJurorPool
+    function claimReward() external nonReentrant {
+        Juror storage j = _jurors[msg.sender];
+        uint256 amount = j.reward;
+        if (amount == 0) revert ZeroAmount();
+        j.reward = 0;
+        _delistIfEmpty(msg.sender);
+        if (!ARK.transfer(msg.sender, amount)) revert TransferFailed();
+        emit RewardClaimed(msg.sender, amount);
+    }
+
+    /// @inheritdoc IArkJurorPool
+    function snapshot() external returns (uint256) {
+        VEARK.checkpoint();
+        return block.number;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The draw. Whitepaper §6.2, yellow paper §4.1                        */
+    /* ------------------------------------------------------------------ */
+
+    /// @inheritdoc IArkJurorPool
+    function arm(uint256 lastDrawBlock) external onlyCourt returns (uint256 snapshotBlock) {
+        if (_drawOpen()) revert DrawPending(_armedUntil);
+        VEARK.checkpoint();
+        drawSeq += 1;
+        _armEpoch = uint64(ArkEpoch.current());
+        _armBlock = uint64(block.number);
+        _armedUntil = uint64(lastDrawBlock);
+        return block.number;
+    }
+
+    /// @inheritdoc IArkJurorPool
+    function armedUntil() external view returns (uint256) {
+        return _drawOpen() ? _armedUntil : 0;
+    }
+
+    /**
+     * @inheritdoc IArkJurorPool
+     * @dev The arm is spent by the call: a panel the pool could not seat at
+     *      the arm returns empty, and the court arms the round again once its
+     *      window has passed.
+     */
+    function drawPanel(bytes32 caseId, uint8 round, uint256 n, uint256 seatStake, uint256 snapshotBlock, bytes32 rand)
+        external
+        onlyCourt
+        returns (address[] memory panel)
+    {
+        if (!_drawOpen() || snapshotBlock != _armBlock) revert NotArmed(snapshotBlock);
+        _armedUntil = 0;
+        uint256 recorded = _seatStake[caseId];
+        if (recorded != 0 && recorded != seatStake) revert SeatMismatch(caseId, recorded, seatStake);
+        (uint256[] memory w, uint256 total, uint256 eligible) = _weights(caseId, seatStake, snapshotBlock);
+        // A draw that seats nobody pins nothing (re-audit 2026-09-30, COURT-01):
+        // the case's seat is recorded with its first panel.
+        if (eligible < n) return panel;
+        _seatStake[caseId] = seatStake;
+        panel = _choose(caseId, round, n, seatStake, w, total, rand);
+        _seats[caseId] += n;
+        emit PanelDrawn(caseId, round, panel, seatStake);
+    }
+
+    /// `n` jurors without replacement, each holding a seat's stake from now (G13).
+    function _choose(
+        bytes32 caseId,
+        uint8 round,
+        uint256 n,
+        uint256 seatStake,
+        uint256[] memory w,
+        uint256 total,
+        bytes32 rand
+    ) private returns (address[] memory panel) {
+        panel = new address[](n);
+        for (uint256 k = 0; k < n; k++) {
+            // A 256-bit draw modulo the remaining weight: the bias is below
+            // total / 2^256, nothing at any stake ARK can have.
+            uint256 i = _pick(w, uint256(keccak256(abi.encode(rand, k))) % total);
+            total -= w[i];
+            w[i] = 0;
+            address a = _list[i];
+            panel[k] = a;
+            Juror storage j = _roll(a);
+            uint256 free = uint256(j.active) - j.held;
+            if (free < seatStake) {
+                // Unbonded since the arm: the stake the draw was armed on
+                // returns from the unbonding lot, which cannot have left (QL-01).
+                uint256 back = seatStake - free;
+                j.unbonding -= uint128(back);
+                j.active += uint128(back);
+            }
+            j.held += uint128(seatStake);
+            _seatRound[caseId][a] = round;
+            _panels[caseId][round].push(a);
+        }
+    }
+
+    /**
+     * Every listed juror's weight for this draw, on the stake and held stake
+     * recorded at the arm (QL-01); zero for one seated on the case already or
+     * without a free seat. The per-address cap is on the pool's stake at the arm.
+     */
+    function _weights(bytes32 caseId, uint256 seatStake, uint256 snapshotBlock)
+        private
+        view
+        returns (uint256[] memory w, uint256 total, uint256 eligible)
+    {
+        uint256 m = _list.length;
+        w = new uint256[](m);
+        uint256[] memory free = new uint256[](m);
+        uint256 pool;
+        for (uint256 i = 0; i < m; i++) {
+            (uint256 s, uint256 h) = _atArm(_jurors[_list[i]]);
+            w[i] = s;
+            free[i] = s - h;
+            pool += s;
+        }
+        // Truncates, against the juror: the cap never exceeds a tenth.
+        uint256 cap = (pool * ADDRESS_CAP_BPS) / BPS;
+        for (uint256 i = 0; i < m; i++) {
+            address a = _list[i];
+            uint256 wi;
+            if (_seatRound[caseId][a] == 0 && free[i] >= seatStake) wi = _weight(a, w[i], snapshotBlock, cap);
+            w[i] = wi;
+            if (wi == 0) continue;
+            total += wi;
+            eligible += 1;
+        }
+    }
+
+    /// A juror's stake and held stake at the arm: its checkpoint where it moved since, else its record now.
+    function _atArm(Juror storage j) private view returns (uint256 s, uint256 h) {
+        if (j.ckSeq == drawSeq) return (j.ckStake, j.ckHeld);
+        return (_stakeAt(j, _armEpoch), j.held);
+    }
+
+    /// The index whose cumulative weight first exceeds `r`.
+    function _pick(uint256[] memory w, uint256 r) private pure returns (uint256 i) {
+        while (r >= w[i]) {
+            r -= w[i];
+            i++;
+        }
+    }
+
+    /// @inheritdoc IArkJurorPool
+    function settle(bytes32 caseId, address[] calldata jurors, bool[] calldata coherent, uint256 slashBps)
+        external
+        onlyCourt
+    {
+        uint256 n = jurors.length;
+        if (_settled[caseId] || n != _seats[caseId] || n != coherent.length) revert SeatMismatch(caseId, _seats[caseId], n);
+        _settled[caseId] = true;
+        uint256 seat = _seatStake[caseId];
+        // Truncates, toward the juror slashed.
+        uint256 cut = (seat * (slashBps > BPS ? BPS : slashBps)) / BPS;
+        uint256 slashed;
+        uint256 coherentSeats;
+        for (uint256 i = 0; i < n; i++) {
+            Juror storage j = _roll(jurors[i]);
+            if (_seatRound[caseId][jurors[i]] == 0) revert SeatMismatch(caseId, 0, i);
+            j.held -= uint128(seat);
+            if (coherent[i]) {
+                coherentSeats += 1;
+            } else {
+                j.active -= uint128(cut);
+                slashed += cut;
+            }
+        }
+        // Equal parts to the coherent seats of a case an appeal decided, with
+        // the slash held unallocated before it (audit 2026-10-03, OC-COURT-07):
+        // it had no exit. A case its first panel decided alone pays its slash
+        // to no seat of its own and holds it unallocated (OC-COURT-09): an
+        // unappealed bribed 4–3 was subsidised by its three dissenters'
+        // stake. The remainder of the division waits for the next.
+        uint256 share;
+        if (n > FIRST_PANEL && coherentSeats != 0) {
+            slashed += unallocatedSlash;
+            share = slashed / coherentSeats;
+            unallocatedSlash = 0;
+        }
+        unallocatedSlash += slashed - share * coherentSeats;
+        for (uint256 i = 0; i < n; i++) {
+            if (coherent[i]) _jurors[jurors[i]].reward += uint128(share);
+            emit SeatSettled(caseId, jurors[i], coherent[i], coherent[i] ? 0 : cut, coherent[i] ? share : 0);
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Views                                                               */
+    /* ------------------------------------------------------------------ */
+
+    function jurorOf(address juror) external view returns (Juror memory) {
+        return _jurors[juror];
+    }
+
+    function activeStakeOf(address juror) public view returns (uint256 active) {
+        (active,) = _stakeOf(_jurors[juror]);
+    }
+
+    function freeStakeOf(address juror) external view returns (uint256 free) {
+        (, free) = _stakeOf(_jurors[juror]);
+    }
+
+    /// The pool's active stake, which the per-address cap and the court's concurrency cap are taken on.
+    function poolStake() public view returns (uint256 s) {
+        uint256 m = _list.length;
+        for (uint256 i = 0; i < m; i++) {
+            (uint256 active,) = _stakeOf(_jurors[_list[i]]);
+            s += active;
+        }
+    }
+
+    function jurorCount() external view returns (uint256) {
+        return _list.length;
+    }
+
+    /**
+     * Listed jurors whose free stake is at least `seat` now: those one case
+     * can seat at that stake (whitepaper §3.7, the S3 condition's 49; PV-01).
+     */
+    function eligibleCount(uint256 seat) external view returns (uint256 n) {
+        uint256 m = _list.length;
+        for (uint256 i = 0; i < m; i++) {
+            (, uint256 free) = _stakeOf(_jurors[_list[i]]);
+            if (free >= seat) n += 1;
+        }
+    }
+
+    /// A juror's draw weight at a veARK snapshot, under the cap the pool stands at now.
+    function drawWeightOf(address juror, uint256 snapshotBlock) external view returns (uint256) {
+        (uint256 active,) = _stakeOf(_jurors[juror]);
+        return _weight(juror, active, snapshotBlock, (poolStake() * ADDRESS_CAP_BPS) / BPS);
+    }
+
+    function panelOf(bytes32 caseId, uint8 round) external view returns (address[] memory) {
+        return _panels[caseId][round];
+    }
+
+    function seatStakeOf(bytes32 caseId) external view returns (uint256) {
+        return _seatStake[caseId];
+    }
+
+    function seatRound(bytes32 caseId, address juror) external view returns (uint8) {
+        return _seatRound[caseId][juror];
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Internals                                                           */
+    /* ------------------------------------------------------------------ */
+
+    /// Active stake counting pending stake whose epoch has passed, and the part no seat holds.
+    function _stakeOf(Juror storage j) private view returns (uint256 active, uint256 free) {
+        active = _stakeAt(j, ArkEpoch.current());
+        free = active - j.held;
+    }
+
+    /// Active stake as of `epoch`: pending stake counts once an epoch after its own has begun.
+    function _stakeAt(Juror storage j, uint256 epoch) private view returns (uint256 s) {
+        s = j.active;
+        if (j.pending != 0 && j.pendingEpoch < epoch) s += j.pending;
+    }
+
+    /// Whether a draw is armed and still drawable.
+    function _drawOpen() private view returns (bool) {
+        return block.number <= _armedUntil;
+    }
+
+    /**
+     * The listed juror with the smallest stake (active and pending, the first
+     * of equals), where it is smaller than `stake`; `PoolFull` where none is.
+     * A list filled at the minimum used to refuse every larger staker and
+     * keep every seat for its filler (OC-COURT-06).
+     */
+    function _smallest(uint256 stake) private view returns (uint256 i) {
+        uint256 m = _list.length;
+        uint256 least = stake;
+        i = m;
+        for (uint256 k = 0; k < m; k++) {
+            Juror storage j = _jurors[_list[k]];
+            uint256 s = uint256(j.active) + j.pending;
+            if (s < least) {
+                least = s;
+                i = k;
+            }
+        }
+        if (i == m) revert PoolFull(MAX_JURORS);
+    }
+
+    /**
+     * Fold pending stake into active once its epoch has passed — after
+     * checkpointing, where a draw is armed and this juror has not moved
+     * since, the stake and held stake the draw reads (QL-01).
+     */
+    function _roll(address a) private returns (Juror storage j) {
+        j = _jurors[a];
+        if (_drawOpen() && j.ckSeq != drawSeq) {
+            j.ckSeq = drawSeq;
+            j.ckStake = uint128(_stakeAt(j, _armEpoch));
+            j.ckHeld = j.held;
+        }
+        if (j.pending != 0 && j.pendingEpoch < ArkEpoch.current()) {
+            j.active += j.pending;
+            j.pending = 0;
+        }
+    }
+
+    function _weight(address a, uint256 active, uint256 snapshotBlock, uint256 cap) private view returns (uint256 wi) {
+        if (active == 0) return 0;
+        uint256 bonus = VEARK.weightAt(a, snapshotBlock);
+        wi = active + (bonus < active ? bonus : active);
+        if (wi > cap) wi = cap;
+    }
+
+    /**
+     * A juror holding nothing leaves the list, so a departed juror costs no
+     * draw a read — not while a draw is armed, whose picks are positions in
+     * the list (QL-01); one left listed with nothing is evicted when the list
+     * fills (QL-21).
+     */
+    function _delistIfEmpty(address a) private {
+        Juror storage j = _jurors[a];
+        if (_drawOpen() || j.index == 0 || j.active != 0 || j.pending != 0 || j.unbonding != 0 || j.reward != 0) return;
+        uint256 i = uint256(j.index) - 1;
+        uint256 last = _list.length - 1;
+        if (i != last) {
+            address moved = _list[last];
+            _list[i] = moved;
+            _jurors[moved].index = uint32(i + 1);
+        }
+        _list.pop();
+        j.index = 0;
+    }
+}

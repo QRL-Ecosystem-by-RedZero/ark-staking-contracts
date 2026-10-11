@@ -1,0 +1,69 @@
+{
+  "name": "hoodi-vps",
+  "chainId": 560048,
+  "profile": "testnet",
+  "evmVersion": "shanghai",
+  "qrlOwnerLength": 64,
+  "rootSigners": {
+    "threshold": 1,
+    "signers": 1
+  },
+  "court": "real",
+  "qday": "ArkQDayOracle",
+  "priceOracle": "ArkReferenceOracle",
+  "governance": {
+    "network": "private-qrvm",
+    "selfDeploy": true
+  },
+  "finality": "finalized",
+  "confirmations": 64,
+  "deliveryMarginSeconds": 120,
+  "deployedFromBlock": 3746315,
+  "assets": [
+    {
+      "symbol": "stETH",
+      "address": "0x3508A952176b3c15387C97BE809eaffB1982176a",
+      "source": "lido",
+      "rebasing": true,
+      "correlationGroup": "group:lido-like",
+      "exitBoundBps": 2500,
+      "escrow": "0x6040715E40542571249e755c0b4f628c8EA4C32d",
+      "seedMinimum": "10000000000000000",
+      "admissionYieldBps": 300
+    }
+  ],
+  "addresses": {
+    "relay": "0xC9Bdd30CF2b14611fbBb1ABF12707235e07C7709",
+    "operationsDestination": "0x6086b810C9D266F937c0304f043a9ba9ed9E6a78"
+  },
+  "logChunkBlocks": 500,
+  "poolValidator": {
+    "teamDeposit": "40000",
+    "note": "The team's own 40,000 QRL deposit into ArkStakingPool funds one real validator on every devnet bring-up; it holds pool shares, never bond principal."
+  },
+  "authority": {
+    "threshold": 1,
+    "signers": 1,
+    "treeHeight": 11,
+    "generations": [
+      [
+        "0x31a2eb1a9b43b8848d5496194b7461692d3ecb931eb40919aeafa81f274deab2"
+      ],
+      [
+        "0x5d30fa5dc8c320e87d3105fda871b3bb67b51b508b658917fbcb60aca5822237"
+      ],
+      [
+        "0xa64c0d6ad2bb1ac054597913cf3eb3a7d36c0e2c74a529bc4c3ae0283cff5d41"
+      ],
+      [
+        "0x848526344b445728d42712323c6769921e5e9aad7ac0f27bb80b4341576f492c"
+      ]
+    ],
+    "commits": [
+      "0x074ca1af4ba1bb27ebb477b8f711a6247729606e8bd6a79af92f728af3971d99",
+      "0xede91353c721619287366fd4b4f212af08b4a7d900b7b4775de1a5aac984c471",
+      "0xa15a1a0da1a3b4840ca8867d07fefa03c67af94f57469ea701b99ff2651f2b31",
+      "0x290decd9548b62a8d60345a988386fc84ba6bc95484008f6362f93160ef3e563"
+    ]
+  }
+}

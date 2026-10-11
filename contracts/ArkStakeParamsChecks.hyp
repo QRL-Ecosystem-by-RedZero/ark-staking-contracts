@@ -1,0 +1,358 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./interfaces/IArkStakeParams.hyp";
+import "./utils/ArkStakeMath.hyp";
+import "./utils/ArkEpoch.hyp";
+
+/**
+ * The ranges and relations of whitepaper §6.3 (yellow paper §6.3; technical
+ * reference §3.2), checked on a whole parameter set for `ArkStakeParams` by a
+ * static call from its `_check` (staking CLAUDE.md item 128).
+ *
+ * WHY THIS CONTRACT EXISTS
+ * ------------------------
+ * The Cushion's two keys took the parameter set to 24,896 bytes of v3 runtime,
+ * 320 over EIP-170. The checks are the largest self-contained block of the
+ * contract — fifty-eight names spelt out as revert data — and they are a
+ * function of the set and of one view of the registry, so they need none of
+ * the set's storage: the set passes itself by value with the registry's
+ * address, the widest asset exit is read here at the point of the sequence
+ * it was always read at, and a static call cannot write anything. That is
+ * what sets this module apart from `ArkCatBondDeterminations` and
+ * `PremiumSwapJudge`, which run in their host's storage by delegatecall and
+ * need a shared store contract to keep the slots in place. Measured on the
+ * v3 line, the delegatecall form (the set written to its bank first, the
+ * module reading it there) would have left the set 37 bytes smaller, and
+ * that was not worth a store contract and a module able to write the set's
+ * storage. The pattern they
+ * share: the host's constructor creates this contract (CREATE nonce 1) and
+ * fixes its address in an immutable; no setter, no admin, not a proxy; a
+ * fixed selector, and a revert re-raised by the host byte for byte, so every
+ * refusal leaves `ArkStakeParams` with the error and the arguments it had
+ * before the split, decoded with the host's ABI.
+ *
+ * Called by anyone but the contract that created it, `check` refuses
+ * (`OnlyDeployer`): it would answer a question nobody asked of it, and a
+ * module that serves one host is easier to reason about when it serves only
+ * that one.
+ */
+contract ArkStakeParamsChecks {
+    /**
+     * The ceiling on the release bound: `ArkStakeParams.MAX_RELEASE_BOUND_BPS`,
+     * which says why, and which hypc 0.0.2 cannot name from here.
+     * `test/ArkStakeSpec.test.js` holds the two and the escrow's equal.
+     */
+    uint16 private constant MAX_RELEASE_BOUND_BPS = 2500;
+
+    /**
+     * The buffer share while the buffer is below its threshold (whitepaper
+     * §4.2). The surge ceiling is bounded by the yield left at this value
+     * rather than at the governable buffer share, because the two can be in
+     * force at once on a young book and the four shares must still sum to BPS.
+     */
+    uint16 private constant SEED_BUFFER_BPS = 1000;
+
+    /// Appeal rounds inside the court's cycle: one (whitepaper §6.2); the governance step lies beyond it.
+    uint256 private constant APPEAL_ROUNDS = 1;
+
+    /**
+     * The unit of the court's windows, which are governed in days (whitepaper
+     * §6.2). A duration literal, so the testnet profile scales it with every
+     * other duration and the windows keep their ratio to the unbonding period
+     * and the epoch (`test/profile.test.js`).
+     */
+    uint256 private constant COURT_DAY = 1 days;
+
+    uint256 private constant BPS = 10000;
+
+    /// The parameter set that created this module, and the one caller `check` answers.
+    address private immutable HOST;
+
+    constructor() {
+        HOST = msg.sender;
+    }
+
+    /**
+     * Revert where `p` or a phase row breaks a range or a relation; return
+     * nothing where they hold. `registry` is the set's (zero until it is
+     * named), the source of the floor under the release bound. `rows` is the
+     * five phase rows packed as the set stores them (item 129): the cell of
+     * field f (0 the mask, 1 the Cushion's target, 2 its ceiling) of phase p
+     * in the sixteen bits from bit 16 x (3p + f). The three per-phase fields
+     * of `p` are not read: the rows carry them.
+     */
+    function check(IArkStakeParams.Params memory p, IArkStakeAdmissions registry, uint256 rows) external view {
+        if (msg.sender != HOST) revert IArkStakeParams.OnlyDeployer(msg.sender);
+        _checkPricing(p);
+        _checkExitAndDelivery(p, registry);
+        _checkSettlementAndCourt(p);
+        _checkRows(rows);
+    }
+
+    /**
+     * Every phase row (`QuantumArk-Phases.md` §3.1, §4; item 129), all five on
+     * every check, so a cell of one phase cannot be voted outside its bounds
+     * while another phase is in force. The bounds are the flat fields' of
+     * 2026-10-06, with one departure: the mask of row 3 (Q-Day) may be zero,
+     * which is that phase's own rule (settlement only, no new principal).
+     * Elsewhere a mask with no bit set would close issuance by a parameter
+     * rather than by the suspensions §4.7 names, so it is refused. A refusal
+     * names the cell as its key does: field name, an at sign, phase digit.
+     */
+    function _checkRows(uint256 rows) private pure {
+        for (uint256 ph = 0; ph < 5; ph++) {
+            bytes1 digit = bytes1(uint8(48 + ph));
+            uint256 r = rows >> (48 * ph);
+            uint256 mask = r & 0xffff;
+            uint256 target = (r >> 16) & 0xffff;
+            uint256 ceiling = (r >> 32) & 0xffff;
+            _range(string(abi.encodePacked("admittedTermsMask@", digit)), mask, ph == 3 ? 0 : 1, 7);
+            // The Cushion (technical reference §3.2): the ceiling's top keeps
+            // junior at least 2,000 bps of the pool at issuance with w >= 5,000,
+            // and relation 10 holds the target at or below it.
+            _range(string(abi.encodePacked("cushionTargetBps@", digit)), target, 0, 2000);
+            _relation(string(abi.encodePacked("c_tgt <= c_max <= 3000@", digit)), ceiling, target, 3000);
+        }
+    }
+
+    /**
+     * The pricing parameters, and relations I13 and I22 with the surge ceiling.
+     *
+     * The ladder is strictly ascending, because a stage is a step along the
+     * threat and a vote moves one step at a time: two stages at one value would
+     * make a vote that changes nothing, and a descending pair would make
+     * "raise the stage" lower the price. The slope is a ratio of the stage's
+     * own target share since 2026-09-30, at most BPS, so every stage is at or
+     * above its slope (I13) and scarce cover is never priced under abundant
+     * cover.
+     */
+    function _checkPricing(IArkStakeParams.Params memory p) private pure {
+        _range("threatStage1Bps", p.threatStage1Bps, 1850, 4000);
+        _range("threatStage2Bps", p.threatStage2Bps, uint256(p.threatStage1Bps) + 1, 4000);
+        _range("threatStage3Bps", p.threatStage3Bps, uint256(p.threatStage2Bps) + 1, 4000);
+        _range("threatStage4Bps", p.threatStage4Bps, uint256(p.threatStage3Bps) + 1, 4000);
+
+        _range("indemnityBps", p.indemnityBps, 5000, 10000);
+        _range("pmlFloorBps", p.pmlFloorBps, 1500, 5000);
+        // "Not above pmlFloorBps": the admission cap shapes the book and the
+        // measured share sizes the capital, so a cap above the floor would
+        // admit a book the floor then pretends is more diversified than it is.
+        _range("maxAssetShareBps", p.maxAssetShareBps, 1, p.pmlFloorBps);
+        // The escalator of §4.2 moves the share from its base to its cap, and
+        // both lie inside the §6.3 range, whose top is the escrow's
+        // BUFFER_MAX_BPS (ArkStakeMath.BUFFER_ESCALATOR_CAP_BPS). A base above
+        // the cap would make the escalator lower the share.
+        _range("bufferEscalatorCapBps", p.bufferEscalatorCapBps, 250, ArkStakeMath.BUFFER_ESCALATOR_CAP_BPS);
+        _range("bufferBps", p.bufferBps, 250, p.bufferEscalatorCapBps);
+        // The ramp of §4.2: while the buffer is below this share of K the
+        // buffer share is at least its seeding value (EC-05).
+        _range("bufferRampThresholdBps", p.bufferRampThresholdBps, 500, 2000);
+        _range("operationsBps", p.operationsBps, 250, 1000);
+        _range("jurorFeeShareBps", p.jurorFeeShareBps, 0, 5000);
+        _range("tailPremiumFloorBps", p.tailPremiumFloorBps, 100, 500);
+        _range("maxEpochMoveBps", p.maxEpochMoveBps, 1500, 3000);
+        _range("fxHaircutMaxBps", p.fxHaircutMaxBps, 0, 3000);
+        _range("fxWindowDays", p.fxWindowDays, 30, 180);
+
+        // I13, at every stage at once: the slope is a ratio of the stage's
+        // target share, alpha_t = floor(sigma_t * rho / BPS), and a ratio at
+        // or below BPS never prices scarce cover under abundant cover
+        // (whitepaper §4.4, §6.3; EC-07). The absolute slope it replaced was
+        // bounded by the first rung instead.
+        _range("premiumSlopeRatioBps", p.premiumSlopeRatioBps, 2500, 10000);
+        // I22: above every stage, within the yield the two fixed shares leave.
+        _relation(
+            "target < ceiling <= BPS - buffer - ops",
+            p.premiumCeilingBps,
+            uint256(p.threatStage4Bps) + 1,
+            BPS - p.bufferBps - p.operationsBps
+        );
+        // Bounded at the buffer's seeding value, not at the governable share,
+        // because a young book pays that value while the gate may be closed;
+        // bounded at the lower share the four streams could overspend the yield
+        // in exactly that state.
+        _relation(
+            "ceiling < surge <= BPS - ops - seed buffer",
+            p.surgeCeilingBps,
+            uint256(p.premiumCeilingBps) + 1,
+            BPS - p.operationsBps - SEED_BUFFER_BPS
+        );
+    }
+
+    /**
+     * The exit, run-off, class and delivery parameters, and relations I25,
+     * I28, the run-off drain and the senior coupon.
+     */
+    function _checkExitAndDelivery(IArkStakeParams.Params memory p, IArkStakeAdmissions registry) private view {
+        // The upper bound is the origin-chain escrow's constant and not BPS; see
+        // MAX_RELEASE_BOUND_BPS. The lower is the widest exit any admitted asset
+        // published, a high-water mark a de-listing does not lower: positions
+        // anchored under that asset are still in the book and still leave
+        // through its exit path.
+        _range("releaseBoundBps", p.releaseBoundBps, 1, MAX_RELEASE_BOUND_BPS);
+        uint16 widestExit = address(registry) == address(0) ? 0 : registry.maxAssetExitBps();
+        if (p.releaseBoundBps < widestExit) revert IArkStakeParams.ReleaseBoundBelowAssetExit(p.releaseBoundBps, widestExit);
+
+        // I25, exit parity: bond principal runs off in no fewer epochs than the
+        // anchored book takes to settle in full. Checked in the whitepaper's
+        // form, BPS over the horizon, which is the stricter of the two ways the
+        // relation can be written — the ceiling form admits a ladder a few
+        // basis points wider than the horizon allows.
+        _relation(
+            "ladder <= BPS / settlement horizon",
+            p.maturityLadderBps,
+            1,
+            ArkStakeMath.maturityLadderMaxBps(
+                ArkStakeMath.settlementHorizonEpochs(
+                    ArkEpoch.UNBONDING_PERIOD, ArkEpoch.EPOCH_LENGTH, p.releaseBoundBps
+                )
+            )
+        );
+
+        _range("runoffTriggerBps", p.runoffTriggerBps, 1500, 5000);
+        _range("runoffBoundBps", p.runoffBoundBps, 1500, 2500);
+        // The queue returns in no fewer epochs than one and a half times the
+        // unbonding period, so principal maturing into a contracting book is
+        // returned over a longer interval than an anchored position needs to
+        // leave. Cross-multiplied, so the half-epoch needs no rounding rule.
+        uint256 drain = ArkStakeMath.runoffDrainEpochs(p.runoffBoundBps);
+        if (2 * drain * ArkEpoch.EPOCH_LENGTH < 3 * uint256(ArkEpoch.UNBONDING_PERIOD)) {
+            revert IArkStakeParams.RelationViolated("runoff drain >= 1.5 x unbonding", p.runoffBoundBps, drain);
+        }
+
+        _range("juniorThicknessBps", p.juniorThicknessBps, 5000, 9000);
+        // The senior rate is at most the floor, so on every book on which
+        // issuance is open the premium meets it in full. Whitepaper §4.6.
+        _relation("senior coupon <= tail floor", p.seniorCouponBps, 0, _min(500, p.tailPremiumFloorBps));
+
+        _range("reserveStepBps", p.reserveStepBps, 250, 1000);
+        // The first offering's rung (§4.7, EC-03). Below the per-epoch bound
+        // by the two ranges, 300 - 500 against 1,500 - 3,000, so the first
+        // rung sits under the second without a relation of its own.
+        _range("firstReserveDiscountBps", p.firstReserveDiscountBps, 300, 500);
+        // Batching (§4.7, PV-13): a multiple of zero, or a claim cost of zero,
+        // turns it off.
+        _range("offeringBatchMultiple", p.offeringBatchMultiple, 0, 100);
+        _range("claimCostGwei", p.claimCostGwei, 0, 10000000);
+        _range("reserveFloorBps", p.reserveFloorBps, 2500, 6000);
+        _range("clearingFloorBps", p.clearingFloorBps, 2500, 7500);
+        // I28: a quantity is offered at the floor before it is retired. The
+        // ladder counts the first offering's rung since 2026-09-30, and the
+        // range is 2 - 12 (PV-24), so at a step of 500 bps or more every
+        // epoch bound and floor of the ranges admits a retention period.
+        _relation(
+            "retention >= reserve ladder",
+            p.unsoldEpochs,
+            ArkStakeMath.reserveLadderEpochs(p.reserveFloorBps, p.maxEpochMoveBps, p.reserveStepBps),
+            12
+        );
+        // Whitepaper §4.7, I33: the solver's bond at no discount and at the
+        // reserve floor. The two ranges are disjoint, so the ceiling stays
+        // above the floor without a relation of its own.
+        _range("solverBondCeilingBps", p.solverBondCeilingBps, 500, 1500);
+        _range("solverBondFloorBps", p.solverBondFloorBps, 100, 300);
+        // Whitepaper §3.4 and §6.3: not above 1,000 bps of principal per
+        // validator. A single operator's slashing then reaches at most a tenth
+        // of the pool that stands behind both triggers.
+        _range("validatorConcentrationBps", p.validatorConcentrationBps, 1, 1000);
+        // Whitepaper §3.4, §6.3: the deadline an exit request gives an
+        // operator, and the bond that makes missing it cost the operator
+        // rather than the pool.
+        _range("exitDeadlineEpochs", p.exitDeadlineEpochs, 1, 4);
+        _range("operatorBondBps", p.operatorBondBps, 500, 2500);
+        // Whitepaper §3.4, §6.3 and I32: the rate up to which the delegation
+        // forwards receipts as distribution before a report classifies them.
+        _range("rewardRateCapBps", p.rewardRateCapBps, 500, 2000);
+        // Whitepaper §5.4, §6.3, I36: successor states admitted per origin chain.
+        _range("successorLimit", p.successorLimit, 1, 3);
+        // The admitted terms and the Cushion are per phase since 2026-10-07:
+        // `_checkRows`.
+    }
+
+    /**
+     * The levy, the progressive trigger-2 settlement, the run-off queue's
+     * decaying exposure and the court: whitepaper §4.2, §4.4, §4.6, §5.3, §6.2
+     * and relations 8 and 9 of §6.3.
+     */
+    function _checkSettlementAndCourt(IArkStakeParams.Params memory p) private pure {
+        _range("stabilizationLevyBps", p.stabilizationLevyBps, 100, 500);
+        _range("commitmentTermEpochs", p.commitmentTermEpochs, 4, 26);
+        _range("psrCapEpochs", p.psrCapEpochs, 2, 12);
+
+        _range("severityFloorBps", p.severityFloorBps, 5000, 8000);
+        // Relation 8: the immediate draw is not below the severity floor, so the
+        // assessment can complete a settlement and never claw one back — the
+        // total is max(D_0, S) with S at or above the floor. Above BPS the draw
+        // would take more than the obligation.
+        _relation("D0 >= severity floor", p.trigger2FloorBps, p.severityFloorBps, BPS);
+        _range("assessmentWindowEpochs", p.assessmentWindowEpochs, 2, 6);
+
+        _range("queueDecayBps", p.queueDecayBps, 1000, 2000);
+        _range("queueExposureFloorBps", p.queueExposureFloorBps, 2000, 5000);
+        // The bond weighs a queue entry of age 8 or more at the floor, and the
+        // coupon prices it at 1 - age x decay floored: the two agree only
+        // while 8 x decay >= BPS - floor (OC-ECON-09). The ranges above imply
+        // it, exactly at their corner; asserted, so a range moved alone cannot
+        // break it.
+        _relation("8 x decay >= BPS - floor", uint256(p.queueDecayBps) * 8, BPS - p.queueExposureFloorBps, 2 * BPS);
+        // Relation 9, by the drain length (whitepaper §6.3;
+        // `queueExposureFloorMaxBps` in the model): the last principal of a
+        // clean queue leaves at a clean age of n_d - 1 with its weight not
+        // below the floor. It joins the run-off bound to the pair, so moving
+        // the bound is refused where it lengthens the drain past the floor.
+        // The bound is reported as zero where the decay is too steep for the
+        // drain and no floor would satisfy it.
+        int256 floorMax = ArkStakeMath.queueExposureFloorMaxBps(p.runoffBoundBps, p.queueDecayBps);
+        if (int256(uint256(p.queueExposureFloorBps)) > floorMax) {
+            revert IArkStakeParams.RelationViolated(
+                "exposure floor <= BPS - (n_d - 1) x decay",
+                p.queueExposureFloorBps,
+                floorMax < 0 ? 0 : uint256(floorMax)
+            );
+        }
+
+        _range("jurorSlashBps", p.jurorSlashBps, 500, 3000);
+        // Whitepaper §6.2, yellow paper Eq. 4.1′: at the top, 8,000, a purchased
+        // verdict still costs five quarters of what it moves (5 kappa <= 4 BPS).
+        _range("verdictCoverBps", p.verdictCoverBps, 3333, 8000);
+
+        // The court's windows (whitepaper §6.2). Each is a stage of the
+        // procedure, so none is shorter than a day; the cycle with its one
+        // appeal stays below the unbonding period, which is what stops a
+        // release from outrunning a determination already open against it; and
+        // the grace period of §5.5 stays inside the first-round cycle, so a
+        // settlement is never deferred past the determination that authorises
+        // it. In whole days the cycle is then at most twenty, the bond's
+        // `ArkEpoch.DISPUTE_CYCLE_APPEAL`. The §6.3 table states no range for
+        // a single window; these are the relations `check-staking-invariants.mjs`
+        // checks on the model's values.
+        _range("challengeWindowDays", p.challengeWindowDays, 1, type(uint16).max);
+        _range("evidenceDays", p.evidenceDays, 1, type(uint16).max);
+        _range("commitDays", p.commitDays, 1, type(uint16).max);
+        _range("revealDays", p.revealDays, 1, type(uint16).max);
+        _range("appealDays", p.appealDays, 1, type(uint16).max);
+        uint256 roundDays = uint256(p.commitDays) + p.revealDays + p.appealDays;
+        uint256 firstRound = uint256(p.challengeWindowDays) + p.evidenceDays + roundDays;
+        uint256 cycle = firstRound + APPEAL_ROUNDS * roundDays;
+        if (cycle * COURT_DAY >= ArkEpoch.UNBONDING_PERIOD) {
+            // The bound is reported in whole days, truncated: informational only.
+            revert IArkStakeParams.RelationViolated("court cycle with appeal < unbonding", cycle, ArkEpoch.UNBONDING_PERIOD / COURT_DAY);
+        }
+        _relation("grace <= first-round cycle", uint256(p.graceEpochs) * ArkEpoch.EPOCH_LENGTH, 0, firstRound * COURT_DAY);
+    }
+
+    function _range(string memory name, uint256 value, uint256 lo, uint256 hi) private pure {
+        if (value < lo || value > hi) revert IArkStakeParams.ParameterOutOfRange(name, value);
+    }
+
+    /// A range whose bounds are set by another parameter. Reports the bound it broke.
+    function _relation(string memory name, uint256 value, uint256 lo, uint256 hi) private pure {
+        if (value < lo) revert IArkStakeParams.RelationViolated(name, value, lo);
+        if (value > hi) revert IArkStakeParams.RelationViolated(name, value, hi);
+    }
+
+    function _min(uint256 a, uint256 b) private pure returns (uint256) {
+        return a < b ? a : b;
+    }
+}

@@ -1,0 +1,920 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/security/ReentrancyGuard.hyp";
+
+import "./interfaces/IArkStakeCourt.hyp";
+import "./interfaces/IArkJurorPool.hyp";
+import "./interfaces/IArkCatBondCourtSide.hyp";
+import "./interfaces/IArkStakeParams.hyp";
+
+import "./ArkCourtFindings.hyp";
+
+/**
+ * ArkStakeCourt — the dispute court of Ark Staking (whitepaper §6.2, §6.6;
+ * yellow paper §4.1, §4.3, §4.5; I24′, G8, G13).
+ *
+ * THE ONE RULE
+ * ------------
+ * **No finding reaches the bond that a purchase could buy for less than one
+ * and a half times what it moves** (I24′, Eq. 4.1′). Every case fixes at its
+ * opening the stake one seat holds, `seat`, and κ and the slash in force, so
+ * the stake the deciding majority of the first panel forfeits where the verdict
+ * is overturned, `F_1 = ceil(7 / 2) * seat * slash / BPS`, bounds the value
+ * the finding can move: `V <= floor(κ * F_1 / BPS)` (`ArkStakeMath.verdictBound`),
+ * so a buyer pays at least `ceil(V * BPS / κ)` (`bribeCostFloor`), which is at
+ * least `ceil(3V / 2)` at κ = 6,666 — and every later round at least 7/4 of
+ * the one before (the panel doubles, the majority `ceil(n / 2)`).
+ *
+ * THE BOUND, BY KIND OF FINDING
+ * -----------------------------
+ * `V` is the bond principal the finding can move, in QRL, valued in ARK at
+ * the ARK reference price the protocol's valuation oracle reports (the
+ * registry's `priceOracle`, keyed `(0, ARK)`; yellow paper §4.1 names that
+ * price and does not fix it).
+ *   - A trigger-1 loss: `V = ceil(sum(lossUnits) * referencePrice / 1e18)`,
+ *     the bond draw the claim can ask for at most (the buffer pays first, the
+ *     indemnity and the vesting factor only reduce it). The seat is the
+ *     minimum juror stake, and a claim above the bound on it is REFUSED
+ *     (`ClaimAboveBound`): it is heard as `piecesFor(V)` assertions, each its
+ *     own case with its own deposit and panel (whitepaper §6.2; the pieces
+ *     are the asserter's to split, by position).
+ *   - The censorship ground (`V = D_0` of the pool now) and the m_loss of a
+ *     held balance (`V` = the held balance, which the finding divides
+ *     between a draw and a release whatever m_loss it states; audit
+ *     2026-09-29, QL-23) are single facts no split can divide, heard one
+ *     finding at a time per kind. Since 2026-09-30 (EC-04) the value is
+ *     divided instead of the seat raised: a single fact above the bound on
+ *     the seat in force opens `n = findingSlices(V_ark, seat, slash, κ)`
+ *     value slices at once (at most 16), each its own case at that seat with
+ *     its own deposit at V / n and its own panel, the i-th case id
+ *     `keccak256(abi.encode(assertion id, uint8(i)))`; each slice's verdict,
+ *     a rejection as well, reaches the bond (`closeSlice`) and settles only
+ *     its fraction of the finding's object. The kind's slot and the bond's
+ *     determination are held until the last slice closes.
+ *   - A loss, censorship or severity finding valued at zero is not heard
+ *     (QL-20); a finding the bond refuses at delivery forfeits the
+ *     asserter's deposit as a failed assertion's.
+ *   - A recovery divides a realised escrow between the bond's subrogation
+ *     and the positions: `V` = the escrow's residual P_rem, the most of the
+ *     bond's subrogation a false realisation moves either way (audit
+ *     2026-10-03, OC-COURT-05; it was heard at V = 0 with no bound). One
+ *     fact at one successor slot, it is not sliced: above the bound on the
+ *     seat in force it is heard at the seat whose bound covers it.
+ *   - A loss is heard only on positions the registry knows and where the
+ *     loss, capped at K, is at least `base_orig` in origin units (yellow
+ *     paper §5.1, `FINDINGS.DEPOSIT_BASE_ORIG`); an asserter that is not the bound beneficiary
+ *     of every position it names posts the deposit of V_max and holds one
+ *     such loss open at a time (OC-COURT-02).
+ *
+ * THE CASE (whitepaper §6.2, §6.6; yellow paper §4.5)
+ * ---------------------------------------------------
+ * Any account asserts against a deposit
+ * `D_1 = max(ceil(base_orig * refPrice_a), ceil(V / 100), 7 * JUROR_FEE)`
+ * (yellow paper §5.1), the price read once at the assertion; a bond above it
+ * is admitted and the excess owed to the payer (technical reference §1.8); any
+ * account challenges against the same; an unchallenged assertion stands when
+ * its challenge window closes, without a jury. A challenged one is heard by
+ * seven jurors after the evidence window, fourteen on the loser's appeal
+ * (2 D_1), and on the escalation of the appeal's loser (4 D_1) veARK decides
+ * in ArkGovernor whether to uphold or to order a retrial before twenty-eight,
+ * drawn excluding both earlier panels; the retrial is final. Every seat is
+ * judged at the end against the FINAL verdict: a vote with it is coherent and
+ * paid a juror fee, a vote against it or no vote is slashed — so the majority
+ * of a round the appeal overturns forfeits its stake, which is the stake the
+ * bound rests on. The losing side's deposits pay the fees first and the fee
+ * pool the balance (it pays what it holds); what the loser's deposits leave
+ * goes to the winner where the assertion stood, and is forfeited where it
+ * failed — into the fee pool, which pays the coherent seats of later cases
+ * (audit 2026-10-03, OC-COURT-07): no path carries QRL to the origin-chain
+ * buffer the papers name, and held apart as `bufferForfeits` it had no exit.
+ *
+ * RANDOMNESS (yellow paper §4.1: "the block randomness value combined with a
+ * seed committed before the case opened"; audit 2026-09-29, QL-18)
+ * ------------------------------------------------------------------------
+ * The seed is fixed at the assertion from the court's running entropy and the
+ * previous block's hash. A draw is ARMED (anyone, once the round is due; the
+ * appeal and the retrial arm their round at once) at block N for a target
+ * block `N + DRAW_LOOKAHEAD` (8), `Round.drawBlock`, and the pool fixes the
+ * stake every juror is drawn on (`ArkJurorPool.arm`, QL-01). The panel is
+ * `keccak256(seed, round, blockhash(drawBlock))` and nothing else, so it is
+ * the same whichever block in `(drawBlock, drawBlock + 256]` takes it, and
+ * anyone may take it: the drawer gains nothing by choosing when to call, or
+ * whether to. No party sees the randomness when it arms: the target block
+ * does not exist yet, and eight blocks ahead no value an armer can read
+ * (not even a block's `prevrandao`, known one block early) decides it —
+ * arming a block later only moves the target to another unbuilt block. It
+ * used to be taken in the draw block only, with that block's `prevrandao`,
+ * so whoever saw the randomness first could abstain and re-arm for a fresh
+ * sample (C-3); a `prevrandao` stored at the arm (a revision of 2026-09-30)
+ * was known to the armer before it armed (PV-06). A round is armed again
+ * only once the window has passed with no draw, when the target's hash is
+ * no longer readable. Residual: the proposer of the target block, fixed
+ * eight blocks in advance, can grind its hash through its contents, and an
+ * armer that proposes blocks can arm eight before its own slot (audit
+ * 2026-10-03, OC-COURT-04, open): the fixes proposed, a commit-reveal of
+ * seeds by both parties with a no-reveal penalty or a draw from the next
+ * block's RANDAO, need more than this contract's v3 room or a RANDAO reveal
+ * on Zond confirmed deterministic, and every devnet validator is the
+ * team's. A round
+ * re-armed after its window has lapsed counts toward `MAX_DRAW_LAPSES`.
+ * `block.timestamp` enters nothing. veARK is checkpointed when a draw is
+ * armed and read at that block.
+ *
+ * CAPACITY AND THE UNDRAWABLE PANEL (QL-19)
+ * ----------------------------------------
+ * Each open case reserves the seats of its first round, seven of its seat
+ * (`FIRST_PANEL`), against the pool's stake from its assertion: a case
+ * asserted beyond that waits (audit 2026-09-30, PV-01). An appeal's and a
+ * retrial's seats are reserved by nothing: they are drawn from the free stake
+ * when that round is armed. A round-one panel the pool cannot seat rejects
+ * the assertion and returns every deposit (`lapseDraw`); a later round that
+ * cannot be seated leaves the previous round's verdict standing (QL-19).
+ *
+ * G8: κ, the slash, the windows, the seat and D_1 are fixed at the opening.
+ * G13: every seat's stake is held by the pool from its draw until `finalize`.
+ *
+ * No owner, no setter; every dependency is a constructor immutable.
+ */
+contract ArkStakeCourt is IArkStakeCourt, ReentrancyGuard {
+    uint256 private constant BPS = 10_000;
+
+    /// The unit the five windows are counted in: one day, scaled by a build profile like every duration.
+    uint256 public constant COURT_DAY = 1 days;
+
+    /// The first panel; each later round doubles it (yellow paper §4.5: 7, 14, 28).
+    uint256 public constant FIRST_PANEL = 7;
+
+    /// Blocks between arming a draw and the target block whose hash draws it (QL-18, PV-06).
+    uint256 public constant DRAW_LOOKAHEAD = 8;
+
+    /// Blocks after the draw block in which the panel is drawable; re-armed only after (QL-18).
+    uint256 public constant BLOCKHASH_REACH = 256;
+
+    /**
+     * After the escalation, the longest the case waits for the governor
+     * before anyone may close it on the appeal verdict — the outcome a vote
+     * that never happens would produce. Two days to open the five-day vote,
+     * with margin; a liveness guard, not in the papers (reported).
+     */
+    uint256 public constant ESCALATION_LAPSE = 14 days;
+
+    /**
+     * The draw window of a round (phase C3b; court question w): one epoch,
+     * because stake joins the draw at the next epoch boundary (`ArkJurorPool`),
+     * so a panel the pool could not seat can be drawn no sooner than that.
+     * Inside it a lapsed draw block is re-armed freely (the censorship device
+     * above); a re-arm once it has lapsed opens the next and counts one lapse.
+     */
+    uint256 public constant DRAW_WINDOW = ArkEpoch.EPOCH_LENGTH;
+
+    /**
+     * Lapsed draw windows after which a case whose panel cannot be drawn is
+     * resolved against the assertion (`lapseDraw`); equally, this many draw
+     * windows since the round was first armed. A reference value, not in the
+     * papers (reported).
+     */
+    uint256 public constant MAX_DRAW_LAPSES = 4;
+
+    IArkJurorPool public immutable POOL;
+    IArkCatBondCourtSide public immutable BOND;
+    IArkStakeParams public immutable PARAMS;
+    /// The findings module this court created: V and the seat by kind, and their delivery to the bond.
+    ArkCourtFindings public immutable FINDINGS;
+    /// contracts/core's ArkGovernor: the one caller of `resolveEscalation`.
+    address public immutable GOVERNOR;
+    /// The fee of one coherent seat, in QRL (technical reference §3.4); seven are the least first deposit.
+    uint256 public immutable JUROR_FEE;
+    /// The pool's minimum juror stake, read once.
+    uint256 public immutable MIN_STAKE;
+
+    mapping(bytes32 => Case) private _cases;
+    mapping(bytes32 => mapping(uint8 => Round)) private _rounds;
+    mapping(bytes32 => mapping(address => Vote)) private _votes;
+    // Private behind an explicit view: hypc's QRVM auto-getter cleans a
+    // mapping key as uint256 before hashing, so a 64-byte address or a
+    // left-aligned bytes32 key reads another slot (OC-V3-02).
+    mapping(address => uint256) private _owed;
+
+    uint256 public feePool;
+    uint256 public openCases;
+    /// The first round's seven seats of every open case, in ARK: what the pool must hold (QL-19, PV-01).
+    uint256 public openSeatStake;
+    /// One open case at a time per single-fact kind (censorship, severity), bit `1 << kind` (QL-23).
+    uint256 private _singleOpen;
+    /// The value slices of a group still open (whitepaper §6.2, EC-04): its kind's slot is freed at the last.
+    mapping(bytes32 => uint256) private _groupLeft;
+    /// Cases ever opened, and each by its opening order (one-based), so a reader can walk them.
+    uint256 public caseCount;
+    mapping(uint256 => bytes32) public caseAt;
+    bytes32 private _entropy;
+    /// The one open loss of each asserter that is not the bound beneficiary of a position it names (OC-COURT-02).
+    mapping(address => bytes32) private _outsiderLoss;
+
+    /**
+     * @param pool_ The juror pool, whose court this is (`ArkJurorPool.setCourt`).
+     * @param bond_ The bond, whose court this is (`ArkCatBond.setCourt`).
+     * @param registry_ The registry: the settlement series and the valuation oracle.
+     * @param params_ The parameter set: κ, the slash, the windows, D_0.
+     * @param ark_ The ARK token the pool bonds (the key of its reference price).
+     * @param governor_ contracts/core's ArkGovernor; the deployer on the harness.
+     * @param depositBaseOrig_ `base_orig`, the deposit base in origin base units (yellow paper §5.1), above zero.
+     * @param jurorFee_ The fee of one coherent seat, in QRL.
+     */
+    constructor(
+        address pool_,
+        address bond_,
+        address registry_,
+        address params_,
+        address ark_,
+        address governor_,
+        uint256 depositBaseOrig_,
+        uint256 jurorFee_
+    ) {
+        if (
+            pool_ == address(0) || bond_ == address(0) || registry_ == address(0) || params_ == address(0)
+                || ark_ == address(0) || governor_ == address(0) || depositBaseOrig_ == 0
+        ) revert BadPayload();
+        POOL = IArkJurorPool(pool_);
+        BOND = IArkCatBondCourtSide(bond_);
+        PARAMS = IArkStakeParams(params_);
+        GOVERNOR = governor_;
+        JUROR_FEE = jurorFee_;
+        uint256 minStake = IArkJurorPool(pool_).MIN_STAKE();
+        MIN_STAKE = minStake;
+        FINDINGS = new ArkCourtFindings(
+            bond_, registry_, params_, ark_, minStake, pool_, depositBaseOrig_, FIRST_PANEL * jurorFee_
+        );
+    }
+
+    receive() external payable {
+        feePool += msg.value;
+        emit FeePoolFunded(msg.sender, msg.value);
+    }
+
+    /// @inheritdoc IArkStakeCourt
+    function fundFeePool() external payable {
+        feePool += msg.value;
+        emit FeePoolFunded(msg.sender, msg.value);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The assertion                                                       */
+    /* ------------------------------------------------------------------ */
+
+    /// @inheritdoc IArkStakeCourt
+    function assertFinding(uint8 kind, bytes calldata payload, bytes32 evidence)
+        external
+        payable
+        nonReentrant
+        returns (bytes32 caseId)
+    {
+        uint256 n = ++caseCount;
+        caseId = keccak256(abi.encode(address(this), msg.sender, kind, keccak256(payload), n));
+        Opening memory o = _admit(kind, payload, caseId);
+
+        // A loss and the censorship ground suspend issuance and hold maturities
+        // from the assertion (yellow paper §1.4 `assertLoss`); the bond keeps
+        // the clock of the hold, so it is told now, not at the verdict.
+        if (kind == uint8(Kind.Loss) || kind == uint8(Kind.Censorship)) BOND.openDetermination(caseId);
+        // A single fact above the bound on the seat (whitepaper §6.2, EC-04):
+        // `slices` cases at the seat, each at V / n and its own deposit and
+        // panel, the i-th `keccak256(abi.encode(caseId, uint8(i)))`, the
+        // group `caseId` on the bond. Rounds up, against the asserter. A
+        // finding inside the bound is the one case `caseId`.
+        uint256 slices = o.slices;
+        if (slices > 1) {
+            BOND.openSlices(caseId, kind, uint8(slices));
+            _groupLeft[caseId] = slices;
+            o.value = (o.value + slices - 1) / slices;
+        }
+        for (uint256 i = 0; i < slices; i++) {
+            bytes32 id = slices == 1 ? caseId : keccak256(abi.encode(caseId, uint8(i)));
+            caseAt[i == 0 ? n : ++caseCount] = id;
+            Case storage c = _open(id, kind, payload, evidence, o);
+            if (slices > 1) {
+                c.group = caseId;
+                c.sliceIndex = uint8(i);
+                c.slices = uint8(slices);
+            }
+        }
+    }
+
+    /// What an assertion is opened at: V, the seat, each case's deposit and the value slices.
+    struct Opening {
+        uint256 value;
+        uint256 seat;
+        uint256 deposit;
+        uint256 slices;
+    }
+
+    /**
+     * The assertion's terms and the refusals it meets before any case opens:
+     * the deposits, a finding that moves nothing, a single fact already
+     * before the court, and the pool's capacity.
+     */
+    function _admit(uint8 kind, bytes calldata payload, bytes32 caseId) private returns (Opening memory o) {
+        bool outsider;
+        (o.value,, o.seat, o.deposit, o.slices, outsider) = FINDINGS.quoteFor(kind, payload, msg.sender);
+        // A bond above the deposits is admitted and the excess owed to the
+        // payer (technical reference §1.8): D_1 follows the thirty-day series,
+        // so a quote one block old may sit below it.
+        uint256 bond = o.deposit * o.slices;
+        if (msg.value < bond) revert IncorrectBond(bond, msg.value);
+        _owed[msg.sender] += msg.value - bond;
+        // One open loss per asserter that is not the bound beneficiary of a
+        // position it names (OC-COURT-02): overlapping losses kept the bond's
+        // determination open indefinitely. A loss is never sliced.
+        if (outsider) {
+            if (_outsiderLoss[msg.sender] != bytes32(0)) revert FindingPending(kind);
+            _outsiderLoss[msg.sender] = caseId;
+        }
+        // A finding that moves nothing is not heard (QL-20): it would hold the
+        // capacity and the bond's determination for its base deposit. A
+        // recovery on an escrow with no residual yet is valued at zero.
+        if (o.value == 0 && kind != uint8(Kind.Recovery)) revert NothingToMove();
+        // One case at a time on a single fact (QL-23): the first finding fixes
+        // it, and its slices hold the kind until the last of them closes.
+        if (kind == uint8(Kind.Censorship) || kind == uint8(Kind.Severity)) {
+            if (_singleOpen & (1 << kind) != 0) revert FindingPending(kind);
+            _singleOpen |= 1 << kind;
+        }
+        // Determinations heard at once are capped by the pool (whitepaper §6.2,
+        // yellow paper §4.1): each open case — each value slice is one —
+        // reserves its first round's seven seats of its own seat (QL-19,
+        // PV-01); a claim beyond it waits for a case to close rather than
+        // being heard cheap.
+        uint256 need = openSeatStake + o.slices * FIRST_PANEL * o.seat;
+        uint256 pool = POOL.poolStake();
+        if (need > pool) revert PoolAtCapacity(need, pool);
+        openSeatStake = need;
+        openCases += o.slices;
+    }
+
+    /// One case, heard whole or as a value slice, from its assertion: its terms, seed and deposit.
+    function _open(bytes32 caseId, uint8 kind, bytes calldata payload, bytes32 evidence, Opening memory o)
+        private
+        returns (Case storage c)
+    {
+        c = _cases[caseId];
+        _fixTerms(c);
+        bytes32 seed = keccak256(abi.encode(_entropy, caseId, blockhash(block.number - 1)));
+        _entropy = seed;
+        c.asserter = msg.sender;
+        c.kind = kind;
+        c.stage = uint8(Stage.Challenge);
+        c.openedAt = uint64(block.timestamp);
+        c.payloadHash = keccak256(payload);
+        c.seed = seed;
+        c.value = uint128(o.value);
+        c.seat = uint128(o.seat);
+        c.deposit = uint128(o.deposit);
+        c.posted[0] = uint128(o.deposit);
+        emit AssertionOpened(caseId, kind, msg.sender, payload, evidence, o.value, o.seat, o.deposit);
+    }
+
+    /// @inheritdoc IArkStakeCourt
+    function challenge(bytes32 caseId) external payable {
+        Case storage c = _case(caseId);
+        if (c.stage != uint8(Stage.Challenge) || c.challenger != address(0)) revert InvalidCaseState(caseId, c.stage);
+        uint256 closes = _challengeEnd(c);
+        if (block.timestamp >= closes) revert WindowClosed(caseId, closes);
+        if (msg.value != c.deposit) revert IncorrectBond(c.deposit, msg.value);
+        c.challenger = msg.sender;
+        c.posted[1] = uint128(msg.value);
+        emit Challenged(caseId, msg.sender, msg.value);
+    }
+
+    /// @inheritdoc IArkStakeCourt
+    function submitEvidence(bytes32 caseId, bytes32 evidence) external {
+        Case storage c = _case(caseId);
+        uint256 closes = _challengeEnd(c) + uint256(c.evidenceDays) * COURT_DAY;
+        if (block.timestamp >= closes) revert WindowClosed(caseId, closes);
+        emit EvidenceSubmitted(caseId, msg.sender, evidence);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The draw and the vote                                               */
+    /* ------------------------------------------------------------------ */
+
+    /// @inheritdoc IArkStakeCourt
+    function armDraw(bytes32 caseId) external {
+        Case storage c = _case(caseId);
+        if (c.stage == uint8(Stage.Challenge) && c.challenger != address(0)) {
+            uint256 opens = _challengeEnd(c) + uint256(c.evidenceDays) * COURT_DAY;
+            if (block.timestamp < opens) revert WindowOpen(caseId, opens);
+            c.stage = uint8(Stage.Rounds);
+            c.round = 1;
+        } else if (c.stage != uint8(Stage.Rounds)) {
+            revert InvalidCaseState(caseId, c.stage);
+        }
+        Round storage r = _rounds[caseId][c.round];
+        // Drawn already, or armed and still drawable: re-armed only once the
+        // draw block's hash has left reach with no draw (QL-18).
+        if (r.commitEnd != 0 || (r.drawBlock != 0 && block.number <= uint256(r.drawBlock) + BLOCKHASH_REACH)) {
+            revert InvalidCaseState(caseId, c.stage);
+        }
+        _arm(caseId, c.round);
+    }
+
+    /// @inheritdoc IArkStakeCourt
+    function drawPanel(bytes32 caseId) external nonReentrant {
+        Case storage c = _case(caseId);
+        uint8 n = c.round;
+        Round storage r = _rounds[caseId][n];
+        if (c.stage != uint8(Stage.Rounds) || r.commitEnd != 0 || r.drawBlock == 0) revert InvalidCaseState(caseId, c.stage);
+        uint256 d = r.drawBlock;
+        if (block.number <= d || block.number > d + BLOCKHASH_REACH) revert NotDrawBlock(d, block.number);
+        uint256 size = FIRST_PANEL << (n - 1);
+        // The seed and the target block's hash alone (QL-18, PV-06): the same
+        // panel at any block of the window, on the pool as it stood at the arm
+        // (QL-01), and unknown to whoever armed it.
+        bytes32 rand = keccak256(abi.encode(c.seed, n, blockhash(d)));
+        if (POOL.drawPanel(caseId, n, size, r.seat, r.armBlock, rand).length == 0) {
+            // Too few jurors at the arm: the arm is spent; armed again once the window passes.
+            emit PanelUnseatable(caseId, n);
+            return;
+        }
+        _entropy = keccak256(abi.encode(_entropy, rand));
+        uint256 commitEnd = block.timestamp + uint256(c.commitDays) * COURT_DAY;
+        uint256 revealEnd = commitEnd + uint256(c.revealDays) * COURT_DAY;
+        r.commitEnd = uint64(commitEnd);
+        r.revealEnd = uint64(revealEnd);
+        // The retrial is final: no window after its reveal.
+        r.appealEnd = uint64(n == 3 ? revealEnd : revealEnd + uint256(c.appealDays) * COURT_DAY);
+        emit JuryDrawn(caseId, n, uint16(size), rand);
+    }
+
+    /**
+     * @inheritdoc IArkStakeCourt
+     * @dev The first round (court question w, phase C3b): a panel the pool
+     *      cannot seat leaves the case where no jury has decided it, and the
+     *      burden is the asserter's, so the assertion fails; since no jury
+     *      found it false, nothing is forfeited — each side's deposits return
+     *      and no fee is paid. The bond's determination is closed.
+     *
+     *      A later round (audit 2026-09-29, QL-19): the verdict of the round
+     *      before it stands, as though the appeal or the retrial had not been
+     *      sought — the case is decided on it and closed by `finalize`, which
+     *      delivers a standing finding, judges every seat of the rounds held
+     *      against it and forfeits the appellant's deposits as a loser's. A
+     *      round-one loser can no longer turn a lost verdict into a rejection
+     *      by appealing into a panel the pool cannot seat (C-4).
+     */
+    function lapseDraw(bytes32 caseId) external nonReentrant {
+        Case storage c = _case(caseId);
+        uint8 n = c.round;
+        Round storage r = _rounds[caseId][n];
+        if (c.stage == uint8(Stage.Challenge) && c.challenger != address(0)) {
+            // Challenged and never armed (audit 2026-10-03, OC-COURT-08): it
+            // held the capacity and the bond's determination until someone
+            // armed it. It lapses as a first round would, four draw windows
+            // after its evidence window closed; `n` is zero, no round was held.
+            uint256 due = _challengeEnd(c) + uint256(c.evidenceDays) * COURT_DAY + MAX_DRAW_LAPSES * DRAW_WINDOW;
+            if (block.timestamp < due) revert WindowOpen(caseId, due);
+        } else {
+            if (c.stage != uint8(Stage.Rounds) || r.commitEnd != 0 || r.armedAt == 0) revert InvalidCaseState(caseId, c.stage);
+            // Not while this round's draw is armed and drawable (re-audit
+            // 2026-09-30, COURT-07): a round re-armed near the deadline is drawn,
+            // not lapsed under it.
+            uint256 reach = uint256(r.drawBlock) + BLOCKHASH_REACH;
+            if (r.drawBlock != 0 && block.number <= reach) revert WindowOpen(caseId, reach);
+            uint256 lapse = uint256(r.armedAt) + MAX_DRAW_LAPSES * DRAW_WINDOW;
+            if (r.lapses < MAX_DRAW_LAPSES && block.timestamp < lapse) revert WindowOpen(caseId, lapse);
+        }
+        emit DrawLapsed(caseId, n, r.lapses);
+        if (n > 1) {
+            c.round = n - 1;
+            c.stage = uint8(Stage.Decided);
+            c.outcome = _rounds[caseId][n - 1].verdict;
+            return;
+        }
+        c.stage = uint8(Stage.Final);
+        c.outcome = uint8(Verdict.Reject);
+        // A value slice's rejection settles its fraction too (whitepaper §6.2).
+        if (c.slices != 0) _deliver(caseId, c, false, "");
+        _end(caseId, c);
+        // No seat was drawn on the case: nothing to release in the pool.
+        _owed[c.asserter] += c.posted[0];
+        _owed[c.challenger] += c.posted[1];
+        emit CaseFinal(caseId, uint8(Verdict.Reject), 0, 0, 0);
+    }
+
+    /// @inheritdoc IArkStakeCourt
+    function commitVote(bytes32 caseId, bytes32 commitment) external {
+        Case storage c = _case(caseId);
+        Round storage r = _rounds[caseId][c.round];
+        if (c.stage != uint8(Stage.Rounds) || r.commitEnd == 0 || block.timestamp >= r.commitEnd) {
+            revert WindowClosed(caseId, r.commitEnd);
+        }
+        if (POOL.seatRound(caseId, msg.sender) != c.round) revert NotADrawnJuror(caseId, msg.sender);
+        _votes[caseId][msg.sender].commitment = commitment;
+        emit VoteCommitted(caseId, msg.sender, commitment);
+    }
+
+    /**
+     * @inheritdoc IArkStakeCourt
+     * @dev The commitment binds the case and the round, so a commitment of one
+     *      round is no reveal in another, and the juror, so two jurors with
+     *      one vote and one salt commit differently. A juror sits once per
+     *      case, and reveals only in the round it was seated on (QL-02): a
+     *      juror of round one used to commit a round-two commitment, skip its
+     *      own reveal and be counted, coherent, in the appeal's tally (C-2).
+     */
+    function revealVote(bytes32 caseId, uint8 vote, bytes32 salt) external {
+        Case storage c = _case(caseId);
+        uint8 n = c.round;
+        Round storage r = _rounds[caseId][n];
+        if (r.commitEnd == 0 || block.timestamp < r.commitEnd) revert WindowOpen(caseId, r.commitEnd);
+        if (c.stage != uint8(Stage.Rounds) || block.timestamp >= r.revealEnd) revert WindowClosed(caseId, r.revealEnd);
+        if (POOL.seatRound(caseId, msg.sender) != n) revert NotADrawnJuror(caseId, msg.sender);
+        Vote storage v = _votes[caseId][msg.sender];
+        if (
+            v.vote != 0 || v.commitment == bytes32(0) || (vote != uint8(Verdict.Uphold) && vote != uint8(Verdict.Reject))
+                || voteCommitment(caseId, n, vote, salt, msg.sender) != v.commitment
+        ) revert RevealMismatch(caseId, msg.sender);
+        v.vote = vote;
+        if (vote == uint8(Verdict.Uphold)) r.upholds += 1;
+        else r.rejects += 1;
+        emit VoteRevealed(caseId, msg.sender, vote);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Appeal and escalation. Whitepaper §6.2, §6.6; yellow paper §4.5      */
+    /* ------------------------------------------------------------------ */
+
+    /// @inheritdoc IArkStakeCourt
+    function appeal(bytes32 caseId) external payable {
+        Case storage c = _case(caseId);
+        if (c.stage != uint8(Stage.Rounds) || c.round != 1) revert InvalidCaseState(caseId, c.stage);
+        _postAgainst(caseId, c, 2);
+        c.round = 2;
+        _armOrDue(caseId, 2);
+        emit Appealed(caseId, 2, msg.value);
+    }
+
+    /// @inheritdoc IArkStakeCourt
+    function escalateToGovernance(bytes32 caseId) external payable {
+        Case storage c = _case(caseId);
+        if (c.stage != uint8(Stage.Rounds) || c.round != 2) revert InvalidCaseState(caseId, c.stage);
+        _postAgainst(caseId, c, 4);
+        c.stage = uint8(Stage.Escalated);
+        c.escalatedAt = uint64(block.timestamp);
+        emit EscalatedToGovernance(caseId, msg.sender, msg.value);
+    }
+
+    /// @inheritdoc IArkCourtEscalation
+    function escalationPending(bytes32 caseId) external view returns (bool) {
+        return _cases[caseId].stage == uint8(Stage.Escalated);
+    }
+
+    /// @inheritdoc IArkCourtEscalation
+    function escalationLapsesAt(bytes32 caseId) external view returns (uint256) {
+        Case storage c = _cases[caseId];
+        return c.stage == uint8(Stage.Escalated) ? uint256(c.escalatedAt) + ESCALATION_LAPSE : 0;
+    }
+
+    function owed(address who) external view returns (uint256) {
+        return _owed[who];
+    }
+
+    /**
+     * @inheritdoc IArkCourtEscalation
+     * @dev Uphold fixes the appeal verdict; a retrial arms a panel of
+     *      twenty-eight at once, drawn excluding every juror of both earlier
+     *      panels (the pool seats nobody twice on a case), and is final.
+     *      Accepted until the case is closed, the lapse included: a vote the
+     *      governor completes late is still the vote.
+     */
+    function resolveEscalation(bytes32 caseId, bool retrial) external {
+        if (msg.sender != GOVERNOR) revert OnlyGovernor(msg.sender);
+        Case storage c = _cases[caseId];
+        if (c.stage != uint8(Stage.Escalated)) {
+            // Closed at its lapse before the vote ended (audit 2026-10-03,
+            // OC-COURT-03): a no-op, so the governor's proposal resolves
+            // instead of reverting `NotEscalated` for good and staying live.
+            if (c.escalatedAt != 0) return;
+            revert NotEscalated(caseId);
+        }
+        if (retrial) {
+            c.stage = uint8(Stage.Rounds);
+            c.round = 3;
+            _armOrDue(caseId, 3);
+        } else {
+            c.stage = uint8(Stage.Decided);
+            c.outcome = _rounds[caseId][2].verdict;
+        }
+        emit EscalationResolved(caseId, retrial);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The end of a case                                                   */
+    /* ------------------------------------------------------------------ */
+
+    /// @inheritdoc IArkStakeCourt
+    function finalize(bytes32 caseId, bytes calldata payload) external nonReentrant {
+        Case storage c = _case(caseId);
+        uint8 st = c.stage;
+        uint8 outcome;
+        if (st == uint8(Stage.Challenge)) {
+            if (c.challenger != address(0)) revert InvalidCaseState(caseId, st);
+            uint256 closes = _challengeEnd(c);
+            if (block.timestamp < closes) revert WindowOpen(caseId, closes);
+            // Unchallenged: the assertion stands without a jury.
+            outcome = uint8(Verdict.Uphold);
+        } else if (st == uint8(Stage.Rounds)) {
+            Round storage r = _rounds[caseId][c.round];
+            if (r.commitEnd == 0) revert InvalidCaseState(caseId, st);
+            if (block.timestamp < r.appealEnd) revert WindowOpen(caseId, r.appealEnd);
+            outcome = _tally(caseId, c.round);
+        } else if (st == uint8(Stage.Escalated)) {
+            uint256 lapse = uint256(c.escalatedAt) + ESCALATION_LAPSE;
+            if (block.timestamp < lapse) revert WindowOpen(caseId, lapse);
+            outcome = _rounds[caseId][2].verdict;
+        } else if (st == uint8(Stage.Decided)) {
+            outcome = c.outcome;
+        } else {
+            revert InvalidCaseState(caseId, st);
+        }
+        c.stage = uint8(Stage.Final);
+        c.outcome = outcome;
+
+        bool refused;
+        bool upheld = outcome == uint8(Verdict.Uphold);
+        if (upheld && keccak256(payload) != c.payloadHash) revert BadPayload();
+        // An upheld finding reaches the bond; so does a value slice's
+        // rejection, since a rejected slice settles its fraction too
+        // (whitepaper §6.2, EC-04). The payload is read only where upheld.
+        // Refused by the bond's own record: the finding moved nothing, and
+        // the asserter's deposits are forfeited as a failed assertion's (QL-20).
+        if (upheld || c.slices != 0) refused = _deliver(caseId, c, upheld, payload);
+        _end(caseId, c);
+        _settle(caseId, c, outcome, refused);
+    }
+
+    /// A verdict to the bond through the findings module (`ArkCourtFindings.deliver`); true where the bond refused it.
+    function _deliver(bytes32 caseId, Case storage c, bool upheld, bytes memory payload) private returns (bool) {
+        (bool ok, bytes memory ret) = address(FINDINGS).delegatecall(
+            abi.encodeCall(
+                ArkCourtFindings.deliver,
+                // V as admitted and bounded at the assertion (OC-COURT-01): the bond draws no more.
+                (caseId, c.kind, c.group, c.sliceIndex, c.slices != 0, upheld, payload, uint256(c.value))
+            )
+        );
+        if (!ok) revert FindingNotDelivered(ret);
+        return !abi.decode(ret, (bool));
+    }
+
+    /// @inheritdoc IArkStakeCourt
+    function claim() external nonReentrant {
+        uint256 amount = _owed[msg.sender];
+        if (amount == 0) revert NothingOwed(msg.sender);
+        _owed[msg.sender] = 0;
+        (bool ok,) = msg.sender.call{value: amount}("");
+        if (!ok) revert TransferFailed();
+        emit Claimed(msg.sender, amount);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Views                                                               */
+    /* ------------------------------------------------------------------ */
+
+    function caseOf(bytes32 caseId) external view returns (Case memory) {
+        return _cases[caseId];
+    }
+
+    function roundOf(bytes32 caseId, uint8 round) external view returns (Round memory) {
+        return _rounds[caseId][round];
+    }
+
+    function voteOf(bytes32 caseId, address juror) external view returns (Vote memory) {
+        return _votes[caseId][juror];
+    }
+
+    function isDrawnJuror(bytes32 caseId, address juror) external view returns (bool) {
+        uint8 n = _cases[caseId].round;
+        return n != 0 && POOL.seatRound(caseId, juror) == n;
+    }
+
+    function voteCommitment(bytes32 caseId, uint8 round, uint8 vote, bytes32 salt, address juror)
+        public
+        pure
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(caseId, round, vote, salt, juror));
+    }
+
+    /*
+     * What an assertion of `kind` with `payload` would be opened at — V in QRL
+     * and in ARK, the seat, each case's deposit, the value slices — or the
+     * refusal it would meet, is `FINDINGS.quote(kind, payload)`, and the
+     * concurrency cap `FINDINGS.concurrencyCap()`: moved there on 2026-09-30
+     * with the deposit, to pay for the value slices in this contract's v3 room.
+     */
+
+    /* ------------------------------------------------------------------ */
+    /* Internals                                                           */
+    /* ------------------------------------------------------------------ */
+
+    function _case(bytes32 caseId) private view returns (Case storage c) {
+        c = _cases[caseId];
+        if (c.stage == uint8(Stage.None)) revert InvalidCaseState(caseId, 0);
+    }
+
+    /// κ, the slash and the five windows in force, fixed for the case (G8).
+    function _fixTerms(Case storage c) private {
+        (uint16 cover, uint16 slash, uint16 ch, uint16 ev, uint16 co, uint16 re, uint16 ap) = PARAMS.courtParams();
+        c.coverBps = cover;
+        c.slashBps = slash;
+        c.challengeDays = ch;
+        c.evidenceDays = ev;
+        c.commitDays = co;
+        c.revealDays = re;
+        c.appealDays = ap;
+    }
+
+    function _challengeEnd(Case storage c) private view returns (uint256) {
+        return uint256(c.openedAt) + uint256(c.challengeDays) * COURT_DAY;
+    }
+
+    /**
+     * An appeal's or a retrial's round, due now: armed at once where the pool
+     * has no draw armed, else by `armDraw` once it has — and its lapse clock
+     * runs from now either way (re-audit 2026-09-30, COURT-07), so a round
+     * the pool was too busy to arm can still lapse.
+     */
+    function _armOrDue(bytes32 caseId, uint8 n) private {
+        if (block.number > POOL.armedUntil()) {
+            _arm(caseId, n);
+        } else {
+            Round storage r = _rounds[caseId][n];
+            r.armedAt = uint64(block.timestamp);
+            r.windowOpens = uint64(block.timestamp);
+        }
+    }
+
+    function _arm(bytes32 caseId, uint8 n) private {
+        Round storage r = _rounds[caseId][n];
+        if (r.armedAt == 0) {
+            r.armedAt = uint64(block.timestamp);
+            r.windowOpens = uint64(block.timestamp);
+        } else if (block.timestamp >= uint256(r.windowOpens) + DRAW_WINDOW) {
+            // The window lapsed without a panel: this re-arm is a failed draw, and opens the next.
+            r.lapses += 1;
+            r.windowOpens = uint64(block.timestamp);
+        }
+        // The case's seat, fixed at its assertion as the indexed seat then,
+        // max(floor, V_max / 8) (whitepaper §6.4, PV-07; re-audit
+        // 2026-09-30, COURT-01): every round and every re-arm draws at it.
+        // Re-indexed at each arm, it moved with the ARK price or one anchor
+        // between two rounds, and the pool, which pins one seat per case,
+        // refused every appeal and retrial draw (`SeatMismatch`), so a bought
+        // first verdict stood. It is also the seat the capacity reserved
+        // (COURT-05).
+        r.seat = _cases[caseId].seat;
+        uint256 drawBlock = block.number + DRAW_LOOKAHEAD;
+        // The pool fixes the stake it will draw on now, and arms nothing else
+        // until this draw is taken or its window passes (QL-01).
+        r.armBlock = uint64(POOL.arm(drawBlock + BLOCKHASH_REACH));
+        r.drawBlock = uint64(drawBlock);
+        emit DrawArmed(caseId, n, drawBlock);
+    }
+
+    /**
+     * A case leaves the capacity it held and, on a single fact, its kind's one
+     * slot — a value slice only with the last of its group, which also closes
+     * the bond's determination the group opened (whitepaper §6.2, EC-04).
+     */
+    function _end(bytes32 caseId, Case storage c) private {
+        if (_outsiderLoss[c.asserter] == caseId) delete _outsiderLoss[c.asserter];
+        openCases -= 1;
+        openSeatStake -= FIRST_PANEL * uint256(c.seat);
+        if (c.slices != 0) {
+            if (--_groupLeft[c.group] != 0) return;
+            caseId = c.group;
+        }
+        _singleOpen &= ~(uint256(1) << c.kind);
+        _closeDetermination(caseId, c.kind);
+    }
+
+    /**
+     * Close the bond's determination of a loss or the censorship ground: the
+     * court opened it, so the bond has no reason to refuse, and any revert —
+     * the bond's guard held by a payout re-entering here, an epoch gap
+     * `closeEpochs` must close first, a call starved of gas — reverts the
+     * whole close, which is retried (QL-22; re-audit 2026-09-30, COURT-02).
+     * Swallowed, it left the determination open and issuance suspended for good.
+     */
+    function _closeDetermination(bytes32 caseId, uint8 kind) private {
+        if (kind == uint8(Kind.Loss) || kind == uint8(Kind.Censorship)) BOND.closeDetermination(caseId);
+    }
+
+    function _tally(bytes32 caseId, uint8 n) private returns (uint8 verdict) {
+        Round storage r = _rounds[caseId][n];
+        verdict = r.verdict;
+        if (verdict != 0) return verdict;
+        if (r.commitEnd == 0 || block.timestamp < r.revealEnd) revert WindowOpen(caseId, r.revealEnd);
+        // A majority of the votes revealed; a tie, none revealed included,
+        // does not establish the assertion — the asserter carries the burden.
+        verdict = r.upholds > r.rejects ? uint8(Verdict.Uphold) : uint8(Verdict.Reject);
+        r.verdict = verdict;
+        emit RoundDecided(caseId, n, verdict, r.upholds, r.rejects);
+    }
+
+    /// The loser of the round in progress posts `times` D_1 inside its window.
+    function _postAgainst(bytes32 caseId, Case storage c, uint256 times) private {
+        Round storage r = _rounds[caseId][c.round];
+        if (r.commitEnd == 0 || block.timestamp < r.revealEnd) revert WindowOpen(caseId, r.revealEnd);
+        if (block.timestamp >= r.appealEnd) revert WindowClosed(caseId, r.appealEnd);
+        uint8 verdict = _tally(caseId, c.round);
+        uint256 side = verdict == uint8(Verdict.Uphold) ? 1 : 0;
+        if (msg.sender != (side == 0 ? c.asserter : c.challenger)) revert NotTheLoser(caseId, msg.sender);
+        uint256 bond = uint256(c.deposit) * times;
+        if (msg.value != bond) revert IncorrectBond(bond, msg.value);
+        c.posted[side] += uint128(bond);
+    }
+
+    /**
+     * Deposits, fees and seats, against the final verdict. Every seat of every
+     * round is coherent where its revealed vote is the final verdict; the pool
+     * slashes the rest and releases every seat (G13). The losing side's
+     * deposits pay the coherent seats' fees first and the fee pool the
+     * balance, pro rata where it holds too little; what the losing deposits
+     * leave goes to the asserter where the assertion stood and to the fee
+     * pool where it failed (whitepaper §6.2 "Failed assertion"; OC-COURT-07).
+     */
+    function _settle(bytes32 caseId, Case storage c, uint8 outcome, bool refused) private {
+        if (c.challenger == address(0)) {
+            // A finding the bond refused forfeits its deposit (QL-20).
+            if (refused) feePool += c.posted[0];
+            else _owed[c.asserter] += c.posted[0];
+            emit CaseFinal(caseId, outcome, 0, 0, refused ? c.posted[0] : 0);
+            return;
+        }
+        (address[] memory who, bool[] memory ok, uint256 coherent) = _seats(caseId, c.round, outcome);
+        POOL.settle(caseId, who, ok, c.slashBps);
+
+        uint256 loserSide = outcome == uint8(Verdict.Uphold) ? 1 : 0;
+        (uint256 paid, uint256 fromPool, uint256 rest) = _payFees(who, ok, coherent, c.posted[loserSide]);
+        if (loserSide == 1) {
+            // The winner's return, forfeited where the bond refused the finding (QL-20).
+            if (refused) {
+                rest += c.posted[0];
+                feePool += rest;
+            } else {
+                _owed[c.asserter] += uint256(c.posted[0]) + rest;
+                rest = 0;
+            }
+        } else {
+            _owed[c.challenger] += c.posted[1];
+            feePool += rest;
+        }
+        emit CaseFinal(caseId, outcome, paid, fromPool, rest);
+    }
+
+    /**
+     * The coherent seats' fees, from the losing deposit `loser` first and the
+     * fee pool for the balance, pro rata where it holds too little. Returns
+     * what was paid, the pool's part, and what the losing deposit has left.
+     */
+    function _payFees(address[] memory who, bool[] memory ok, uint256 coherent, uint256 loser)
+        private
+        returns (uint256 paid, uint256 fromPool, uint256 rest)
+    {
+        uint256 fee = coherent * JUROR_FEE;
+        uint256 fromDeposit = fee < loser ? fee : loser;
+        fromPool = fee - fromDeposit;
+        if (fromPool > feePool) fromPool = feePool;
+        feePool -= fromPool;
+        paid = fromDeposit + fromPool;
+        // Truncates; the remainder returns to the fee pool.
+        uint256 each = coherent == 0 ? 0 : paid / coherent;
+        feePool += paid - each * coherent;
+        for (uint256 i = 0; i < who.length; i++) {
+            if (ok[i]) _owed[who[i]] += each;
+        }
+        rest = loser - fromDeposit;
+    }
+
+    /// Every seat of rounds 1 .. `rounds`, and whether its revealed vote is `outcome`.
+    function _seats(bytes32 caseId, uint8 rounds, uint8 outcome)
+        private
+        view
+        returns (address[] memory who, bool[] memory ok, uint256 coherent)
+    {
+        who = new address[]((FIRST_PANEL << rounds) - FIRST_PANEL);
+        ok = new bool[](who.length);
+        uint256 k;
+        for (uint8 n = 1; n <= rounds; n++) {
+            address[] memory panel = POOL.panelOf(caseId, n);
+            for (uint256 i = 0; i < panel.length; i++) {
+                who[k] = panel[i];
+                if (_votes[caseId][panel[i]].vote == outcome) {
+                    ok[k] = true;
+                    coherent += 1;
+                }
+                k++;
+            }
+        }
+    }
+}

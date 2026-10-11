@@ -1,0 +1,139 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./interfaces/IChunkedDeployer.hyp";
+
+/**
+ * Deploys creation code too large for one QRL transaction, from pieces that fit.
+ *
+ * See IChunkedDeployer for the rule this contract exists to enforce and for the
+ * one constraint it places on whatever it deploys.
+ *
+ * Two byte-identical copies exist, contracts/staking and contracts/core (core
+ * creates ArkGovernor through it); staking's test/ChunkedDeployer.test.js holds
+ * them equal. Edit both or neither.
+ *
+ * WHY ONE ACCOUNT, FIXED AT CONSTRUCTION (audit D19, 2026-09-29)
+ * --------------------------------------------------------------
+ * Every `deploy` is a CREATE from this contract, so it advances this contract's
+ * nonce, and the address of each contract it creates is a function of that
+ * nonce. Open to everyone, a stranger could deploy anything through it between
+ * two of the operator's deployments and shift the address of every contract the
+ * operator creates after — the address a deployment plan, a site's records or a
+ * later constructor argument expected. So `owner` is the account that created
+ * this contract, fixed in an immutable with no setter, and `append`, `deploy`
+ * and `clear` refuse anyone else (`NotOwner`): the nonce moves only when the
+ * owner moves it, and the addresses it creates follow from the owner's own
+ * sequence of calls. A deployment wanting its own deployer creates its own.
+ *
+ * WHY UPLOADS ARE STILL KEYED BY THE UPLOADER
+ * -------------------------------------------
+ * Pieces arrive in separate transactions, so between the first and the last there
+ * is a window in which the upload is incomplete. Before the owner rule, keying by
+ * `(uploader, id)` is what kept a stranger from appending into that window (the
+ * hash check at `deploy` would refuse the result, but the deployment would be
+ * blocked for the price of one append). With one permitted uploader the key is
+ * redundant; it is kept so the views keep their signature and a second rule
+ * stands behind the first.
+ *
+ * WHY PIECES ARE STORED SEPARATELY
+ * --------------------------------
+ * Appending to one `bytes` value rewrites the whole value on every append, so the
+ * cost grows with the square of the code. A list of pieces writes each piece once,
+ * and `deploy` pays for one pass over them.
+ */
+contract ChunkedDeployer is IChunkedDeployer {
+    /// @inheritdoc IChunkedDeployer
+    address public immutable owner;
+
+    mapping(bytes32 => bytes[]) private _uploads;
+
+    constructor() {
+        owner = msg.sender;
+    }
+
+    /// @inheritdoc IChunkedDeployer
+    function append(bytes32 uploadId, bytes calldata chunk) external {
+        _onlyOwner();
+        bytes[] storage parts = _uploads[_key(msg.sender, uploadId)];
+        parts.push(chunk);
+        emit Appended(msg.sender, uploadId, parts.length - 1, chunk.length);
+    }
+
+    /// @inheritdoc IChunkedDeployer
+    function deploy(bytes32 uploadId, bytes32 codeHash, bytes calldata constructorArgs)
+        external
+        returns (address deployed)
+    {
+        _onlyOwner();
+        bytes32 key = _key(msg.sender, uploadId);
+        bytes[] storage parts = _uploads[key];
+        uint256 n = parts.length;
+        if (n == 0) revert EmptyUpload(uploadId);
+
+        bytes memory code;
+        for (uint256 i = 0; i < n; i++) {
+            code = bytes.concat(code, parts[i]);
+        }
+
+        // The hash covers the code and not the constructor arguments. The code is
+        // what an auditor reads and what the artifact records; the arguments are
+        // the owner's to choose, and only the owner can reach this call.
+        bytes32 actual = keccak256(code);
+        if (actual != codeHash) revert CodeHashMismatch(codeHash, actual);
+
+        bytes memory init = bytes.concat(code, constructorArgs);
+        /// @hyperion memory-safe-assembly
+        assembly {
+            // The payload of `bytes memory` sits one native word past the
+            // pointer, and the native word is 32 bytes on the v2 line and 64
+            // under QIP-55. `shl(256, 1)` is zero exactly on a 256-bit word —
+            // a shift at or past the width — so it distinguishes the two at
+            // run time and one source serves both compilers.
+            let word := 0x20
+            if iszero(iszero(shl(256, 1))) { word := 0x40 }
+            deployed := create(0, add(init, word), mload(init))
+        }
+        if (deployed == address(0)) revert CreateFailed();
+
+        // Cleared only after a successful create, so a failed attempt keeps the
+        // upload and can be retried with corrected arguments instead of re-sent.
+        delete _uploads[key];
+        emit Deployed(msg.sender, uploadId, deployed, codeHash);
+    }
+
+    /**
+     * Discard the owner's upload under an id.
+     *
+     * An upload can be poisoned by its own uploader: a piece re-sent after a
+     * first attempt that did mine after all lands twice, and nothing appended
+     * later can take it out, so the code hash never matches again. The hash
+     * check refuses the result, so this is not a safety matter; without a
+     * reset the id is simply dead.
+     */
+    function clear(bytes32 uploadId) external {
+        _onlyOwner();
+        bytes32 key = _key(msg.sender, uploadId);
+        uint256 n = _uploads[key].length;
+        delete _uploads[key];
+        emit Cleared(msg.sender, uploadId, n);
+    }
+
+    /// The keccak256 of one piece of an upload, so a resuming uploader can check what is on chain.
+    function pieceHash(address uploader, bytes32 uploadId, uint256 index) external view returns (bytes32) {
+        return keccak256(_uploads[_key(uploader, uploadId)][index]);
+    }
+
+    /// How many pieces the caller has uploaded under an id.
+    function piecesOf(address uploader, bytes32 uploadId) external view returns (uint256) {
+        return _uploads[_key(uploader, uploadId)].length;
+    }
+
+    function _onlyOwner() private view {
+        if (msg.sender != owner) revert NotOwner(msg.sender);
+    }
+
+    function _key(address uploader, bytes32 uploadId) private pure returns (bytes32) {
+        return keccak256(abi.encode(uploader, uploadId));
+    }
+}

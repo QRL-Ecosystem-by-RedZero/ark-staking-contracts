@@ -1,0 +1,801 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * The catastrophe bond: leg B of Ark Staking.
+ *
+ * The one rule this contract exists to enforce: **bond principal leaves the
+ * pool only at maturity, by the measured condition of whitepaper §5.3, or to
+ * settle a trigger of §5.1 — and never on request** (invariants I9, I10, I21).
+ * There is no redemption at par on demand on either leg of this product, and
+ * the absence of that path is the product.
+ *
+ * SHARES, NOT BALANCES — BECAUSE PRINCIPAL IS DRAWN ON
+ * ---------------------------------------------------
+ * A holding records SHARES of its class, not QRL. Each class keeps a pair
+ * `(shares, principal)`, and a holding is worth `shares * principal / shares_c`.
+ * Every pro-rata reduction of principal — the conditional release of §5.3, a
+ * trigger draw of §5.1, a validator returning less than its stake under §3.4 —
+ * is then ONE storage write to that class's principal, and every derived
+ * quantity follows without being touched: what a holding is worth, what an
+ * epoch's maturity cohort is worth, what a run-off queue lot is worth.
+ *
+ * The alternative, recording QRL per holding, has to walk the holders. Its gas
+ * cost is unbounded and it therefore stops working at exactly the moment it is
+ * needed — which is the lesson `StakingVault` already carries, where `slash`
+ * costs less than `stake` for this reason. No path in this contract iterates
+ * holdings.
+ *
+ * The coupon and distribution indices run on SHARES; the draws and the release
+ * run on PRINCIPAL. The two never have to be reconciled, because a transfer
+ * moves shares without moving principal and a draw moves principal without
+ * moving shares.
+ *
+ * WHAT THE CLIFF IS A PROPERTY OF
+ * ------------------------------
+ * Whitepaper §5.3 attaches the thirty-day coupon cliff to the ISSUANCE and not
+ * to the holder, so a transfer does not reset it (I20). A holding therefore
+ * stores `cliffEpoch` — the consequence — rather than the moment it was issued.
+ * A transfer copies the field and there is nothing left to reset, which makes
+ * the invariant a property of the record instead of a rule someone has to
+ * remember on every path that touches ownership.
+ *
+ * HELD AND QUEUED PRINCIPAL IS STILL OUTSTANDING
+ * ---------------------------------------------
+ * This is the thing most likely to be got wrong. Principal whose maturity falls
+ * inside a determination or the protective freeze is HELD, and principal
+ * maturing while the run-off gate is closed is QUEUED. Whitepaper §5.3 and I26
+ * say of both that they stay outstanding, are counted for the capital
+ * requirement and for the draw of §5.1, earn the coupon of every epoch they
+ * wait, are transferable, and are never a source of a coupon. So neither path
+ * removes shares from its class: a hold is the ABSENCE of a write, and the
+ * queue records an entitlement beside the holding rather than in place of it.
+ */
+interface IArkCatBond {
+    /* ------------------------------------------------------------------ */
+    /* Types                                                               */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * One subscription. Every field is fixed at issuance except `owner`, which
+     * a transfer moves, and `shares`, which a partial transfer splits.
+     *
+     * `class_` is 0 junior and 1 senior. The ordinal is a wire format — it
+     * appears in `indexed` event topics — so it is appended to, never reordered.
+     */
+    struct Holding {
+        address owner;
+        uint8 class_;
+        /// 13, 52 or 156. Self-describing, and free in the slot `owner` opens.
+        uint16 termEpochs;
+        uint32 maturityEpoch;
+        /// The first epoch whose coupon this holding may draw. Fixed at issuance (I20).
+        uint32 cliffEpoch;
+        uint128 shares;
+        /**
+         * The last epoch this holding has been paid the coupon of.
+         *
+         * A cursor and not a `rewardDebt`, because the coupon has a cliff: the
+         * base an epoch's coupon is divided over is the shares ELIGIBLE at that
+         * epoch's boundary, which is not the shares outstanding, and a running
+         * per-share index cannot express "from epoch k onward" without knowing
+         * what the index stood at when k arrived. A cursor against a cumulative
+         * per-epoch figure says it in two lookups and no loop.
+         */
+        uint32 claimedThrough;
+        /**
+         * The generation of the class this holding belongs to.
+         *
+         * A class whose principal is drawn to zero while shares remain has to
+         * start again, or a later subscriber would be diluted by shares that are
+         * worth nothing. The generation is bumped there, and a holding of a
+         * stale generation is void: worth nothing and owed nothing, which is
+         * exactly what it is.
+         */
+        uint16 gen;
+        /**
+         * One more than the epoch the holding was created in, until it joins the
+         * staking distribution; zero once it has. A distribution is divided over
+         * the holdings recorded at the opening of the epoch it arrives in
+         * (whitepaper §3.4, audit D16), so a holding takes nothing of its own
+         * epoch's. Free in the slot `shares` opens.
+         */
+        uint32 freeFrom;
+        /// `shares * accFree` at the last settlement, unscaled. The staking distribution of §3.4.
+        uint256 freeDebt;
+        /// The same, for principal a conditional release of §5.3 has returned.
+        uint256 releaseDebt;
+        /// QRL this holding has already drawn from the run-off queue.
+        uint128 queueDrawn;
+        /**
+         * The shares this holding had when its maturity cohort entered the
+         * run-off queue, fixed at its first draw. The entitlement is pro rata to
+         * this and never to the shares left after a draw, which shrink with every
+         * payment and would make each later draw worth less than the one before.
+         */
+        uint128 queueShares;
+        /**
+         * The shares this holding had when trigger 2 was drawn (phase C3), fixed
+         * at the first payout or split after the draw, where `declFixed` is set;
+         * until then its shares ARE its shares at the draw, since nothing is
+         * issued after a declaration. A holding's part of the recovery of
+         * whitepaper §5.4 is pro rata to this — "by holding of record at the
+         * opening determination" — so a holding that redeemed what the draw left
+         * it keeps its claim on what the bond later recovers. A record carved
+         * out of it by a partial transfer after the draw is fixed at zero
+         * (OC-ECON-01): the claim stays with the record of the draw.
+         */
+        uint128 declShares;
+        bool declFixed;
+        /**
+         * The next trigger draw whose relief this holding has not taken (phase
+         * C3): a draw on its class while it waited in the run-off queue was
+         * taken at its exposure weight, and the difference is paid back with
+         * its next queue draw (`ArkCatBondStore.Relief`).
+         */
+        uint32 reliefCursor;
+    }
+
+    /**
+     * The whole of the bond's state a reader needs, in one call.
+     *
+     * One struct rather than fifteen getters, because every getter is encoding
+     * code in the contract nearest the deployment ceiling of CLAUDE.md §3.1, and
+     * because a test that reads one struct is shorter and states its rule more
+     * plainly than one that reads fifteen figures.
+     */
+    struct BondState {
+        uint256 juniorShares;
+        uint256 seniorShares;
+        uint256 juniorPrincipal;
+        uint256 seniorPrincipal;
+        uint256 outstanding;
+        bool gateClosed;
+        uint256 atGateClose;
+        uint256 queueTotal;
+        uint256 queueServed;
+        uint64 lastClosedEpoch;
+        uint8 clearEpochs;
+        uint8 belowEpochs;
+        uint256 determinationsOpen;
+        uint64 firstOpenedAt;
+        bool shortfallOpen;
+        uint256 couponPool;
+        uint256 freePool;
+        uint256 principalOwed;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Events                                                              */
+    /* ------------------------------------------------------------------ */
+
+    event StakingSet(address indexed staking);
+    event CourtSet(address indexed court);
+
+    /// Principal issued into a class and a maturity epoch. Whitepaper §3.4.
+    event Subscribed(
+        address indexed owner,
+        uint256 indexed id,
+        uint8 indexed class_,
+        uint256 amount,
+        uint256 shares,
+        uint256 maturityEpoch
+    );
+
+    /// A holding moved, whole or in part. `newId` equals `id` where it moved whole.
+    event HoldingTransferred(address indexed from, address indexed to, uint256 indexed id, uint256 newId, uint256 shares);
+
+    /// The run-off gate of whitepaper §5.3 changed state at an epoch boundary.
+    event RunoffGateClosed(uint256 indexed epoch, uint256 atGateClose);
+    event RunoffGateOpened(uint256 indexed epoch);
+
+    /// Principal maturing into a closed gate entered the queue, ordered by maturity.
+    event Queued(uint256 indexed maturityEpoch, uint256 amount, uint256 queueTotal);
+
+    /// Principal returned at maturity, or drawn from the run-off queue.
+    event Redeemed(address indexed owner, uint256 indexed id, uint256 amount);
+
+    /// A queued holding was paid back what a trigger draw took above its exposure weight (whitepaper §5.3, I26′).
+    event ReliefPaid(uint256 indexed id, uint256 amount);
+
+    /// Principal above the capital requirement returned at par, pro rata. Whitepaper §5.3.
+    event ConditionalReleased(uint256 indexed epoch, uint256 junior, uint256 senior);
+
+    /**
+     * Shares left a holding by a payout while epochs they stood in the coupon
+     * base of were still unsettled; their coupon for those epochs is claimable
+     * by `claimTail` as each is distributed.
+     */
+    event CouponTailOpened(uint256 indexed tailId, address indexed owner, uint8 class_, uint256 shares, uint256 fromEpoch, uint256 throughEpoch);
+
+    /// A holding drew what it was owed. `coupon` was sent by the coupon account, not by the bond.
+    event Claimed(address indexed owner, uint256 indexed id, uint256 coupon, uint256 principalAndDistribution);
+
+    /// The staking distribution of whitepaper §3.4 reached the holders.
+    event DistributionCredited(uint256 amount);
+
+    /// A validator returned less than its stake: a loss of principal, pro rata over every holding.
+    event PrincipalLost(uint256 amount, uint256 outstanding);
+
+    /// A trigger determination opened or closed. Whitepaper §5.1, §6.2.
+    event DeterminationOpened(bytes32 indexed determinationId, uint256 openedAt);
+    event DeterminationClosed(bytes32 indexed determinationId);
+
+    /* ------------------------------------------------------------------ */
+    /* Errors                                                              */
+    /* ------------------------------------------------------------------ */
+
+    error OnlyDeployer(address caller);
+    error OnlyCourt(address caller);
+    error OnlyStaking(address caller);
+    error NotHolder(uint256 id, address caller);
+    error AmountExceedsHolding(uint256 held);
+    error AlreadySet(address current);
+
+    /// The term is outside the admitted set of whitepaper §6.3.
+    error TermNotAdmitted(uint8 term);
+
+    /// There are two classes, junior and senior. Whitepaper §4.6.
+    error ClassUnknown(uint8 class_);
+
+    /**
+     * Issuance into a maturity epoch already carrying the ladder fraction of
+     * the book it would be sold into. Whitepaper §5.3: a refusal at issuance
+     * rather than a default at maturity.
+     */
+    error MaturityLadderFull(uint256 maturityEpoch, uint256 bound);
+
+    /**
+     * A senior subscription that would take junior's share of the pool below
+     * the thickness senior is promised. Whitepaper §4.6.
+     */
+    error JuniorTooThin(uint256 juniorPrincipal, uint256 required);
+
+    /// Issuance and the conditional release are suspended while a determination is open. Whitepaper §4.7, §5.3.
+    error DeterminationOpen(uint256 open);
+
+    /// The same, while a settlement the book could not meet in full is unrecovered.
+    error CouponShortfallUnrecovered();
+
+    /// The coupon at exact cover is below the floor under the tail-risk premium. Whitepaper §4.7.
+    error CouponBelowFloor(uint256 couponBps, uint256 floorBps);
+
+    /// The circuit breaker of whitepaper §5.5 suspends issuance and premium pricing.
+    error BreakerActive();
+
+    /// Q-Day has been declared: the pool is consumed by the event it was sold to cover.
+    error Declared();
+
+    /// The protective freeze of whitepaper §3.3 is active.
+    error Frozen();
+
+    /**
+     * Q-Day has been declared and the trigger-2 settlement of whitepaper §5.2 is
+     * not written: principal that stands behind that settlement does not leave
+     * before it. Refused on every path that pays principal (audit 2026-09-27, D6).
+     */
+    error DeclaredPendingSettlement();
+
+    error SubscriptionTooSmall(uint256 sent, uint256 minimum);
+
+    /// Nothing redeems before its maturity epoch. Whitepaper §5.3, invariant I9.
+    error NotMatured(uint256 id, uint256 maturityEpoch);
+
+    /// Principal maturing inside a determination is held until it closes, and no longer than twenty days.
+    error HeldByDetermination(uint256 until);
+
+    /// Principal maturing during the protective freeze is held until it lifts.
+    error HeldByFreeze(uint256 id);
+
+    /// Principal maturing while the run-off gate is closed is queued, not returned. Whitepaper §5.3.
+    error InRunoffQueue(uint256 id, uint256 maturityEpoch);
+
+    error NotQueued(uint256 id);
+    error NothingDue(uint256 id);
+
+    /// The holding belongs to a generation of its class drawn to nothing: it is worth nothing.
+    error HoldingVoid(uint256 id);
+
+    /// More epochs are unclosed than one call may close; `closeEpochs` closes them in batches.
+    error EpochGapTooLong(uint256 gap, uint256 max);
+
+    /// A quantity does not fit the 128 bits it is stored in.
+    error AmountTooLarge(uint256 amount);
+
+
+    /**
+     * An epoch's settlement window has closed and its coupon is not yet
+     * distributed: nothing moves shares until it is. Lifted by anyone calling
+     * `ArkBondCoupon.distribute`.
+     */
+    error CouponPending(uint256 epoch);
+
+    /// `claimTail`: no such tail, or not the caller's.
+    error NotTailOwner(uint256 tailId, address caller);
+
+    /// Utilisation was not below the threshold at the close of two consecutive epochs. Whitepaper §5.3.
+    error UtilisationNotLow(uint8 epochs);
+
+    /// The run-off gate is closed, which suspends the conditional release.
+    error RunoffGateShut();
+
+    /// The root of the preceding epoch is unadmitted, so the book cannot be read. Whitepaper §5.3.
+    error RootUnadmitted(uint256 epoch);
+
+    /// The book has not yet closed an epoch inside the operating range of whitepaper §4.7.
+    error NoOperatingEpoch();
+
+    error NothingToRelease();
+
+
+    error DeterminationAlreadyOpen(bytes32 determinationId);
+    error NoSuchDetermination(bytes32 determinationId);
+
+    /// Principal is owed but not liquid: it returns as the exits of whitepaper §3.4 land.
+    error PrincipalNotLiquid(uint256 available);
+
+    /* ------------------------------------------------------------------ */
+    /* Build 2 (phase C3): the trigger settlement, the entitlement, the    */
+    /* subrogation recovery. Events and errors of `ArkCatBondSettlement`,  */
+    /* declared here so they decode at the bond's address.                 */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * A trigger-1 determination settled through the waterfall of whitepaper
+     * §5.2: the vested obligation, the capital available to it, the one
+     * haircut, the buffer's part (paid on the origin chain) and the bond's
+     * part (drawn junior first, in QRL).
+     */
+    event LossDetermined(
+        bytes32 indexed determinationId,
+        uint256 obligation,
+        uint256 available,
+        uint256 haircutBps,
+        uint256 bufferUnits,
+        uint256 drawQrl,
+        uint256 drawJunior,
+        uint256 drawSenior
+    );
+
+    /// One affected position's two parts of a trigger-1 settlement.
+    event LossPartRecorded(bytes32 indexed determinationId, bytes32 indexed stakeAssetId, uint256 bufferUnits, uint256 entitlementQrl);
+
+    /**
+     * The buffer's part of a position's trigger-1 settlement, as the loss leaf
+     * the attester quorum seals for the escrow's `settleLoss` (whitepaper §3.5,
+     * yellow paper §2.2 `lossLeafKey`), to the destination its bound
+     * beneficiary named here under ML-DSA-87.
+     */
+    event LossLeafSealed(
+        bytes32 indexed determinationId,
+        bytes32 indexed stakeAssetId,
+        uint256 chainId,
+        address escrow,
+        address destination,
+        uint256 quantity,
+        bytes32 leaf
+    );
+
+    /**
+     * A draw of trigger 2 (whitepaper §4.6, §5.2): the floor D_0 at the
+     * ratification — or on the censorship ground, the whole of it — and the
+     * severity balance at the close of the assessment window.
+     */
+    event Trigger2Drawn(bytes32 indexed settlementId, uint256 drawBps, uint256 drawQrl, uint256 drawJunior, uint256 drawSenior);
+
+    /**
+     * The severity could not be measured at the close of the assessment window
+     * (the valuation oracle silent or its breaker active): the balance above
+     * D_0 is HELD in its classes, neither paid nor released (I37).
+     */
+    event SeverityHeld(uint256 heldQrl, uint256 heldJunior, uint256 heldSenior);
+
+    /// The severity balance settled at `severityBps`; what it did not reach stays with its class.
+    event SeveritySettled(uint256 measuredLossBps, uint256 severityBps, uint256 drawTotalBps, bool byCourt);
+
+    /// A settlement entitlement paid to a position's bound beneficiary, in QRL (yellow paper §1.4).
+    event SettlementClaimed(bytes32 indexed settlementId, bytes32 indexed stakeAssetId, address indexed beneficiary, uint256 amount);
+
+    /**
+     * A recovery opened on a successor state (whitepaper §5.4, yellow paper
+     * §4.3): the escrow realised, the bond's share against the one residual,
+     * divided senior first on the actual draws, and the positions' share.
+     */
+    event RecoveryOpened(
+        bytes32 indexed recoveryId,
+        bytes32 indexed successorId,
+        address escrow,
+        uint256 realised,
+        uint256 toSenior,
+        uint256 toJunior,
+        uint256 toPositions,
+        uint256 residualAfter
+    );
+
+    /// One recipient's share of a recovery, as the leaf the escrow's `releaseShare` pays (yellow paper §2.2 `shareLeafKey`).
+    event RecoveryLeafSealed(
+        bytes32 indexed recoveryId,
+        bytes32 indexed recipient,
+        uint256 chainId,
+        address escrow,
+        bytes32 successorId,
+        address destination,
+        uint256 quantity,
+        bytes32 leaf
+    );
+
+    /**
+     * The ground of trigger 2 was fixed (phase C3b): a declaration, grounded by
+     * the first claimant record or opening, or the censorship ground the court
+     * found. `at` is T, the moment the claimants are recorded as of; `baseAtT`
+     * and `transitFound` the censorship ground's anchored notional at the
+     * determination and the qualifying transit the court found (zero for a
+     * declaration).
+     */
+    event Trigger2Grounded(uint8 ground, uint64 at, uint256 baseAtT, uint256 transitFound);
+
+    /// The court opened `n` value slices of one finding (whitepaper §6.2, EC-04), covering `phi` of its object (1e18 the whole).
+    event SlicesOpened(bytes32 indexed group, uint8 kind, uint8 n, uint256 phi);
+    /// Slice `i` of `group` closed on its verdict, settling `phi` of the finding's object where upheld.
+    event SliceClosed(bytes32 indexed group, uint8 i, bool upheld, uint256 phi);
+
+    /**
+     * The claimant record after a batch (whitepaper §5.2; R-5): the recorded
+     * principal of the claimants anchored at T and of the qualifying releases,
+     * every still-anchored position the record has passed, and W, the vested
+     * weight of the claimants at T.
+     */
+    event ClaimantsRecorded(uint256 anchored, uint256 transit, uint256 live, uint256 vestedWeight);
+
+    /**
+     * The court found what an escrow realised on a successor (whitepaper §5.4):
+     * recorded at the successor's slot in admission order; it is applied —
+     * `RecoveryOpened` — once every earlier slot of that escrow has a finding.
+     */
+    event RecoveryFound(bytes32 indexed recoveryId, bytes32 indexed successorId, address escrow, uint256 slot, uint256 realised);
+
+    /// The settlement module named at construction was not built on this bond's dependencies.
+    error ModuleMismatch(address module);
+
+    /// A position already in the claimant record.
+    error AlreadyRecorded(bytes32 stakeAssetId);
+
+    /// The claimant record is not complete: `recorded` of the `required` recorded principal it must reach.
+    error ClaimantsIncomplete(uint256 recorded, uint256 required);
+
+    /// The record has passed `recorded` of the `count` anchors the root of the epoch before T proves (audit 2026-09-29, QL-06).
+    error AnchorsUnrecorded(uint256 recorded, uint256 count);
+
+    /// The anchor count of the root of `epoch`, the epoch before a declaration's, proven on its count leaf (QL-06).
+    event PriorAnchorsProven(uint256 epoch, uint256 count);
+
+    /// The count of that root is proven already, as `count`; a proof of another is refused (re-audit 2026-09-30, BOND-09).
+    error PriorCountProven(uint256 count);
+
+    /**
+     * The settlement opened W_a epochs after T without every anchor of the
+     * root of `epoch` recorded: `excluded` of its proven count are excluded
+     * from this declaration (no trigger-2 claim); `counted` false where the
+     * root's count was never proven (QL-06 lapse).
+     */
+    event AnchorsExcluded(uint256 epoch, uint256 excluded, bool counted);
+
+    /**
+     * The oracle gave no settlement or reference price at the opening, and the
+     * settlement opened at the registry's carried price instead (audit
+     * 2026-09-29, QL-07; I37, item 25a).
+     */
+    event OpenedAtCarriedPrice(uint256 price, uint256 refOpen);
+
+    /// A recovery found behind a successor with no finding yet; it is applied once that finding stands.
+    error RecoveryWaiting(bytes32 recoveryId);
+
+    /// The two triggers are exclusive (whitepaper §5.1): one determination per pool.
+    error TriggersExclusive();
+
+    /// A determination the court has not opened, or one already settled.
+    error DeterminationNotOpen(bytes32 determinationId);
+    error AlreadyDetermined(bytes32 determinationId);
+
+    /// A determination naming no position, lists of different lengths, an unknown position or two escrows.
+    error BadDetermination();
+
+    /// Only the bound beneficiary of a position acts for it (whitepaper §3.2).
+    error NotBeneficiary(bytes32 stakeAssetId, address caller);
+
+    /// The position is not a claimant of this settlement or recovery.
+    error NotClaimant(bytes32 stakeAssetId);
+
+    /// Declared, but the settlement it calls for has not run yet, or has run already.
+    error DeclarationNotRatified();
+    error DeclarationAlreadySettled();
+
+    /// The severity balance settles at the close of the assessment window and not before.
+    error AssessmentWindowOpen(uint256 closesAtEpoch);
+
+    /// The severity is unmeasurable, or nothing is held.
+    error SeverityUnmeasurable();
+    error NothingHeld();
+
+    /// The court fixes m_loss for a held balance only after the series has stayed silent 2 x W_a epochs.
+    error SeverityCourtTooEarly(uint256 fromEpoch);
+
+    /// Value slices (whitepaper §6.2, EC-04): a group of no slices, too many, or of no sliced kind.
+    error BadSlices(bytes32 group, uint8 n);
+    /// A group of value slices of this kind is still before the court.
+    error SliceGroupOpen(bytes32 group);
+    /// No such slice open: another group, an index past its count, or a slice already closed.
+    error NoSuchSlice(bytes32 group, uint8 i);
+
+    /// Principal of this class is held against an unmeasured severity (whitepaper §4.6).
+    error HeldUnderSeverity(uint8 class_);
+
+    /// A recovery opens only after the trigger-2 settlement it subrogates has run.
+    error NothingToSubrogate();
+    error RecoveryExists(bytes32 recoveryId);
+    error NoSuchRecovery(bytes32 recoveryId);
+
+    /// A successor state not admitted for that origin chain (whitepaper §5.4, §6.3).
+    error SuccessorNotAdmitted(uint256 chainId, bytes32 successorId);
+
+    /// This recipient's leaf of this settlement or recovery was sealed already.
+    error AlreadyClaimed(bytes32 recipient);
+
+    /// A destination wider than an origin-chain address (whitepaper §3.2, D14).
+    error DestinationNotOriginAddress(address destination);
+
+    /**
+     * The one refusal of a court finding (re-audit 2026-09-30, COURT-02): the
+     * bond's own record does not admit it, for the reason named by `cause`,
+     * the selector of the error it replaces (`DeclarationAlreadySettled`,
+     * `NothingHeld`, ...). Raised only by the court-facing entry points, and
+     * the only revert the court records as a refusal; any other revert — the
+     * shared guard held, an epoch gap, gas — reverts the court's call, which
+     * is retried.
+     */
+    error FindingRefused(bytes4 cause);
+
+    /**
+     * A ratified declaration opened on the part of the full settlement the
+     * censorship ground did not settle (re-audit 2026-09-30, COURT-04):
+     * `remainder` of the whole (1e18), on which its floor draw and severity
+     * are taken.
+     */
+    event DeclarationOnRemainder(uint256 remainder, uint256 refOpen);
+
+    /**
+     * The Cushion's part of a draw (yellow paper §4.5; technical reference
+     * §1.7, I42): of a trigger-1 determination, of a trigger-2 draw under
+     * `settlementId`, or the residual draw under T2_CUSHION. Beside
+     * `LossDetermined` and `Trigger2Drawn`, whose totals include it and whose
+     * class parts do not.
+     */
+    event CushionDrawn(bytes32 indexed settlementId, uint256 amount);
+
+    /*
+     * `outstandingPrincipal()` and `runoffGateClosed()` are NOT declared here.
+     * They belong to `IArkCatBondView` in `IArkStakeExternal.hyp`, which is the
+     * shape the registry reads and which the bond also inherits; declaring them
+     * twice would make every implementation an explicit override of two
+     * unrelated interfaces for no gain.
+     */
+}
+
+/**
+ * The book, as the bond reads it from `ArkStakeRegistry`.
+ *
+ * Declared here, in the consumer's own interface file, for the reason
+ * `IArkStakeAdmissions` is declared in `IArkStakeParams.hyp`: the registry owes
+ * each consumer a narrow shape rather than its whole surface, and a change on
+ * either side is then a compile error instead of a silent divergence.
+ * `IArkStakeRegistry` cannot serve, because it declares structs and events and
+ * no functions at all.
+ */
+interface IArkStakeBook {
+    /// The settlement series (thirty-day, bounded per epoch): the price bond principal converts at. Whitepaper §5.5, I38.
+    function referencePrice() external view returns (uint256);
+
+    /// The epoch average, read by the premium swap's reserve alone. Whitepaper §4.7, §5.5.
+    function epochPrice() external view returns (uint256);
+
+    /// ceil(K * BPS / (N^cap_30 + buffer_orig)): the reading the conditional release is gated on. Whitepaper §4.3, §5.3.
+    function utilisationBps() external view returns (uint256);
+
+    /// `att_eff * N_A`: the occurrence limit, identically the capital held against it.
+    function requiredCapital() external view returns (uint256);
+
+    /// h_fx, the conversion haircut in force (whitepaper §4.3): the conditional release is measured on it (SP-05).
+    function fxHaircutBps() external view returns (uint256);
+
+    /// Whether the thirty-day average has fallen 5,000 bps in 24 hours. Whitepaper §5.5.
+    function breakerActive() external view returns (bool);
+
+    /// `sigma_t * y_A / att_eff`, the figure the floor of whitepaper §4.5 is read against.
+    function couponAtExactCoverBps(uint256 grossYieldBps) external view returns (uint256);
+
+    /// The valuation oracle, which the bond reads the book's realised yield from.
+    function priceOracle() external view returns (address);
+
+    /**
+     * The settlement price of whitepaper §5.5 (yellow paper §4.2): the
+     * thirty-day series outside the breaker, the emergency valuation clamped
+     * between the compounded floor and the carried price while it holds. A
+     * trigger-1 determination and the opening of trigger 2 convert at it.
+     */
+    function settlementPrice() external view returns (uint256);
+
+    /// The window cover vests over from anchoring (whitepaper §5.3); the claimant record reads it once.
+    function VESTING_WINDOW() external view returns (uint64);
+}
+
+/**
+ * The coupon account of the catastrophe bond, and the series a holding draws from.
+ *
+ * The one rule this contract exists to enforce: **a coupon is paid from the
+ * proceeds delivered for its own epoch and from no other account** (whitepaper
+ * §4.7, invariants I7 and I8).
+ *
+ * WHY THIS IS NOT PART OF ArkCatBond
+ * ----------------------------------
+ * The same argument `IProceedsLedger` makes one step further along. That contract
+ * makes a coupon out of principal unreachable by never holding principal; this one
+ * makes principal out of a coupon unreachable by never holding a coupon in the
+ * same balance as the pool. `ArkCatBond` custodies bond principal and has no path
+ * that can reach a wei of coupon, because every wei of coupon is here — so I8 is a
+ * property of where the money is rather than a guard on every path that moves it.
+ *
+ * The deployment ceiling of CLAUDE.md §3.1 is what first put the question — the
+ * bond with the series inside it was 21,603 bytes of creation code against about
+ * 18,000 — but it is not why the seam is here. `ChunkedDeployer` now removes that
+ * ceiling for the bond, and the coupon account stays separate on the argument
+ * above, which is the argument that made `ProceedsLedger` a contract of its own.
+ */
+interface IArkBondCoupon {
+    /// An epoch's coupon was divided between the classes. Whitepaper §4.6.
+    event CouponDistributed(
+        uint256 indexed epoch,
+        uint256 poolCouponBps,
+        uint256 juniorAmount,
+        uint256 seniorAmount,
+        bool seniorShortfall
+    );
+
+    /// A holding was paid, or credited without being paid where value must not move.
+    event CouponPaid(address indexed to, uint8 indexed class_, uint256 fromEpoch, uint256 toEpoch, uint256 amount);
+
+    event BondSet(address indexed bond);
+
+    error OnlyBond(address caller);
+    error OnlyLedger(address caller);
+    error OnlyDeployer(address caller);
+    error AlreadySet(address current);
+    error EpochAlreadyDistributed(uint256 epoch);
+    error NotYetPayable(uint256 epoch, uint256 payableAt);
+    error NothingDue();
+
+    /// The last epoch whose coupon has been fixed. A holding may be paid up to it.
+    function lastDistributed() external view returns (uint64);
+
+    /// The last epoch that closed inside the operating range of whitepaper §4.7.
+    function lastOperatingEpoch() external view returns (uint64);
+
+    /**
+     * Fix the base an epoch's coupon divides over, when that epoch closes. Bond
+     * only. `queueWeights` packs the run-off queue's clean-age clock during
+     * the epoch (bits 32 up) and the decay and exposure floor in force in it
+     * (bits 16 - 31, 0 - 15): what a queued holding's weight in the epoch is
+     * computed from (whitepaper §5.3, I26′).
+     */
+    function recordBoundary(
+        uint256 epoch,
+        uint128 eligibleJunior,
+        uint128 eligibleSenior,
+        uint128 principalJunior,
+        uint128 principalSenior,
+        uint16 seniorCouponBps,
+        uint256 queueWeights
+    ) external;
+
+    /// The shortfall carry outstanding in the ledger (I34); issuance is suspended while it is not zero.
+    function shortfallCarry() external view returns (uint256);
+
+    /**
+     * Pay a holding the epochs after `fromEpoch`, and report the epoch it is now
+     * paid up to. `send` is false where the caller must not move value, and the
+     * amount is withheld for `withdraw`. Bond only. A holding in the run-off
+     * queue names the epoch after which it is queued (`queuedAfter`, zero for
+     * none) and the clean-age clock it entered at: it is paid every later epoch
+     * at its exposure weight in that epoch (whitepaper §5.3, I26′).
+     */
+    function payTo(uint8 class_, uint256 fromEpoch, uint256 shares, address to, bool send, uint256 queuedAfter, uint256 clock)
+        external
+        returns (uint256 amount, uint64 through);
+
+    /**
+     * As `payTo`, sending, but never for an epoch after `throughEpoch`: the
+     * coupon of shares a payout retired, which stood in the base up to that
+     * epoch and no further. Bond only.
+     */
+    function payThrough(
+        uint8 class_,
+        uint256 fromEpoch,
+        uint256 throughEpoch,
+        uint256 shares,
+        address to,
+        uint256 queuedAfter,
+        uint256 clock
+    ) external returns (uint256 amount, uint64 reached);
+
+    /// What a holding of `shares` in `class_` is owed for the epochs after `fromEpoch`.
+    function owed(uint8 class_, uint256 fromEpoch, uint256 shares) external view returns (uint256);
+
+    /// Coupon drawn from the ledger and not yet taken by a holding.
+    function pool() external view returns (uint256);
+}
+
+/**
+ * What `ArkBondStaking` needs from the pool it places principal for.
+ *
+ * Narrow deliberately: the staking contract knows nothing of a holding, a class or
+ * a coupon, and this interface is the whole of what it may ask or tell. Everything
+ * it tells arrives as a `payable` function that names what the value is for, which
+ * is what lets `ArkCatBond` keep refusing a bare transfer.
+ */
+/// The bond's epoch clock, as the coupon account drives it.
+interface IArkCatBondClock {
+    function closeEpoch() external;
+}
+
+/**
+ * The contract that carries bond principal to QRL staking and back.
+ * `ArkBondStaking` implements it; the bond calls `place` and nothing else.
+ */
+interface IArkBondStaking {
+    event DelegationSet(address indexed delegation);
+    event Placed(uint256 amount);
+    event Recalled(uint256 amount);
+    event Distributed(uint256 amount);
+    event LossRecorded(uint256 amount);
+
+    error OnlyBond(address caller);
+    error OnlyDelegation(address caller);
+    error OnlyDeployer(address caller);
+    error AlreadySet(address current);
+    error NoShortfall(uint256 owed, uint256 idle);
+
+    /// Place principal the bond has decided is idle. Bond only, and it sends the value.
+    function place() external payable;
+}
+
+/**
+ * The one other call the bond makes on its staking contract: book a loss the
+ * delegation already shows before principal is priced for a payment. Declared
+ * apart from `IArkBondStaking` so the staking contract need not re-declare it.
+ */
+interface IArkBondStakingSync {
+    function syncLoss() external returns (uint256 loss);
+}
+
+interface IArkCatBondPrincipal {
+    /// Principal the bond has placed with staking, less what has come back.
+    function placedWithStaking() external view returns (uint256);
+
+    /**
+     * What the bond owes holders in principal now: the release accrued, principal
+     * past its maturity not yet collected, and the run-off queue — the three a
+     * requested exit answers under yellow paper §1.4.
+     */
+    function principalOwedNow() external view returns (uint256);
+
+    /// The balance the bond may still part with as principal.
+    function unencumbered() external view returns (uint256);
+
+    /// Principal coming home from the delegation. Staking only.
+    function returnPrincipal() external payable;
+
+    /// The staking distribution of whitepaper §3.4, for every holding. Staking only.
+    function creditDistribution() external payable;
+
+    /// A validator returned less than its stake. Staking only. Whitepaper §3.4.
+    function recordLoss(uint256 amount) external;
+}

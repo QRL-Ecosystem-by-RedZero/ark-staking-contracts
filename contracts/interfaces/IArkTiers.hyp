@@ -1,0 +1,36 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * The risk tiers a stake pool can be scoped to.
+ *
+ * WHY THIS TYPE LIVES HERE AND NOT IN THE INSURANCE PRODUCT
+ * ---------------------------------------------------------
+ * Ark Staking scopes every position to exactly one tier, because jurors for a
+ * dispute in tier N are drawn only from the pool of tier N (invariant #2). That
+ * makes the tier taxonomy part of THIS product's own state layout: it is in the
+ * `Operator` struct, in every event topic, and in the key of `_tierStake`.
+ *
+ * It was originally read across from `IQuantumArkRegistry.InsuranceTier` in the
+ * combined repository. Keeping that import would have made the staking layer
+ * depend on the whole insurance interface to borrow a three-value enum, and
+ * would have meant the insurance product could not be versioned without
+ * touching the ABI of every staking event.
+ *
+ * The names are deliberately unchanged from the combined repository, and so is
+ * the ordinal order, so the two trees still line up value for value:
+ * NoahArk = 0, Vault = 1, Citadel = 2. Any consumer on the insurance side that
+ * ABI-encodes a tier keeps encoding the identical byte.
+ *
+ * The type name `InsuranceTier` is inherited rather than chosen; see the naming
+ * question in CLAUDE.md before renaming it, because a rename is an ABI change
+ * for every event that carries a tier as an indexed topic.
+ */
+interface IArkTiers {
+    /// Ordinals are part of the ABI. Append only; never reorder.
+    enum InsuranceTier {
+        NoahArk,
+        Vault,
+        Citadel
+    }
+}

@@ -1,0 +1,1405 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "../lib/openzeppelin/utils/cryptography/MerkleProof.hyp";
+
+import "../interfaces/IArkStakeExternal.hyp";
+import "../utils/ArkStakeMath.hyp";
+import "../utils/ArkEpoch.hyp";
+import "../utils/ArkStakeLeaves.hyp";
+import "../interfaces/IArkStakeRegistry.hyp";
+import "../interfaces/IArkCatBondCourtSide.hyp";
+import "../interfaces/IArkVeArkSnapshot.hyp";
+import "../interfaces/IArkFlow.hyp";
+
+/**
+ * Test doubles for the contracts Ark Staking reads but does not own.
+ *
+ * NOT FOR A NETWORK HOLDING VALUE. `deployQrlLeg` does put the attestation, the
+ * Q-Day oracle and the price oracle on the time-compressed testnet devnets
+ * (the VPS one included), which is why, since 2026-09-27, every state-moving
+ * call on them is gated on one account (`sealer`, `operator`) and an epoch's
+ * attested root is written once. What remains is that one account IS the
+ * attester quorum, the Q-Day oracle and the valuation oracle there.
+ *
+ * They exist so the local ZVM suite, and a
+ * private Kurtosis enclave, can exercise this product's rules without the
+ * insurance repository's attestation verifier and Q-Day oracle, the protocol's
+ * valuation oracle, or the bond this tree has not written yet. They are in the
+ * contract tree rather than in `test/` because the harness executes compiled
+ * artifacts and a mock has to be compiled to be one.
+ *
+ * `MockAttestation` verifies a real Merkle proof rather than returning true.
+ * A double that accepted any root would make every domain-separation test
+ * vacuous — and domain separation is the property keeping a root sealed to
+ * record an anchoring from also authorising an insurance indemnity payment
+ * (whitepaper §3.5). A test that cannot fail on a wrong leaf is not testing
+ * the leaf construction.
+ *
+ * `seal` is the sealer's alone, standing in for the attester quorum. Open to
+ * anyone, any account could overwrite a root the relayer sealed and make every
+ * forward proof against it fail.
+ *
+ * AN EPOCH'S ROOT IS WRITTEN ONCE (2026-09-27, audit D7). Proofs are consumed
+ * per (epoch, leaf), so a root that could be overwritten would admit NEW leaves
+ * into an old epoch — a second anchor record, or a delegation report with a
+ * short `WITHDRAWAL_DONE` writing principal down. Resealing the root already
+ * there is a no-op, so a sealer that lost its own receipt can retry; any other
+ * root for a sealed epoch is refused.
+ *
+ * The sealer starts as the deployer and is handed on with `transferSealer`, so
+ * a deployment can name a sealing account distinct from the deployer and from
+ * governance (`SEALER_ADDRESS`, scripts/lib/deploy.js).
+ */
+contract MockAttestation is IAttestationVerifier {
+    mapping(uint256 => bytes32) private _roots;
+    address public sealer;
+
+    error NotSealer(address caller);
+    error EpochAlreadySealed(uint256 epoch, bytes32 root);
+
+    event SealerTransferred(address indexed previous, address indexed next);
+
+    constructor() {
+        sealer = msg.sender;
+    }
+
+    function transferSealer(address next) external {
+        if (msg.sender != sealer) revert NotSealer(msg.sender);
+        if (next == address(0)) revert NotSealer(next);
+        emit SealerTransferred(sealer, next);
+        sealer = next;
+    }
+
+    function seal(uint256 epoch, bytes32 root) external virtual {
+        if (msg.sender != sealer) revert NotSealer(msg.sender);
+        bytes32 current = _roots[epoch];
+        if (current == root) return;
+        if (current != bytes32(0)) revert EpochAlreadySealed(epoch, current);
+        _roots[epoch] = root;
+    }
+
+    function _overwrite(uint256 epoch, bytes32 root) internal {
+        if (msg.sender != sealer) revert NotSealer(msg.sender);
+        _roots[epoch] = root;
+    }
+
+    function rootOf(uint256 epoch) external view returns (bytes32) {
+        return _roots[epoch];
+    }
+
+    function verify(uint256 epoch, bytes32 leaf, bytes32[] calldata proof)
+        external
+        view
+        returns (bool)
+    {
+        bytes32 root = _roots[epoch];
+        if (root == bytes32(0)) return false;
+        return MerkleProof.verifyCalldata(proof, root, leaf);
+    }
+}
+
+/**
+ * `MockAttestation` with the overwrite the unit suite builds on. TEST ONLY:
+ * never deployed by `scripts/lib/deploy.js`, which deploys `MockAttestation`.
+ *
+ * The suite seals a one-leaf root (the leaf itself, proved by an empty path)
+ * several times in one epoch, one fact per test step, which is cheaper to read
+ * than a tree per epoch. A root written once would make every such test build
+ * its tree up front; this keeps them as they are, and the write-once rule is
+ * held against `MockAttestation` itself by name.
+ */
+contract MockAttestationResealable is MockAttestation {
+    function seal(uint256 epoch, bytes32 root) external override {
+        _overwrite(epoch, root);
+    }
+}
+
+/**
+ * The account allowed to move a double's state (2026-09-27, audit D2).
+ *
+ * The doubles below were open to every caller, and `deployQrlLeg` put them on
+ * the shared VPS devnet: anyone reaching its RPC could `declare()` — which the
+ * relayer turned into a terminal `close` leaf on the Hoodi escrow — or set a
+ * price of zero and take the premium pot at dust. The operator starts as the
+ * deployer and may hand itself on; a double on a shared network is still a
+ * double, and `watchQday` only acts on it where a profile opts in.
+ */
+abstract contract MockOperated {
+    address public operator;
+
+    error NotOperator(address caller);
+
+    event OperatorTransferred(address indexed previous, address indexed next);
+
+    constructor() {
+        operator = msg.sender;
+    }
+
+    modifier onlyOperator() {
+        if (msg.sender != operator) revert NotOperator(msg.sender);
+        _;
+    }
+
+    function transferOperator(address next) external onlyOperator {
+        if (next == address(0)) revert NotOperator(next);
+        emit OperatorTransferred(operator, next);
+        operator = next;
+    }
+}
+
+contract MockQDayOracle is IQDayOracle, MockOperated {
+    bool private _declared;
+    bool private _frozen;
+    uint64 private _declaredAt;
+
+    function declare(uint64 at) external onlyOperator {
+        _declared = true;
+        _declaredAt = at;
+    }
+
+    function setFrozen(bool value) external onlyOperator {
+        _frozen = value;
+    }
+
+    function declared() external view returns (bool) {
+        return _declared;
+    }
+
+    function frozen() external view returns (bool) {
+        return _frozen;
+    }
+
+    function declaredAt() external view returns (uint64) {
+        return _declaredAt;
+    }
+}
+
+/**
+ * The ecosystem phase (contracts/core's `ArkPhase`, staking CLAUDE.md item
+ * 129), as `ArkStakeParams` reads it: the five views of `IArkPhase` the set
+ * calls, and none of its transition rules, which are core's and tested
+ * there. A test puts a phase in force now (`setPhase`), at a later boundary
+ * (`setPending`), moves the epoch the phase in force began (`setEntered`),
+ * reports another epoch length (`setEpochLength`), or declares Q-Day
+ * (`setDeclared`), which reads as phase 3 from the epoch it is set in, on a
+ * stored phase below 3, as core's read rule does.
+ *
+ * One level of history, as the set's own banks keep: `phaseAt` answers the
+ * phase before the last change for an epoch before it began. Gated on the
+ * operator, as every double a deployment may put on a shared network.
+ */
+contract MockArkPhase is MockOperated {
+    uint8 private _phase;
+    uint8 private _before;
+    uint256 private _entered;
+    uint8 private _pendingTo;
+    uint256 private _pendingEpoch;
+    bool private _declared;
+    uint256 private _declaredEpoch;
+    uint256 public epochLength = ArkEpoch.EPOCH_LENGTH;
+
+    /// Put `p` in force from the current epoch, the phase before it kept for earlier epochs; clears a pending step.
+    function setPhase(uint8 p) external onlyOperator {
+        _settle();
+        _before = _phase;
+        _phase = p;
+        _entered = ArkEpoch.current();
+        _pendingEpoch = 0;
+    }
+
+    /// A step to `to` in force from `epoch` (zero clears it), as core schedules one for the next boundary.
+    function setPending(uint8 to, uint256 epoch) external onlyOperator {
+        _settle();
+        _pendingTo = to;
+        _pendingEpoch = epoch;
+    }
+
+    /// The epoch the phase in force began.
+    function setEntered(uint256 epoch) external onlyOperator {
+        _settle();
+        _entered = epoch;
+    }
+
+    function setEpochLength(uint256 value) external onlyOperator {
+        epochLength = value;
+    }
+
+    /// A ratified declaration (or its absence), read as phase 3 from the current epoch on.
+    function setDeclared(bool value) external onlyOperator {
+        _declared = value;
+        _declaredEpoch = ArkEpoch.current();
+    }
+
+    function phase() external view returns (uint8) {
+        return _read(ArkEpoch.current());
+    }
+
+    function phaseAt(uint256 epoch) external view returns (uint8) {
+        return _read(epoch);
+    }
+
+    function pendingPhase() external view returns (uint8 toPhase, uint256 effectiveEpoch) {
+        if (_pendingEpoch > ArkEpoch.current()) return (_pendingTo, _pendingEpoch);
+    }
+
+    function phaseEnteredEpoch() external view returns (uint256) {
+        uint256 e = ArkEpoch.current();
+        if (_declared && e >= _declaredEpoch && _stored(e) < 3) return _declaredEpoch;
+        return _pendingEpoch != 0 && e >= _pendingEpoch ? _pendingEpoch : _entered;
+    }
+
+    function qdayOracle() external pure returns (address) {
+        return address(0);
+    }
+
+    function governance() external view returns (address) {
+        return operator;
+    }
+
+    function _read(uint256 epoch) private view returns (uint8) {
+        uint8 s = _stored(epoch);
+        return _declared && epoch >= _declaredEpoch && s < 3 ? 3 : s;
+    }
+
+    function _stored(uint256 epoch) private view returns (uint8) {
+        if (_pendingEpoch != 0 && epoch >= _pendingEpoch) return _pendingTo;
+        return epoch >= _entered ? _phase : _before;
+    }
+
+    /// A pending step whose epoch has come becomes the phase in force, its predecessor the history.
+    function _settle() private {
+        uint256 e = _pendingEpoch;
+        if (e != 0 && ArkEpoch.current() >= e) {
+            _before = _phase;
+            _phase = _pendingTo;
+            _entered = e;
+            _pendingEpoch = 0;
+        }
+    }
+}
+
+/**
+ * The valuation oracle. The drawdown is keyed by the window it is asked over,
+ * so a test can show the governable window actually reaches the oracle: asked
+ * over any other window, it reports no drawdown at all.
+ *
+ * `setReverting` makes every read revert, keyed prices and the realised yield
+ * included, standing in for an oracle that is out of data, so a test can show
+ * which paths depend on it and which must not (OC-ORC-09: a keyed price that
+ * still answered masked OC-ORC-03). Each post emits its time, so the last
+ * update of a live double is read from its logs.
+ *
+ * Conforms to the silence of yellow paper §6.1 since 2026-10-05 (I40): a post
+ * is an accepted round (`latestRound`, `lastAccepted`), and the double is
+ * silent when told (`setSilent`, a pause) or, once a heartbeat is set
+ * (`setHeartbeat`; zero, the default, never goes stale: a live feed whose
+ * value does not move), more than the heartbeat after its last post;
+ * `observe` and `epochAverage` then revert `OracleSilent(updatedAt)`. It never
+ * computes a series: the production oracle is `ArkReferenceOracle`.
+ * `breakerActive` applies the rule the registry applied to the posted values
+ * before the breaker moved to the oracle (the thirty-day average 5,000 bps
+ * below the one 24 hours earlier), so a test still fires it by posting a
+ * fall. `arkReferencePrice` is a stored value that answers under
+ * `setReverting`, as the real one's read never fails (yellow paper §5.1);
+ * zero until set.
+ */
+contract MockPriceOracle is IReferencePriceOracle, MockOperated {
+    uint256 private _twapEpoch;
+    uint256 private _twap30d;
+    uint256 private _twap24hAgo;
+    mapping(bytes32 => uint256) private _keyed;
+    mapping(uint256 => uint256) private _drawdown;
+    mapping(bytes32 => uint256) private _yield;
+    uint256 private _emergency;
+    bool private _reverting;
+    bool private _silent;
+    uint64 private _updatedAt;
+    uint64 private _heartbeat;
+    uint64 private _rounds;
+    uint64 private _firedAt;
+    uint256 private _arkRef;
+
+    error OracleUnavailable();
+
+    event PriceSet(uint256 twapEpoch, uint256 twap30d, uint256 twap24hAgo, uint256 timestamp);
+    event PriceSetFor(uint256 indexed chainId, address indexed asset, uint256 twap30d, uint256 timestamp);
+
+    function setReverting(bool value) external onlyOperator {
+        _reverting = value;
+    }
+
+    /// Silent for every key while set: the pause of yellow paper §6.1.
+    function setSilent(bool value) external onlyOperator {
+        _silent = value;
+    }
+
+    /// T_hb in seconds; zero never goes stale.
+    function setHeartbeat(uint64 heartbeatSeconds) external onlyOperator {
+        _heartbeat = heartbeatSeconds;
+    }
+
+    function setArkReferencePrice(uint256 price) external onlyOperator {
+        _arkRef = price;
+    }
+
+    function set(uint256 twapEpoch_, uint256 twap30d_, uint256 twap24hAgo_) external onlyOperator {
+        _twapEpoch = twapEpoch_;
+        _twap30d = twap30d_;
+        _twap24hAgo = twap24hAgo_;
+        _round();
+        if (!_fired(twap30d_, twap24hAgo_)) _firedAt = 0;
+        else if (_firedAt == 0) _firedAt = uint64(block.timestamp);
+        emit PriceSet(twapEpoch_, twap30d_, twap24hAgo_, block.timestamp);
+    }
+
+    /**
+     * A thirty-day average for one key alone, where a test needs two prices
+     * apart — the court reads ARK's at `(0, ARK)` beside the origin asset's.
+     * Zero falls back to the one price every key reads.
+     */
+    function setPriceFor(uint256 chainId, address asset, uint256 twap30d_) external onlyOperator {
+        _keyed[keccak256(abi.encode(chainId, asset))] = twap30d_;
+        _round();
+        emit PriceSetFor(chainId, asset, twap30d_, block.timestamp);
+    }
+
+    function _round() private {
+        _rounds += 1;
+        _updatedAt = uint64(block.timestamp);
+    }
+
+    function setDrawdown(uint256 windowSeconds, uint256 bps) external onlyOperator {
+        _drawdown[windowSeconds] = bps;
+    }
+
+    function setYield(uint256 chainId, address asset, uint256 bps) external onlyOperator {
+        _yield[keccak256(abi.encode(chainId, asset))] = bps;
+    }
+
+    function _live() private view {
+        if (_reverting) revert OracleUnavailable();
+    }
+
+    function _isSilent() private view returns (bool) {
+        return _silent || (_heartbeat != 0 && block.timestamp > uint256(_updatedAt) + uint256(_heartbeat));
+    }
+
+    function _prices(uint256 chainId, address asset) private view returns (uint256, uint256, uint256) {
+        uint256 keyed = _keyed[keccak256(abi.encode(chainId, asset))];
+        if (keyed != 0) return (keyed, keyed, keyed);
+        return (_twapEpoch, _twap30d, _twap24hAgo);
+    }
+
+    /// A keyed price, where one is set, else the one price every key reads; every key reverts under `setReverting`.
+    function observe(uint256 chainId, address asset) external view returns (uint256, uint256, uint256) {
+        _live();
+        if (_isSilent()) revert OracleSilent(_updatedAt);
+        return _prices(chainId, asset);
+    }
+
+    function latestRound(uint256 chainId, address asset) external view returns (uint64, uint64, uint256, bool) {
+        _live();
+        (, uint256 p,) = _prices(chainId, asset);
+        return (_rounds, _updatedAt, p, false);
+    }
+
+    function lastAccepted(uint256 chainId, address asset) external view returns (uint256 twap30d, uint64 updatedAt) {
+        _live();
+        (, twap30d,) = _prices(chainId, asset);
+        updatedAt = _updatedAt;
+    }
+
+    /// The posted epoch average, read for any closed epoch.
+    function epochAverage(uint256 chainId, address asset, uint64) external view returns (uint256 p) {
+        _live();
+        if (_isSilent()) revert OracleSilent(_updatedAt);
+        (p,,) = _prices(chainId, asset);
+    }
+
+    function silent(uint256, address) external view returns (bool) {
+        _live();
+        return _isSilent();
+    }
+
+    function breakerActive(uint256, address) external view returns (bool active, uint64 firedAt) {
+        _live();
+        active = _fired(_twap30d, _twap24hAgo);
+        if (active) firedAt = _firedAt;
+    }
+
+    /// A series with no value a day ago has had nothing to fall from (the registry's rule until 2026-10-05).
+    function _fired(uint256 twap30d, uint256 ago) private pure returns (bool) {
+        // Halved rather than scaled, so an absurd post cannot overflow here.
+        return ago != 0 && twap30d <= ago / 2;
+    }
+
+    function arkReferencePrice() external view returns (uint256) {
+        return _arkRef;
+    }
+
+    /// The emergency valuation `twap_e` (yellow paper §4.2), one figure for every key; zero until set.
+    function setEmergency(uint256 twapE) external onlyOperator {
+        _emergency = twapE;
+    }
+
+    function emergencyValuation(uint256, address) external view returns (uint256) {
+        _live();
+        return _emergency;
+    }
+
+    function maxDrawdownBps(uint256, address, uint256 windowSeconds) external view returns (uint256) {
+        _live();
+        return _drawdown[windowSeconds];
+    }
+
+    function realisedYieldBps(uint256 chainId, address asset) external view returns (uint256) {
+        _live();
+        return _yield[keccak256(abi.encode(chainId, asset))];
+    }
+}
+
+/**
+ * contracts/core's VeArk, reduced to what the juror pool reads: a weight per
+ * account, readable only at a block `checkpoint()` recorded and never at the
+ * current one — core's two refusals, `SnapshotNotRecorded` and `FutureLookup`,
+ * which the pool must live with. `test/ArkJurorPool.test.js` also runs the
+ * pool against core's own VeArk where the umbrella checkout has its build.
+ * Operated, for a double a devnet deployment may carry.
+ */
+contract MockVeArk is IArkVeArkSnapshot, MockOperated {
+    struct Point {
+        uint64 blk;
+        uint192 weight;
+    }
+
+    mapping(address => Point[]) private _history;
+    mapping(uint256 => bool) public recorded;
+
+    error FutureLookup(uint256 blockNumber, uint256 current);
+    error SnapshotNotRecorded(uint256 blockNumber);
+
+    function setWeight(address account, uint256 weight) external onlyOperator {
+        Point[] storage h = _history[account];
+        if (h.length != 0 && h[h.length - 1].blk == block.number) h[h.length - 1].weight = uint192(weight);
+        else h.push(Point(uint64(block.number), uint192(weight)));
+    }
+
+    function checkpoint() external {
+        recorded[block.number] = true;
+    }
+
+    function weightAt(address account, uint256 blockNumber) external view returns (uint256 w) {
+        if (blockNumber >= block.number) revert FutureLookup(blockNumber, block.number);
+        if (!recorded[blockNumber]) revert SnapshotNotRecorded(blockNumber);
+        Point[] storage h = _history[account];
+        for (uint256 i = h.length; i > 0; i--) {
+            if (h[i - 1].blk <= blockNumber) return h[i - 1].weight;
+        }
+    }
+}
+
+/**
+ * The two roles of contracts/core's ArkTimelock the valuation oracle reads
+ * (`guardian`, `proposer`), and a forwarder, so a test can stand it as the
+ * oracle's governance: the guardian pauses, the timelock renews, a guardian
+ * renounced (zero) leaves no pause. Set by its deployer alone; never deployed
+ * on a shared network.
+ */
+contract MockTimelockRoles {
+    address public guardian;
+    address public proposer;
+    address private immutable _setter = msg.sender;
+
+    constructor(address guardian_, address proposer_) {
+        guardian = guardian_;
+        proposer = proposer_;
+    }
+
+    function setGuardian(address next) external {
+        if (msg.sender != _setter) revert("not the deployer");
+        guardian = next;
+    }
+
+    /// Calls `target` as this contract, the governance account the oracle names.
+    function exec(address target, bytes calldata data) external {
+        if (msg.sender != _setter) revert("not the deployer");
+        (bool ok, ) = target.call(data);
+        if (!ok) revert("call failed");
+    }
+}
+
+contract MockBond is IArkCatBondView {
+    uint256 private _outstanding;
+    bool private _gateClosed;
+
+    function set(uint256 value) external {
+        _outstanding = value;
+    }
+
+    function setGateClosed(bool value) external {
+        _gateClosed = value;
+    }
+
+    function outstandingPrincipal() external view returns (uint256) {
+        return _outstanding;
+    }
+
+    function runoffGateClosed() external view returns (bool) {
+        return _gateClosed;
+    }
+
+    /**
+     * The prefixes of the bond's claimant record and an escrow's ledger the
+     * registry's censorship-ground hold reads (OC-LEGA-01): ground and T, and
+     * the ledger's cursor as its seventh word. Zero until a test sets them,
+     * so the hold never binds; set by the deployer alone.
+     */
+    uint256 private _ground;
+    uint256 private _at;
+    uint256 private _cursor;
+    address private immutable _setter = msg.sender;
+
+    function setClaimants(uint256 ground, uint256 at, uint256 cursor) external {
+        if (msg.sender != _setter) revert("not the deployer");
+        _ground = ground;
+        _at = at;
+        _cursor = cursor;
+    }
+
+    function claimants() external view returns (uint256, uint256) {
+        return (_ground, _at);
+    }
+
+    function escrowLedger(uint256, address) external view returns (uint256[7] memory w) {
+        w[6] = _cursor;
+    }
+}
+
+/**
+ * The product's dispute court, reduced to the two facts the bond reads from it.
+ *
+ * NEVER DEPLOYED ON A SHARED NETWORK. The court of whitepaper §6.2 is not in this
+ * tree. What the bond needs from it in this build is only that a determination is
+ * open, and when it opened — enough to make "issuance is suspended while a
+ * determination is open" and "a maturity inside one is held, for twenty days at
+ * most" real states a test can reach. It forwards through a contract rather than
+ * letting an account call the bond directly, so the court-only path is exercised
+ * by a real caller.
+ *
+ * Opened and closed by its deployer alone. `npm run deploy` puts it on the live
+ * devnet, where anybody could otherwise open a determination and hold every
+ * maturity and suspend issuance at will.
+ */
+contract MockDisputeCourt {
+    error OnlyDeployer(address caller);
+
+    IArkCatBondCourtSide public immutable BOND;
+    address public immutable DEPLOYER;
+
+    constructor(address bond_) {
+        BOND = IArkCatBondCourtSide(bond_);
+        DEPLOYER = msg.sender;
+    }
+
+    modifier onlyDeployer() {
+        if (msg.sender != DEPLOYER) revert OnlyDeployer(msg.sender);
+        _;
+    }
+
+    function open(bytes32 determinationId) external onlyDeployer {
+        BOND.openDetermination(determinationId);
+    }
+
+    function close(bytes32 determinationId) external onlyDeployer {
+        BOND.closeDetermination(determinationId);
+    }
+
+    /*
+     * The findings build 2 settles on (phase C3). A stand-in states them; the
+     * court of phase C4 reaches them on a bonded assertion and a verdict.
+     */
+
+    /*
+     * A stand-in states a finding with no V (OC-COURT-01): unbounded (V is a
+     * uint128 in the court, so the widest one and a sum of sixteen fit), so the
+     * bond's own arithmetic is what the unit suite reads. The `...At` forms
+     * state the V a real court admitted the finding at.
+     */
+    uint256 private constant UNBOUNDED = type(uint128).max;
+
+    function determineLoss(bytes32 determinationId, bytes32[] calldata ids, uint256[] calldata lossUnits)
+        external
+        onlyDeployer
+    {
+        BOND.determineLoss(determinationId, ids, lossUnits, UNBOUNDED);
+    }
+
+    function determineLossAt(bytes32 determinationId, bytes32[] calldata ids, uint256[] calldata lossUnits, uint256 value)
+        external
+        onlyDeployer
+    {
+        BOND.determineLoss(determinationId, ids, lossUnits, value);
+    }
+
+    function determineCensorship(bytes32 determinationId, uint256 transitUnits) external onlyDeployer {
+        BOND.determineCensorship(determinationId, transitUnits, UNBOUNDED);
+    }
+
+    function determineCensorshipAt(bytes32 determinationId, uint256 transitUnits, uint256 value) external onlyDeployer {
+        BOND.determineCensorship(determinationId, transitUnits, value);
+    }
+
+    function fixSeverity(uint256 measuredLossBps) external onlyDeployer {
+        BOND.fixSeverity(measuredLossBps);
+    }
+
+    /// The value slices of one finding (whitepaper §6.2, EC-04), as the court opens and closes them.
+    function openSlices(bytes32 group, uint8 kind, uint8 n) external onlyDeployer {
+        BOND.openSlices(group, kind, n);
+    }
+
+    function closeSlice(bytes32 group, uint8 i, bool upheld, bytes calldata payload) external onlyDeployer {
+        BOND.closeSlice(group, i, upheld, payload, UNBOUNDED);
+    }
+
+    function closeSliceAt(bytes32 group, uint8 i, bool upheld, bytes calldata payload, uint256 value)
+        external
+        onlyDeployer
+    {
+        BOND.closeSlice(group, i, upheld, payload, value);
+    }
+
+    function openRecovery(
+        bytes32 recoveryId,
+        uint256 chainId,
+        bytes32 successorId,
+        address escrow,
+        uint256 realisedUnits,
+        uint256 anchoredBase
+    ) external onlyDeployer {
+        BOND.openRecovery(recoveryId, chainId, successorId, escrow, realisedUnits, anchoredBase);
+    }
+}
+
+/**
+ * `ArkBondDelegation`, reduced to the balance arithmetic `ArkBondStaking` reads.
+ *
+ * NEVER DEPLOYED ON A SHARED NETWORK. The real contract is tested against the
+ * genesis deposit contract's own code with real qrysm deposits, and those tests
+ * are where its behaviour is established. What this suite needs is narrower: a
+ * principal figure that can FALL, so a loss of bond principal reaches the book,
+ * a raw call that can push value, so the staking contract's one door can be
+ * shown to tell a return from a distribution, and principal that is deployed
+ * and exits that are pending, so the exit shortfall can be measured. Reproducing a loss through sealed
+ * reconciliation reports would test `ArkBondDelegation.reconcile` a second time,
+ * and "a double would test the double" holds only where the double stands in for
+ * the thing under test — which here it does not.
+ */
+contract MockDelegation {
+    address public immutable BOND;
+    uint256 public principal;
+    /// Principal the double pretends is at validators: not idle, and not returnable.
+    uint256 public deployed;
+    /// Stake asked to exit and not yet back, as `ArkBondDelegation.exitsPending` reports it.
+    uint256 public exitsPending;
+    /// What one exit request frees, capped at what is deployed and not already exiting.
+    uint256 public exitStake = 40_000 * 10 ** 18; // `* 10 ** 18`: v2 says `ether`, v3 `quanta`; both parse this
+
+    constructor(address bond_) {
+        BOND = bond_;
+    }
+
+    function fund() external payable {
+        principal += msg.value;
+    }
+
+    function returnIdle(uint256 amount) external {
+        if (amount > principal - deployed) revert("not idle");
+        principal -= amount;
+        (bool ok,) = BOND.call{value: amount}("");
+        if (!ok) revert("return failed");
+    }
+
+    function idle() external view returns (uint256) {
+        return principal - deployed;
+    }
+
+    /// Move idle principal to validators, as `delegate` does, without a deposit contract.
+    function deployIdle(uint256 amount) external {
+        deployed += amount;
+    }
+
+    /// A validator exited: its principal is idle again, and no longer pending.
+    function undeploy(uint256 amount) external {
+        deployed -= amount;
+        exitsPending = exitsPending > amount ? exitsPending - amount : 0;
+    }
+
+    /// Slashed validators held open, as `ArkBondDelegation.slashedOpen` reports them: the pool's bunker (OC-LEGB-03).
+    uint256 public slashedOpen;
+
+    function setSlashedOpen(uint256 n) external {
+        slashedOpen = n;
+    }
+
+    /// The delegation picks the validator (OC-LEGB-04); the double has none to name.
+    function requestExit() external returns (bytes32) {
+        uint256 left = deployed - exitsPending;
+        exitsPending += exitStake < left ? exitStake : left;
+        return bytes32(0);
+    }
+
+    /// A validator returned less than its stake: principal falls, and nothing is pushed.
+    function loseStake(uint256 amount) external {
+        principal -= amount;
+        if (deployed > principal) deployed = principal;
+    }
+
+    /// A staking distribution, arriving the way `distribute` sends one: a raw call.
+    function pushDistribution() external payable {
+        (bool ok,) = BOND.call{value: msg.value}("");
+        if (!ok) revert("push failed");
+    }
+}
+
+/**
+ * An external surface over `ArkStakeMath` and `ArkEpoch`, for the suite alone.
+ *
+ * NEVER DEPLOYED, like the doubles above. Both are libraries of `internal`
+ * functions, so they are inlined into their callers and no test can reach them
+ * directly. `ArkStakeRegistry` exposes the pricing pipeline it uses and nothing
+ * else, which leaves the settlement of whitepaper §5.2, the recovery of §5.4,
+ * the classes of §4.6, the auction bounds of §4.7 and the run-off rules of §5.3
+ * untested against the specification — and those are figures the scenario
+ * report works in full.
+ *
+ * It holds no state and forwards without adjusting anything. A harness that
+ * clamped, defaulted or reordered an argument would be testing itself.
+ */
+contract StakeMathHarness {
+    function pmlBps(uint256 floorBps, uint256 observedBps) external pure returns (uint256) {
+        return ArkStakeMath.pmlBps(floorBps, observedBps);
+    }
+
+    function effectiveIndemnityBps(uint256 sigmaTargetBps, uint256 indemnityBps, uint256 pml)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.effectiveIndemnityBps(sigmaTargetBps, indemnityBps, pml);
+    }
+
+    function effectiveAttachmentBps(uint256 indemnityEff, uint256 pml) external pure returns (uint256) {
+        return ArkStakeMath.effectiveAttachmentBps(indemnityEff, pml);
+    }
+
+    function requiredCapital(uint256 anchoredNotional, uint256 attachmentBps) external pure returns (uint256) {
+        return ArkStakeMath.requiredCapital(anchoredNotional, attachmentBps);
+    }
+
+    function bondNotionalInOrigin(uint256 bondNotional, uint256 refPrice) external pure returns (uint256) {
+        return ArkStakeMath.bondNotionalInOrigin(bondNotional, refPrice);
+    }
+
+    function bondCapacityInOrigin(uint256 bondNotional, uint256 refPrice, uint256 haircut)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.bondCapacityInOrigin(bondNotional, refPrice, haircut);
+    }
+
+    function fxHaircutBps(uint256 drawdown, uint256 cap) external pure returns (uint256) {
+        return ArkStakeMath.fxHaircutBps(drawdown, cap);
+    }
+
+    function coverageRatioBps(uint256 bondNotional, uint256 refPrice, uint256 required, uint256 haircut, uint256 buffer)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.coverageRatioBps(bondNotional, refPrice, required, haircut, buffer);
+    }
+
+    function coveredBps(uint256 bondNotional, uint256 refPrice, uint256 required, uint256 haircut, uint256 buffer)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.coveredBps(bondNotional, refPrice, required, haircut, buffer);
+    }
+
+    function capacity(uint256 bondNotional, uint256 bondCapacity, uint256 buffer, uint256 attachmentBps)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.capacity(bondNotional, bondCapacity, buffer, attachmentBps);
+    }
+
+    function premiumShareBps(uint256 sigmaTargetBps, uint256 slopeRatio, uint256 ceiling, uint256 covered)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.premiumShareBps(sigmaTargetBps, slopeRatio, ceiling, covered);
+    }
+
+    function premiumTargetBps(uint256 sigmaTargetBps, uint256 slopeRatio, uint256 ceiling, uint256 covered)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.premiumTargetBps(sigmaTargetBps, slopeRatio, ceiling, covered);
+    }
+
+    function scarcitySlopeBps(uint256 sigmaTargetBps, uint256 slopeRatio) external pure returns (uint256) {
+        return ArkStakeMath.scarcitySlopeBps(sigmaTargetBps, slopeRatio);
+    }
+
+    function stakerShareBps(uint256 bufferBps, uint256 operationsBps, uint256 premiumBps)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.stakerShareBps(bufferBps, operationsBps, premiumBps);
+    }
+
+    function bufferShareInForceBps(uint256 base, uint256 cap, uint256 hMax, uint256 haircut)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.bufferShareInForceBps(base, cap, hMax, haircut);
+    }
+
+    function bufferEscalatorCapBps() external pure returns (uint256) {
+        return ArkStakeMath.BUFFER_ESCALATOR_CAP_BPS;
+    }
+
+    function stabilizationLevyInForceBps(uint256 levy, uint256 stage) external pure returns (uint256) {
+        return ArkStakeMath.stabilizationLevyInForceBps(levy, stage);
+    }
+
+    function psrCapUnits(uint256 epochs, uint256 stage1, uint256 stage4, uint256 epochYield)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.psrCapUnits(epochs, stage1, stage4, epochYield);
+    }
+
+    /* The return-path leaves of ArkStakeLeaves, for the three-way agreement tests. */
+
+    function allocationDomain() external pure returns (bytes32) {
+        return ArkStakeLeaves.ALLOCATION_DOMAIN;
+    }
+
+    function lossDomain() external pure returns (bytes32) {
+        return ArkStakeLeaves.LOSS_DOMAIN;
+    }
+
+    function recoveryDomain() external pure returns (bytes32) {
+        return ArkStakeLeaves.RECOVERY_DOMAIN;
+    }
+
+    function allocationLeaf(address escrow, uint256 epoch, IArkStakeRegistry.Allocation memory a)
+        external
+        pure
+        returns (bytes32)
+    {
+        return ArkStakeLeaves.allocationLeaf(escrow, epoch, a);
+    }
+
+    function lossLeaf(
+        uint256 chainId,
+        address escrow,
+        bytes32 determinationId,
+        bytes32 id,
+        address destination,
+        uint256 quantity
+    ) external pure returns (bytes32) {
+        return ArkStakeLeaves.lossLeaf(chainId, escrow, determinationId, id, destination, quantity);
+    }
+
+    function shareLeaf(
+        uint256 chainId,
+        address escrow,
+        bytes32 successorId,
+        bytes32 recoveryId,
+        bytes32 recipient,
+        address destination,
+        uint256 quantity
+    ) external pure returns (bytes32) {
+        return ArkStakeLeaves.shareLeaf(chainId, escrow, successorId, recoveryId, recipient, destination, quantity);
+    }
+
+    /// The registry's anchor leaf, spend key and release builders, which it no longer exposes (2026-09-29, for its v3 size).
+    function stakeLeafKey(address escrow, bytes32 id, uint256 anchoredNotional) external pure returns (bytes32) {
+        return ArkStakeLeaves.stakeLeafKey(escrow, id, anchoredNotional);
+    }
+
+    function spendKey(uint256 epoch, bytes32 leaf) external pure returns (bytes32) {
+        return ArkStakeLeaves.spendKey(epoch, leaf);
+    }
+
+    function releasePayload(bytes32 id, address recipient, uint64 claimNonce, uint256 chainId)
+        external
+        pure
+        returns (bytes32)
+    {
+        return ArkStakeLeaves.releasePayload(id, recipient, claimNonce, chainId);
+    }
+
+    function releaseLeaf(address escrow, bytes32 payload) external pure returns (bytes32) {
+        return ArkStakeLeaves.releaseLeaf(escrow, payload);
+    }
+
+    /// The registry's two forward leaves it no longer exposes (phase C3b, for its v3 size).
+    function releasedLeaf(address escrow, bytes32 id, uint64 claimNonce) external pure returns (bytes32) {
+        return ArkStakeLeaves.releasedLeaf(escrow, id, claimNonce);
+    }
+
+    function bufferLeaf(uint256 chainId, address escrow, address asset, uint256 epoch, uint256 units)
+        external
+        pure
+        returns (bytes32)
+    {
+        return ArkStakeLeaves.bufferLeaf(chainId, escrow, asset, epoch, units);
+    }
+
+    function anchorCountLeaf(uint256 epoch, uint256 count) external pure returns (bytes32) {
+        return ArkStakeLeaves.anchorCountLeaf(epoch, count);
+    }
+
+    function seedReturnLeaf(uint256 chainId, address escrow, uint256 epoch) external pure returns (bytes32) {
+        return ArkStakeLeaves.seedReturnLeaf(chainId, escrow, epoch);
+    }
+
+    function sliceFraction(uint256 groupFraction, uint256 slices, uint256 index) external pure returns (uint256) {
+        return ArkStakeMath.sliceFraction(groupFraction, slices, index);
+    }
+
+    function slicedDrawTarget(uint256 fullSettlement, uint256 drawNumerator) external pure returns (uint256) {
+        return ArkStakeMath.slicedDrawTarget(fullSettlement, drawNumerator);
+    }
+
+    function slicedHeldPrincipal(uint256 fullSettlement, uint256 drawNumerator, uint256 openFraction, uint256 reachBps)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.slicedHeldPrincipal(fullSettlement, drawNumerator, openFraction, reachBps);
+    }
+
+    function psrCapFactorBps(uint256 epochs, uint256 stage1, uint256 stage4) external pure returns (uint256) {
+        return ArkStakeMath.psrCapFactorBps(epochs, stage1, stage4);
+    }
+
+    function psrTopUpUnits(uint256 spot, uint256 commit, uint256 covered, uint256 y) external pure returns (uint256) {
+        return ArkStakeMath.psrTopUpUnits(spot, commit, covered, y);
+    }
+
+    function solverBondBps(uint256 ceiling, uint256 floor, uint256 move, uint256 reserveFloor, uint256 discount)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.solverBondBps(ceiling, floor, move, reserveFloor, discount);
+    }
+
+    function solverBondQrl(uint256 lot, uint256 bps) external pure returns (uint256) {
+        return ArkStakeMath.solverBondQrl(lot, bps);
+    }
+
+    function shortfallCarryQrl(uint256 retained, uint256 price, uint256 reserveFloor) external pure returns (uint256) {
+        return ArkStakeMath.shortfallCarryQrl(retained, price, reserveFloor);
+    }
+
+    function couponRateBps(uint256 anchoredNotional, uint256 bondInOrigin, uint256 premiumBps, uint256 grossYieldBps)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.couponRateBps(anchoredNotional, bondInOrigin, premiumBps, grossYieldBps);
+    }
+
+    function maxCouponRateBps(uint256 sigmaTargetBps, uint256 attachmentBps, uint256 grossYieldBps)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.maxCouponRateBps(sigmaTargetBps, attachmentBps, grossYieldBps);
+    }
+
+    function couponMultipleBps(uint256 sigmaTargetBps, uint256 attachmentBps) external pure returns (uint256) {
+        return ArkStakeMath.couponMultipleBps(sigmaTargetBps, attachmentBps);
+    }
+
+    function vestingBps(uint256 anchoredAt, uint256 nowTs, uint256 windowSeconds) external pure returns (uint256) {
+        return ArkStakeMath.vestingBps(anchoredAt, nowTs, windowSeconds);
+    }
+
+    function availableCapital(uint256 buffer, uint256 bondInOrigin, uint256 occurrenceLimit)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.availableCapital(buffer, bondInOrigin, occurrenceLimit);
+    }
+
+    function settlementHaircutBps(uint256 available, uint256 vestedObligation) external pure returns (uint256) {
+        return ArkStakeMath.settlementHaircutBps(available, vestedObligation);
+    }
+
+    function settlementFor(uint256 realisedLoss, uint256 indemnityEff, uint256 vesting, uint256 haircut)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.settlementFor(realisedLoss, indemnityEff, vesting, haircut);
+    }
+
+    function realisedAfterConversion(uint256 paid, uint256 impactBps) external pure returns (uint256) {
+        return ArkStakeMath.realisedAfterConversion(paid, impactBps);
+    }
+
+    function emergencyPriceFloor(uint256 carried, uint256 move, uint256 epochs) external pure returns (uint256) {
+        return ArkStakeMath.emergencyPriceFloor(carried, move, epochs);
+    }
+
+    function settlementPrice(bool cleared, uint256 carried, uint256 twap30d, uint256 emergency, uint256 floor)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.settlementPrice(cleared, carried, twap30d, emergency, floor);
+    }
+
+    function utilisationBps(uint256 required, uint256 bondNotional, uint256 bondCapacity, uint256 buffer)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.utilisationBps(required, bondNotional, bondCapacity, buffer);
+    }
+
+    function conditionalReleaseQrl(uint256 bondNotional, uint256 refPrice, uint256 required, uint256 haircut)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.conditionalReleaseQrl(bondNotional, refPrice, required, haircut);
+    }
+
+    function settlementHorizonEpochs(uint256 unbonding, uint256 epoch, uint256 releaseBound)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.settlementHorizonEpochs(unbonding, epoch, releaseBound);
+    }
+
+    function releaseBoundUnits(uint256 queueBase, uint256 bound) external pure returns (uint256) {
+        return ArkStakeMath.releaseBoundUnits(queueBase, bound);
+    }
+
+    function settlementCloses(uint256 epoch) external pure returns (uint256) {
+        return ArkEpoch.settlementCloses(epoch);
+    }
+
+    function maturityLadderMaxBps(uint256 horizon) external pure returns (uint256) {
+        return ArkStakeMath.maturityLadderMaxBps(horizon);
+    }
+
+    function runoffHorizonEpochs(uint256 ladder) external pure returns (uint256) {
+        return ArkStakeMath.runoffHorizonEpochs(ladder);
+    }
+
+    function runoffContractionBps(uint256 current, uint256 twoEarlier) external pure returns (uint256) {
+        return ArkStakeMath.runoffContractionBps(current, twoEarlier);
+    }
+
+    function runoffGateGround(uint256 stage, uint256 bondNow, uint256 bondTwoEarlier, uint256 trigger)
+        external
+        pure
+        returns (bool)
+    {
+        return ArkStakeMath.runoffGateGround(stage, bondNow, bondTwoEarlier, trigger);
+    }
+
+    function runoffDrainEpochs(uint256 bound) external pure returns (uint256) {
+        return ArkStakeMath.runoffDrainEpochs(bound);
+    }
+
+    function runoffReleaseQrl(uint256 bound, uint256 atGateClose, uint256 queued) external pure returns (uint256) {
+        return ArkStakeMath.runoffReleaseQrl(bound, atGateClose, queued);
+    }
+
+    function queueExposureFloorMaxBps(uint256 bound, uint256 decay) external pure returns (int256) {
+        return ArkStakeMath.queueExposureFloorMaxBps(bound, decay);
+    }
+
+    function queueFloorRelationHolds(uint256 floor, uint256 bound, uint256 decay) external pure returns (bool) {
+        return ArkStakeMath.queueFloorRelationHolds(floor, bound, decay);
+    }
+
+    function deliveredCouponBps(uint256 coupon, uint256 cost, uint256 cleared) external pure returns (uint256) {
+        return ArkStakeMath.deliveredCouponBps(coupon, cost, cleared);
+    }
+
+    function discountCapBps(uint256 tailFloor, uint256 couponAtExactCover) external pure returns (uint256) {
+        return ArkStakeMath.discountCapBps(tailFloor, couponAtExactCover);
+    }
+
+    function admittedDiscountBps(
+        uint256 move,
+        uint256 first,
+        uint256 step,
+        uint256 reserveFloor,
+        uint256 tailFloor,
+        uint256 couponAtExactCover,
+        uint256 failures
+    ) external pure returns (uint256) {
+        return ArkStakeMath.admittedDiscountBps(move, first, step, reserveFloor, tailFloor, couponAtExactCover, failures);
+    }
+
+    function offeringBatchThresholdUnits(uint256 multiple, uint256 claimCostGwei, uint256 unitScale)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.offeringBatchThresholdUnits(multiple, claimCostGwei, unitScale);
+    }
+
+    function reserveLadderEpochs(uint256 reserveFloor, uint256 move, uint256 step) external pure returns (uint256) {
+        return ArkStakeMath.reserveLadderEpochs(reserveFloor, move, step);
+    }
+
+    function unsoldRetention(uint256 unsold, uint256 offered, uint256 unsoldEpochs)
+        external
+        pure
+        returns (uint256, uint256)
+    {
+        return ArkStakeMath.unsoldRetention(unsold, offered, unsoldEpochs);
+    }
+
+    function trancheCoupons(uint256 pool, uint256 thickness, uint256 senior)
+        external
+        pure
+        returns (uint256, uint256, bool)
+    {
+        return ArkStakeMath.trancheCoupons(pool, thickness, senior);
+    }
+
+    function classDraws(uint256 draw, uint256 pool, uint256 thickness) external pure returns (uint256, uint256) {
+        return ArkStakeMath.classDraws(draw, pool, thickness);
+    }
+
+    function classDrawsOnPrincipal(uint256 draw, uint256 junior, uint256 senior)
+        external
+        pure
+        returns (uint256, uint256)
+    {
+        return ArkStakeMath.classDrawsOnPrincipal(draw, junior, senior);
+    }
+
+    function trigger2SeverityBps(uint256 floor, bool measured, uint256 loss, uint256 ceiling)
+        external
+        pure
+        returns (bool, uint256)
+    {
+        return ArkStakeMath.trigger2SeverityBps(floor, measured, loss, ceiling);
+    }
+
+    function measuredSeverityCeilingBps(uint256 move, uint256 epochs) external pure returns (uint256) {
+        return ArkStakeMath.measuredSeverityCeilingBps(move, epochs);
+    }
+
+    function trigger2DrawTotalBps(uint256 floor, bool measured, uint256 severity) external pure returns (uint256) {
+        return ArkStakeMath.trigger2DrawTotalBps(floor, measured, severity);
+    }
+
+    function trigger2HeldBps(uint256 floor, bool measured) external pure returns (uint256) {
+        return ArkStakeMath.trigger2HeldBps(floor, measured);
+    }
+
+    function recoveryAllocation(uint256 recovered, uint256 paid) external pure returns (uint256, uint256) {
+        return ArkStakeMath.recoveryAllocation(recovered, paid);
+    }
+
+    function classRecovery(uint256 bondRecovery, uint256 drawJunior, uint256 drawSenior)
+        external
+        pure
+        returns (uint256, uint256)
+    {
+        return ArkStakeMath.classRecovery(bondRecovery, drawJunior, drawSenior);
+    }
+
+    function censorshipDilutionBps(uint256 anchored, uint256 transit) external pure returns (uint256) {
+        return ArkStakeMath.censorshipDilutionBps(anchored, transit);
+    }
+
+    function trigger2Share(uint256 pool, uint256 base, uint256 principal) external pure returns (uint256) {
+        return ArkStakeMath.trigger2Share(pool, base, principal);
+    }
+
+    /* Trigger 2 on the vested obligation (papers sync 5, phase C3b). */
+
+    function trigger2VestedWeight(uint256 notional, uint256 vesting) external pure returns (uint256) {
+        return ArkStakeMath.trigger2VestedWeight(notional, vesting);
+    }
+
+    function trigger2Obligation(uint256 w) external pure returns (uint256) {
+        return ArkStakeMath.trigger2Obligation(w);
+    }
+
+    function trigger2CapUnits(uint256 principal, uint256 attachment) external pure returns (uint256) {
+        return ArkStakeMath.trigger2CapUnits(principal, attachment);
+    }
+
+    function trigger2FullSettlement(uint256 w, uint256 pool, uint256 price, uint256 cap) external pure returns (uint256) {
+        return ArkStakeMath.trigger2FullSettlement(w, pool, price, cap);
+    }
+
+    /// The model's five-argument form: D of the S_full these four fix.
+    function trigger2PoolDraw(uint256 w, uint256 d, uint256 pool, uint256 price, uint256 cap)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.trigger2PoolDraw(ArkStakeMath.trigger2FullSettlement(w, pool, price, cap), d);
+    }
+
+    function trigger2HeldPrincipal(uint256 w, uint256 d0, uint256 pool, uint256 price, uint256 cap)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.trigger2HeldPrincipal(ArkStakeMath.trigger2FullSettlement(w, pool, price, cap), d0);
+    }
+
+    function heldFreezeOfHolding(uint256 holding, uint256 classPrincipal, uint256 held) external pure returns (uint256) {
+        return ArkStakeMath.heldFreezeOfHolding(holding, classPrincipal, held);
+    }
+
+    function trigger2Entitlement(uint256 draw, uint256 w, uint256 weight) external pure returns (uint256) {
+        return ArkStakeMath.trigger2Entitlement(draw, w, weight);
+    }
+
+    function trigger2BalanceEntitlement(uint256 floorDraw, uint256 totalDraw, uint256 w, uint256 weight)
+        external
+        pure
+        returns (uint256)
+    {
+        return ArkStakeMath.trigger2BalanceEntitlement(floorDraw, totalDraw, w, weight);
+    }
+
+    function trigger2EscrowDraws(uint256 junior, uint256 senior, uint256 escrowWeight, uint256 w)
+        external
+        pure
+        returns (uint256, uint256)
+    {
+        return ArkStakeMath.trigger2EscrowDraws(junior, senior, escrowWeight, w);
+    }
+
+    function measuredLossBps(uint256 pre, uint256 post) external pure returns (bool, uint256) {
+        return ArkStakeMath.measuredLossBps(pre, post);
+    }
+
+    function holdDeterminationOpen(uint256 windowEpochs, uint256 since, bool resumed) external pure returns (bool) {
+        return ArkStakeMath.holdDeterminationOpen(windowEpochs, since, resumed);
+    }
+
+    function queueExposureBps(uint256 decay, uint256 floor, uint256 age) external pure returns (uint256) {
+        return ArkStakeMath.queueExposureBps(decay, floor, age);
+    }
+
+    function queuedAtExposure(uint256 principal, uint256 exposure) external pure returns (uint256) {
+        return ArkStakeMath.queuedAtExposure(principal, exposure);
+    }
+
+    function censorshipDrawBps(uint256 trigger2FloorBps) external pure returns (uint256) {
+        return ArkStakeMath.censorshipDrawBps(trigger2FloorBps);
+    }
+
+    function verdictBound(uint256 majorityStake, uint256 slash, uint256 coverBps) external pure returns (uint256) {
+        return ArkStakeMath.verdictBound(majorityStake, slash, coverBps);
+    }
+
+    function bribeCostFloor(uint256 claim, uint256 coverBps) external pure returns (uint256) {
+        return ArkStakeMath.bribeCostFloor(claim, coverBps);
+    }
+
+    function determinationsFor(uint256 claim, uint256 bound) external pure returns (uint256) {
+        return ArkStakeMath.determinationsFor(claim, bound);
+    }
+
+    function findingSlices(uint256 value, uint256 seat, uint256 slash, uint256 coverBps) external pure returns (uint256) {
+        return ArkStakeMath.findingSlices(value, seat, slash, coverBps);
+    }
+
+    function courtCaseCapacity(uint256 poolStake, uint256 seat) external pure returns (uint256) {
+        return ArkStakeMath.courtCaseCapacity(poolStake, seat);
+    }
+
+    function lossFindingValue(uint256 loss, uint256 limit) external pure returns (uint256) {
+        return ArkStakeMath.lossFindingValue(loss, limit);
+    }
+
+    function findingValueMax(uint256 d0, uint256 limit, uint256 censorshipRequirement) external pure returns (uint256) {
+        return ArkStakeMath.findingValueMax(d0, limit, censorshipRequirement);
+    }
+
+    function indexedMinimumJurorStake(uint256 floor, uint256 vMax, uint256 opened) external pure returns (uint256) {
+        return ArkStakeMath.indexedMinimumJurorStake(floor, vMax, opened);
+    }
+
+    function bufferBelowRampThreshold(uint256 threshold, uint256 buffer, uint256 required) external pure returns (bool) {
+        return ArkStakeMath.bufferBelowRampThreshold(threshold, buffer, required);
+    }
+
+    function operationsSplit(uint256 ops, uint256 juror) external pure returns (uint256, uint256) {
+        return ArkStakeMath.operationsSplit(ops, juror);
+    }
+
+    /* The shared clock, so the suite can assert the bound of whitepaper §6.3. */
+
+    function epochLength() external pure returns (uint64) {
+        return ArkEpoch.EPOCH_LENGTH;
+    }
+
+    function couponCliff() external pure returns (uint64) {
+        return ArkEpoch.COUPON_CLIFF;
+    }
+
+    function epochOf(uint256 timestamp) external pure returns (uint256) {
+        return ArkEpoch.epochOf(timestamp);
+    }
+
+    function currentEpoch() external view returns (uint256) {
+        return ArkEpoch.current();
+    }
+
+    function startOf(uint256 epoch) external pure returns (uint256) {
+        return ArkEpoch.startOf(epoch);
+    }
+}
+
+/**
+ * A sender on an IArkFlow lane, as the Quantum Ark Treasury and Qurrl's
+ * revenue splitter send (`ArkFlowSend.push`): clamped to the receiver's room,
+ * never reverting for the receiver's reasons, keeping whatever was not sent.
+ * Test-only; the Cushion's suite drives the bond's lane through it.
+ */
+contract MockFlowSender {
+    event Pushed(uint256 sent);
+
+    function push(address receiver, bytes32 lane, bytes32 ref) external payable returns (uint256 sent) {
+        sent = ArkFlowSend.push(receiver, lane, ref, msg.value);
+        emit Pushed(sent);
+    }
+
+    receive() external payable {}
+}

@@ -1,0 +1,24 @@
+{
+  "name": "ethereum",
+  "chainId": 1,
+  "evmVersion": "shanghai",
+  "qrlOwnerLength": 64,
+  "finality": "finalized",
+  "confirmations": 12,
+  "deliveryMarginSeconds": 900,
+  "deployedFromBlock": 0,
+  "assets": [
+    {
+      "symbol": "stETH",
+      "address": "0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84",
+      "rebasing": true,
+      "correlationGroup": "group:lido-like",
+      "exitBoundBps": 2500,
+      "escrow": null
+    }
+  ],
+  "addresses": {
+    "relay": null,
+    "operationsDestination": null
+  }
+}

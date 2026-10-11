@@ -1,0 +1,470 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/token/ERC20/IERC20.hyp";
+import "./lib/openzeppelin/security/ReentrancyGuard.hyp";
+
+import "./interfaces/IStakingVault.hyp";
+import "./interfaces/IVeArk.hyp";
+import "./interfaces/IArkTiers.hyp";
+import "./utils/QuantumErrors.hyp";
+
+/**
+ * Tier-scoped underwriting and jury stake.
+ *
+ * See IStakingVault for the rule this contract exists to enforce: jurors for a
+ * tier are drawn only from that tier's pool, so the deciders are the people
+ * slashed by a wrong decision.
+ *
+ * SHARES, NOT BALANCES — BECAUSE OF SLASHING
+ * ------------------------------------------
+ * Delegators hold SHARES of an operator's pool, not ARK balances. Slashing then
+ * costs one storage write: the pool's `totalStake` falls and every share is
+ * worth proportionally less, immediately and exactly. The balance alternative
+ * would have to walk the delegator list, whose gas cost is unbounded and which
+ * therefore stops working at exactly the moment a big operator misbehaves.
+ *
+ * REWARDS ARE EXACT, NOT APPROXIMATE
+ * ----------------------------------
+ * QRL rewards arrive per tier, and splitting them across operators without
+ * iterating is the usual trap. The trick used here is a two-level index:
+ *
+ *   1. `_accPerStake[tier]` rises when rewards arrive.
+ *   2. An operator's share is `totalStake * (accPerStake - operatorIndex)`.
+ *
+ * Step 2 is exact ONLY IF `totalStake` did not move while that gap accrued — so
+ * `_syncOperator` is called before every single change to an operator's stake:
+ * stake, unbond and slash alike. That makes the invariant "an operator's stake
+ * is constant between syncs" true by construction, and the arithmetic exact
+ * rather than merely close.
+ *
+ * REWARDS THAT ARRIVE FOR AN EMPTY TIER
+ * -------------------------------------
+ * They are held in `_unallocated[tier]` and folded into the next distribution,
+ * not reverted and not stranded. Reverting would make premium collection fail
+ * for a tier that has no underwriters yet, which is precisely the bootstrap
+ * state the protocol starts in.
+ */
+contract StakingVault is IStakingVault, ReentrancyGuard {
+    /// Fixed unbonding delay. Longer than a 7-day challenge plus three appeal rounds.
+    uint64 public constant UNBONDING_PERIOD = 21 days;
+
+    /// Largest share of a tier's jury weight any single address may hold, in bps.
+    uint16 public constant MAX_JUROR_SHARE_BPS = 1000;
+
+    /// Ceiling on an operator's commission, in bps.
+    uint16 public constant MAX_COMMISSION_BPS = 3000;
+
+    uint256 private constant ACC = 1e18;
+    uint16 private constant BPS = 10000;
+
+    IERC20 public immutable ark;
+    IVeArk public immutable veArk;
+
+    /// Set once at deployment; the only address permitted to slash.
+    address public disputeCourt;
+    address private immutable _deployer;
+
+    struct Operator {
+        IArkTiers.InsuranceTier tier;
+        uint16 commissionBps;
+        bool registered;
+        uint256 totalStake;
+        uint256 totalShares;
+        uint256 index;
+        uint256 accRewardPerShare;
+        uint256 commissionOwed;
+    }
+
+    /**
+     * A delegator's position.
+     *
+     * `exitingShares` are shares whose 21-day clock is running. They are still
+     * counted in the operator's pool, so they are STILL SLASHABLE and still
+     * earn — they are merely excluded from jury draws.
+     */
+    struct Position {
+        address operator;
+        uint256 shares;
+        uint256 exitingShares;
+        uint256 rewardDebt;
+        uint64 unbondingEnd;
+    }
+
+    mapping(address => Operator) private _operators;
+    mapping(address => Position) private _positions;
+    mapping(uint8 => uint256) private _tierStake;
+    mapping(uint8 => uint256) private _accPerStake;
+    mapping(uint8 => uint256) private _unallocated;
+    mapping(address => uint256) private _claimable;
+
+    constructor(address ark_, address veArk_) {
+        if (ark_ == address(0) || veArk_ == address(0)) revert ZeroAddress();
+        ark = IERC20(ark_);
+        veArk = IVeArk(veArk_);
+        _deployer = msg.sender;
+    }
+
+    /**
+     * Wires the dispute court, once.
+     *
+     * @dev Deliberately one-shot rather than an admin setter. If the slasher
+     *      could be re-pointed, whoever holds that key holds every staker's
+     *      capital, and no amount of timelock makes that acceptable.
+     */
+    function setDisputeCourt(address court) external {
+        if (msg.sender != _deployer) revert OnlyDisputeCourt(msg.sender);
+        if (court == address(0)) revert ZeroAddress();
+        if (disputeCourt != address(0)) revert OnlyDisputeCourt(msg.sender);
+        disputeCourt = court;
+    }
+
+    function registerOperator(IArkTiers.InsuranceTier tier, uint16 commissionBps) external {
+        if (commissionBps > MAX_COMMISSION_BPS) {
+            revert CommissionOutOfRange(commissionBps, MAX_COMMISSION_BPS);
+        }
+        Operator storage op = _operators[msg.sender];
+        if (op.registered) {
+            // Commission may be lowered but never raised: delegators picked an
+            // operator partly on price, and a raise would be a retroactive fee
+            // on capital that is locked for 21 days and cannot leave in time.
+            if (commissionBps > op.commissionBps) {
+                revert CommissionOutOfRange(commissionBps, op.commissionBps);
+            }
+            op.commissionBps = commissionBps;
+        } else {
+            op.registered = true;
+            op.tier = tier;
+            op.commissionBps = commissionBps;
+            op.index = _accPerStake[uint8(tier)];
+        }
+        emit OperatorRegistered(msg.sender, op.tier, commissionBps);
+    }
+
+    function stake(IArkTiers.InsuranceTier tier, address operator, uint256 amount)
+        external
+        nonReentrant
+    {
+        if (amount == 0) revert ZeroValue();
+
+        Operator storage op = _operators[operator];
+        if (!op.registered || op.tier != tier) revert UnknownOperator(operator, uint8(tier));
+
+        Position storage pos = _positions[msg.sender];
+        if (pos.operator != address(0) && pos.operator != operator) {
+            revert UnknownOperator(operator, uint8(tier));
+        }
+
+        _syncOperator(operator);
+        _settle(msg.sender);
+
+        uint256 shares =
+            op.totalShares == 0 ? amount : (amount * op.totalShares) / op.totalStake;
+
+        op.totalStake += amount;
+        op.totalShares += shares;
+        _tierStake[uint8(op.tier)] += amount;
+
+        pos.operator = operator;
+        pos.shares += shares;
+        pos.rewardDebt = ((pos.shares + pos.exitingShares) * op.accRewardPerShare) / ACC;
+
+        if (!ark.transferFrom(msg.sender, address(this), amount)) {
+            revert TransferFailed(address(this), amount);
+        }
+
+        emit Staked(msg.sender, operator, op.tier, amount);
+    }
+
+    /**
+     * Starts the unbonding clock. Jury weight is removed immediately; the stake
+     * itself is NOT.
+     *
+     * @dev The shares stay in the operator's pool for the full 21 days, so a
+     *      slash landing in that window still cuts them. Removing the stake here
+     *      instead would hand every staker a free escape: watch for a dispute,
+     *      unbond, and be immune before the verdict — which is exactly what the
+     *      unbonding period exists to prevent. What the delegator loses at once
+     *      is only the right to be drawn as a juror.
+     *
+     *      One request at a time. A queue would let a staker slice an exit into
+     *      pieces timed around a dispute they can already see coming.
+     */
+    function beginUnbonding(uint256 amount) external nonReentrant {
+        Position storage pos = _positions[msg.sender];
+        if (pos.operator == address(0) || pos.shares == 0) revert NotUnbonding(msg.sender);
+        if (pos.exitingShares != 0) revert StillUnbonding(pos.unbondingEnd, uint64(block.timestamp));
+
+        Operator storage op = _operators[pos.operator];
+        _syncOperator(pos.operator);
+        _settle(msg.sender);
+
+        uint256 shares = (amount * op.totalShares) / op.totalStake;
+        if (shares == 0 || shares > pos.shares) revert SlashExceedsStake(pos.shares, shares);
+
+        pos.shares -= shares;
+        pos.exitingShares = shares;
+        pos.unbondingEnd = uint64(block.timestamp) + UNBONDING_PERIOD;
+
+        emit UnbondingStarted(msg.sender, amount, pos.unbondingEnd);
+    }
+
+    /**
+     * Withdraws stake whose 21 days have elapsed.
+     *
+     * @dev The amount is priced at the CURRENT share value, so a slash during
+     *      the unbonding window reduces what comes out. That is the whole point:
+     *      the exit is delayed precisely so it can still be charged for what
+     *      happened before it.
+     */
+    function withdraw() external nonReentrant {
+        Position storage pos = _positions[msg.sender];
+        if (pos.exitingShares == 0) revert NotUnbonding(msg.sender);
+        if (uint64(block.timestamp) < pos.unbondingEnd) {
+            revert StillUnbonding(pos.unbondingEnd, uint64(block.timestamp));
+        }
+
+        Operator storage op = _operators[pos.operator];
+        _syncOperator(pos.operator);
+        _settle(msg.sender);
+
+        uint256 shares = pos.exitingShares;
+        uint256 amount = (shares * op.totalStake) / op.totalShares;
+
+        pos.exitingShares = 0;
+        pos.unbondingEnd = 0;
+        op.totalShares -= shares;
+        op.totalStake -= amount;
+        _tierStake[uint8(op.tier)] -= amount;
+
+        pos.rewardDebt = (pos.shares * op.accRewardPerShare) / ACC;
+        if (pos.shares == 0) pos.operator = address(0);
+
+        if (!ark.transfer(msg.sender, amount)) revert TransferFailed(msg.sender, amount);
+
+        emit Withdrawn(msg.sender, amount);
+    }
+
+    /**
+     * Moves stake to another operator in the same tier without unbonding.
+     *
+     * @dev Same tier only. Crossing tiers this way would let a delegator dodge a
+     *      slash by hopping out of the tier whose dispute is running, which is
+     *      the same exploit the unbonding period exists to close.
+     */
+    function redelegate(address newOperator) external nonReentrant {
+        Position storage pos = _positions[msg.sender];
+        if (pos.operator == address(0) || pos.shares == 0) revert NotUnbonding(msg.sender);
+        // A position points at one operator. Moving while shares are exiting
+        // would strand those shares in the old pool with no way to name them.
+        if (pos.exitingShares != 0) revert StillUnbonding(pos.unbondingEnd, uint64(block.timestamp));
+
+        Operator storage from = _operators[pos.operator];
+        Operator storage to = _operators[newOperator];
+        if (!to.registered || to.tier != from.tier) {
+            revert UnknownOperator(newOperator, uint8(from.tier));
+        }
+
+        _syncOperator(pos.operator);
+        _syncOperator(newOperator);
+        _settle(msg.sender);
+
+        uint256 amount = (pos.shares * from.totalStake) / from.totalShares;
+        from.totalStake -= amount;
+        from.totalShares -= pos.shares;
+
+        uint256 shares = to.totalShares == 0 ? amount : (amount * to.totalShares) / to.totalStake;
+        to.totalStake += amount;
+        to.totalShares += shares;
+
+        pos.operator = newOperator;
+        pos.shares = shares;
+        pos.rewardDebt = (shares * to.accRewardPerShare) / ACC;
+
+        emit Staked(msg.sender, newOperator, to.tier, amount);
+    }
+
+    function distributeRewards(IArkTiers.InsuranceTier tier) external payable {
+        if (msg.value == 0) revert ZeroValue();
+
+        uint8 t = uint8(tier);
+        uint256 amount = msg.value + _unallocated[t];
+        uint256 staked = _tierStake[t];
+
+        if (staked == 0) {
+            _unallocated[t] = amount;
+            return;
+        }
+
+        _unallocated[t] = 0;
+        _accPerStake[t] += (amount * ACC) / staked;
+
+        emit RewardsDistributed(tier, amount);
+    }
+
+    function claimRewards() external nonReentrant returns (uint256 amount) {
+        Position storage pos = _positions[msg.sender];
+        if (pos.operator != address(0)) {
+            _syncOperator(pos.operator);
+            _settle(msg.sender);
+        }
+        // An operator's commission accrues to the same claimable balance, so a
+        // single call collects both roles.
+        Operator storage op = _operators[msg.sender];
+        if (op.registered) {
+            _syncOperator(msg.sender);
+            _claimable[msg.sender] += op.commissionOwed;
+            op.commissionOwed = 0;
+        }
+
+        amount = _claimable[msg.sender];
+        if (amount == 0) return 0;
+        _claimable[msg.sender] = 0;
+
+        (bool ok,) = msg.sender.call{value: amount}("");
+        if (!ok) revert TransferFailed(msg.sender, amount);
+    }
+
+    function slash(address operator, uint256 amount, bytes32 caseId) external {
+        if (msg.sender != disputeCourt) revert OnlyDisputeCourt(msg.sender);
+
+        Operator storage op = _operators[operator];
+        if (!op.registered) revert UnknownOperator(operator, 0);
+        if (amount > op.totalStake) revert SlashExceedsStake(op.totalStake, amount);
+
+        _syncOperator(operator);
+
+        // Shares are untouched: cutting `totalStake` alone reprices every share
+        // in the pool at once, which is exactly the pro-rata outcome delegators
+        // were told to expect.
+        op.totalStake -= amount;
+        _tierStake[uint8(op.tier)] -= amount;
+
+        if (!ark.transfer(disputeCourt, amount)) revert TransferFailed(disputeCourt, amount);
+
+        emit Slashed(operator, op.tier, amount, caseId);
+    }
+
+    function totalStaked(IArkTiers.InsuranceTier tier) public view returns (uint256) {
+        return _tierStake[uint8(tier)];
+    }
+
+    function delegationOf(address delegator) external view returns (Delegation memory) {
+        Position storage pos = _positions[delegator];
+        Operator storage op = _operators[pos.operator];
+        return Delegation({
+            amount: stakeValueOf(delegator) + exitingValueOf(delegator),
+            operator: pos.operator,
+            tier: op.tier,
+            unbondingEnd: pos.unbondingEnd
+        });
+    }
+
+    /**
+     * The ARK a delegator's ACTIVE shares are currently worth, after slashing.
+     *
+     * @dev Excludes shares that are unbonding: those still back the pool and can
+     *      still be slashed, but they no longer confer jury weight.
+     */
+    function stakeValueOf(address delegator) public view returns (uint256) {
+        return _valueOf(delegator, _positions[delegator].shares);
+    }
+
+    /// @notice The ARK still exposed to slashing while the 21-day clock runs.
+    function exitingValueOf(address delegator) public view returns (uint256) {
+        return _valueOf(delegator, _positions[delegator].exitingShares);
+    }
+
+    function _valueOf(address delegator, uint256 shares) private view returns (uint256) {
+        Position storage pos = _positions[delegator];
+        if (pos.operator == address(0) || shares == 0) return 0;
+        Operator storage op = _operators[pos.operator];
+        if (op.totalShares == 0) return 0;
+        return (shares * op.totalStake) / op.totalShares;
+    }
+
+    /**
+     * Jury draw weight, capped so no address can take a jury majority.
+     *
+     * @dev Two factors, both required. Tier stake supplies the skin in the game;
+     *      the veARK boost rewards a long horizon. A candidate with no stake in
+     *      this tier weighs zero no matter how much veARK they hold — they would
+     *      lose nothing if the verdict were wrong.
+     */
+    function drawWeight(address candidate, IArkTiers.InsuranceTier tier)
+        external
+        view
+        returns (uint256)
+    {
+        Position storage pos = _positions[candidate];
+        if (pos.operator == address(0)) return 0;
+
+        Operator storage op = _operators[pos.operator];
+        if (op.tier != tier) return 0;
+
+        uint256 base = stakeValueOf(candidate);
+        if (base == 0) return 0;
+
+        // The veARK term is a BONUS ON TOP OF STAKE, capped at the stake itself,
+        // so a long lock is worth at most a doubling. Letting it scale freely
+        // would let someone with a large lock and a token stake dominate a tier
+        // they have almost nothing at risk in — the opposite of invariant #2.
+        uint256 bonus = veArk.juryWeightOf(candidate) / 4;
+        if (bonus > base) bonus = base;
+        uint256 weight = base + bonus;
+
+        uint256 cap = (_tierStake[uint8(tier)] * MAX_JUROR_SHARE_BPS) / BPS;
+        return weight > cap ? cap : weight;
+    }
+
+    /// @param operator The operator being queried.
+    /// @return tier Tier served. @return totalStake ARK backing it. @return commissionBps Fee.
+    function operatorOf(address operator)
+        external
+        view
+        returns (IArkTiers.InsuranceTier tier, uint256 totalStake, uint16 commissionBps)
+    {
+        Operator storage op = _operators[operator];
+        return (op.tier, op.totalStake, op.commissionBps);
+    }
+
+    /// @notice QRL currently claimable by an account, across both of its roles.
+    function claimableOf(address account) external view returns (uint256) {
+        return _claimable[account];
+    }
+
+    /**
+     * Pulls an operator's accrued share of tier rewards.
+     *
+     * @dev MUST run before any change to `op.totalStake`. That precondition is
+     *      what makes the multiplication exact rather than an approximation.
+     */
+    function _syncOperator(address operator) private {
+        Operator storage op = _operators[operator];
+        uint256 acc = _accPerStake[uint8(op.tier)];
+        if (acc == op.index) return;
+
+        if (op.totalStake > 0) {
+            uint256 owed = (op.totalStake * (acc - op.index)) / ACC;
+            uint256 commission = (owed * op.commissionBps) / BPS;
+            op.commissionOwed += commission;
+            if (op.totalShares > 0) {
+                op.accRewardPerShare += ((owed - commission) * ACC) / op.totalShares;
+            }
+        }
+        op.index = acc;
+    }
+
+    /// Credits a delegator's accrued rewards and re-bases their debt.
+    function _settle(address delegator) private {
+        Position storage pos = _positions[delegator];
+        if (pos.operator == address(0)) return;
+
+        // Exiting shares keep earning: they are still slashable, so they are
+        // still at risk, and stake at risk is stake that is paid for.
+        Operator storage op = _operators[pos.operator];
+        uint256 accrued = ((pos.shares + pos.exitingShares) * op.accRewardPerShare) / ACC;
+        if (accrued > pos.rewardDebt) _claimable[delegator] += accrued - pos.rewardDebt;
+        pos.rewardDebt = accrued;
+    }
+}

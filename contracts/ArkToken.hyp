@@ -1,0 +1,264 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/token/ERC20/ERC20.hyp";
+
+import "./interfaces/IArkToken.hyp";
+import "./utils/QuantumErrors.hyp";
+
+/**
+ * ARK — governance and security-bond token. Fixed supply, minted once.
+ *
+ * See IArkToken for why ARK is not the claim-paying asset and why there is no
+ * `permit`. This contract adds the two mechanics that interface promises:
+ * contributor vesting that carries no governance weight, and checkpointed
+ * voting power.
+ *
+ * VESTED WEIGHT WITHOUT A TIME ORACLE
+ * -----------------------------------
+ * Vesting advances with the clock, but a checkpoint can only be written by a
+ * transaction. Rather than pretend otherwise, voting weight is defined as the
+ * VESTED BALANCE AS OF THE LAST SYNC, and `syncVotingWeight` is permissionless
+ * so anyone can bring an account current.
+ *
+ * The error is therefore always in the same direction: an account that has just
+ * crossed its cliff holds LESS weight than it is entitled to until someone
+ * pokes it, never more. Understating weight can only make a proposal harder to
+ * pass, which is the safe direction for a protocol whose governance controls an
+ * insurance reserve.
+ *
+ * Unvested tokens are also non-transferable. Locking them in place is what
+ * makes "no voting weight" mean something: without it, a contributor could move
+ * unvested tokens to a second address and vote from there.
+ */
+contract ArkToken is ERC20, IArkToken {
+    /// Total supply, minted in the constructor and never added to.
+    // `* 10 ** 18` rather than a denomination: v2 spells it `ether`, QIP-55
+    // spells it `quanta`, and neither compiler parses the other.
+    uint256 public constant MAX_SUPPLY = 1_000_000_000 * 10 ** 18;
+
+    /// Cliff before any contributor or backer tokens vest.
+    uint64 public constant VEST_CLIFF = 365 days;
+
+    /// Total vesting duration, measured from `vestStart`.
+    uint64 public constant VEST_DURATION = 4 * 365 days;
+
+    /**
+     * A linear vesting schedule with a cliff.
+     *
+     * `total` is the portion of the holder's balance that started locked. It
+     * never changes: releasing is implicit in the passage of time, so there is
+     * no `released` counter to keep in sync with transfers.
+     */
+    struct Vesting {
+        uint256 total;
+        uint64 start;
+    }
+
+    /// Checkpointed voting weight. `fromBlock` fits uint32 for the life of any chain we care about.
+    struct Checkpoint {
+        uint32 fromBlock;
+        uint224 votes;
+    }
+
+    mapping(address => Vesting) private _vesting;
+    mapping(address => address) private _delegates;
+    mapping(address => Checkpoint[]) private _checkpoints;
+    Checkpoint[] private _totalCheckpoints;
+
+    /// Last synced vested balance per account, and the source of all delegated weight.
+    mapping(address => uint256) private _units;
+
+    /**
+     * Mints the whole supply across the six allocation buckets.
+     *
+     * Proportions are fixed here rather than passed in: they are the tokenomics,
+     * and a constructor argument would let a redeploy quietly change them.
+     *
+     * @param incentives Staking and community rewards vault (35%).
+     * @param treasury DAO treasury (20%), which also funds the RepScore discount budget.
+     * @param contributors Contributor allocation (18%), vesting 4 years with a 1-year cliff.
+     * @param backers Early backer allocation (12%), same schedule.
+     * @param backstop Insurance backstop reserve (10%), auctionable only by vote.
+     * @param liquidity Liquidity allocation (5%).
+     * @param vestStart Timestamp the contributor and backer schedules run from.
+     */
+    constructor(
+        address incentives,
+        address treasury,
+        address contributors,
+        address backers,
+        address backstop,
+        address liquidity,
+        uint64 vestStart
+    ) ERC20("Quantum Ark", "ARK") {
+        if (
+            incentives == address(0) || treasury == address(0) || contributors == address(0)
+                || backers == address(0) || backstop == address(0) || liquidity == address(0)
+        ) revert ZeroAddress();
+        if (vestStart == 0) revert ZeroValue();
+
+        // Schedules MUST be written before minting. `_afterTokenTransfer` syncs
+        // voting units on every mint, and with no schedule in place yet it would
+        // record the whole contributor allocation as vested — handing the team
+        // full governance weight on day one, which is the exact outcome the
+        // vesting rule exists to prevent.
+        _vesting[contributors] = Vesting({total: (MAX_SUPPLY * 1800) / 10000, start: vestStart});
+        _vesting[backers] = Vesting({total: (MAX_SUPPLY * 1200) / 10000, start: vestStart});
+
+        _mint(incentives, (MAX_SUPPLY * 3500) / 10000);
+        _mint(treasury, (MAX_SUPPLY * 2000) / 10000);
+        _mint(contributors, (MAX_SUPPLY * 1800) / 10000);
+        _mint(backers, (MAX_SUPPLY * 1200) / 10000);
+        _mint(backstop, (MAX_SUPPLY * 1000) / 10000);
+        _mint(liquidity, (MAX_SUPPLY * 500) / 10000);
+    }
+
+    function vestedBalanceOf(address account) public view returns (uint256) {
+        uint256 balance = balanceOf(account);
+        uint256 locked = lockedOf(account);
+        return balance > locked ? balance - locked : 0;
+    }
+
+    /**
+     * The still-locked portion of an account's allocation.
+     *
+     * @dev Zero before a schedule exists, the full amount before the cliff, then
+     *      unwinding linearly to zero at `start + VEST_DURATION`.
+     */
+    function lockedOf(address account) public view returns (uint256) {
+        Vesting storage v = _vesting[account];
+        if (v.total == 0) return 0;
+
+        uint64 nowTs = uint64(block.timestamp);
+        if (nowTs < v.start + VEST_CLIFF) return v.total;
+        if (nowTs >= v.start + VEST_DURATION) return 0;
+
+        uint256 elapsed = nowTs - v.start;
+        uint256 vested = (v.total * elapsed) / VEST_DURATION;
+        return v.total - vested;
+    }
+
+    function delegate(address delegatee) external {
+        address current = _delegates[msg.sender];
+        _delegates[msg.sender] = delegatee;
+        emit DelegateChanged(msg.sender, current, delegatee);
+
+        uint256 units = _units[msg.sender];
+        _moveVotes(current, delegatee, units);
+    }
+
+    /**
+     * Brings an account's voting weight up to date with its vested balance.
+     *
+     * @dev Permissionless on purpose. Newly vested weight is inert until this is
+     *      called, so leaving it to the holder alone would let a forgetful
+     *      delegate silently under-represent their delegators.
+     * @param account The holder to refresh.
+     */
+    function syncVotingWeight(address account) public {
+        uint256 previous = _units[account];
+        uint256 current = vestedBalanceOf(account);
+        if (previous == current) return;
+
+        _units[account] = current;
+
+        address to = _delegates[account];
+        if (to == address(0)) return;
+
+        if (current > previous) {
+            _pushVotes(to, getVotes(to) + (current - previous));
+            _push(_totalCheckpoints, _latest(_totalCheckpoints) + (current - previous));
+        } else {
+            _pushVotes(to, getVotes(to) - (previous - current));
+            _push(_totalCheckpoints, _latest(_totalCheckpoints) - (previous - current));
+        }
+    }
+
+    function delegates(address account) external view returns (address) {
+        return _delegates[account];
+    }
+
+    function getVotes(address account) public view returns (uint256) {
+        return _latest(_checkpoints[account]);
+    }
+
+    function getPastVotes(address account, uint256 blockNumber) external view returns (uint256) {
+        if (blockNumber >= block.number) revert FutureLookup(blockNumber, block.number);
+        return _lookup(_checkpoints[account], blockNumber);
+    }
+
+    function getPastTotalSupply(uint256 blockNumber) external view returns (uint256) {
+        if (blockNumber >= block.number) revert FutureLookup(blockNumber, block.number);
+        return _lookup(_totalCheckpoints, blockNumber);
+    }
+
+    /**
+     * Blocks any transfer that would dip into locked tokens, then re-syncs both
+     * sides.
+     *
+     * @dev Mints skip the lock check: the constructor is the only minter, and it
+     *      writes the schedule after minting.
+     */
+    function _afterTokenTransfer(address from, address to, uint256) internal override {
+        if (from != address(0)) {
+            uint256 locked = lockedOf(from);
+            if (locked > 0 && balanceOf(from) < locked) {
+                revert VotingWeightNotVested(from, locked - balanceOf(from));
+            }
+            syncVotingWeight(from);
+        }
+        if (to != address(0)) syncVotingWeight(to);
+    }
+
+    function _moveVotes(address from, address to, uint256 amount) private {
+        if (from == to || amount == 0) return;
+        if (from != address(0)) {
+            _pushVotes(from, getVotes(from) - amount);
+        }
+        if (to != address(0)) {
+            _pushVotes(to, getVotes(to) + amount);
+        }
+        // Total tracks weight that is actually delegated, so it moves only when
+        // weight enters or leaves the delegated set, not when it changes hands.
+        if (from == address(0)) {
+            _push(_totalCheckpoints, _latest(_totalCheckpoints) + amount);
+        } else if (to == address(0)) {
+            _push(_totalCheckpoints, _latest(_totalCheckpoints) - amount);
+        }
+    }
+
+    /// Writes a delegate's checkpoint and reports the change against that delegate.
+    function _pushVotes(address delegatee, uint256 votes) private {
+        uint256 previous = _latest(_checkpoints[delegatee]);
+        _push(_checkpoints[delegatee], votes);
+        emit DelegateVotesChanged(delegatee, previous, votes);
+    }
+
+    /// Appends to a checkpoint array, collapsing repeated writes in one block.
+    function _push(Checkpoint[] storage ckpts, uint256 votes) private {
+        uint256 len = ckpts.length;
+        if (len > 0 && ckpts[len - 1].fromBlock == uint32(block.number)) {
+            ckpts[len - 1].votes = uint224(votes);
+        } else {
+            ckpts.push(Checkpoint({fromBlock: uint32(block.number), votes: uint224(votes)}));
+        }
+    }
+
+    function _latest(Checkpoint[] storage ckpts) private view returns (uint256) {
+        uint256 len = ckpts.length;
+        return len == 0 ? 0 : ckpts[len - 1].votes;
+    }
+
+    /// Binary search for the last checkpoint at or before `blockNumber`.
+    function _lookup(Checkpoint[] storage ckpts, uint256 blockNumber) private view returns (uint256) {
+        uint256 high = ckpts.length;
+        uint256 low = 0;
+        while (low < high) {
+            uint256 mid = (low + high) / 2;
+            if (ckpts[mid].fromBlock > blockNumber) high = mid;
+            else low = mid + 1;
+        }
+        return low == 0 ? 0 : ckpts[low - 1].votes;
+    }
+}

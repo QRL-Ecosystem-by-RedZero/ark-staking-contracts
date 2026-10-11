@@ -1,0 +1,74 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * Deploys a contract whose creation code is too large to send in one transaction.
+ *
+ * The one rule this contract exists to enforce: **the code it creates is exactly
+ * the code whose hash the owner named, and nobody but the account that created
+ * this contract can add to an upload, create from it, or clear it** — so
+ * splitting a deployment across several transactions opens no window in which
+ * somebody else's bytes are created, and nobody else can advance this
+ * contract's CREATE nonce and shift the address of the next contract a
+ * deployment expects (audit D19, 2026-09-29).
+ *
+ * WHY IT EXISTS
+ * -------------
+ * The public QRL RPC proxy caps a request body at 50KB, and an ML-DSA-87 signature
+ * with its public key adds about 7.2KB to every transaction, on top of hex encoding
+ * doubling the payload. Creation code above roughly 18,000 bytes therefore cannot
+ * be sent in one request (CLAUDE.md §3.1). The limit is on the REQUEST, not on the
+ * chain: EIP-3860 admits initcode to 49,152 bytes, so the code can be assembled on
+ * chain from pieces that each fit, and created from there.
+ *
+ * WHAT A CONTRACT DEPLOYED THROUGH IT MUST NOT DO
+ * -----------------------------------------------
+ * The created contract's constructor sees THIS contract as `msg.sender`. A contract
+ * that took `msg.sender` as the account allowed to wire it would hand that
+ * authority to a contract that can make no call on its behalf — the right would
+ * be lost, not stolen. Every contract deployed through here therefore takes its
+ * wiring authority as a constructor argument, which the owner supplies and the
+ * code hash does not cover; the deploy scripts refuse a contract nobody has
+ * checked for this (contracts/staking `scripts/lib/chunked.js` `CHUNK_SAFE`).
+ *
+ * WHAT IT DOES NOT DO
+ * -------------------
+ * It holds no authority over anything it has created. Nothing here can call a
+ * created contract, and a created contract has no reason to trust this one.
+ */
+interface IChunkedDeployer {
+    event Appended(address indexed uploader, bytes32 indexed uploadId, uint256 index, uint256 length);
+    event Deployed(address indexed uploader, bytes32 indexed uploadId, address deployed, bytes32 codeHash);
+    event Cleared(address indexed uploader, bytes32 indexed uploadId, uint256 pieces);
+
+    /// The assembled code is not the code the uploader named.
+    error CodeHashMismatch(bytes32 expected, bytes32 actual);
+
+    /// `CREATE` returned the zero address: the constructor reverted or ran out of gas.
+    error CreateFailed();
+
+    /// Nothing has been uploaded under this id by this uploader.
+    error EmptyUpload(bytes32 uploadId);
+
+    /// Only the account that created this contract may upload, create or clear.
+    error NotOwner(address caller);
+
+    /// The account that created this contract: the only one that may use it. Immutable; there is no setter.
+    function owner() external view returns (address);
+
+    /// Add one piece of creation code to the owner's upload.
+    function append(bytes32 uploadId, bytes calldata chunk) external;
+
+    /// Discard the owner's upload under an id, so a poisoned upload can be sent again.
+    function clear(bytes32 uploadId) external;
+
+    /**
+     * Assemble the owner's upload, check it against `codeHash`, append the
+     * constructor arguments and create it (CREATE, so the address follows from
+     * this contract's nonce, which only the owner advances). The upload is
+     * cleared on success.
+     */
+    function deploy(bytes32 uploadId, bytes32 codeHash, bytes calldata constructorArgs)
+        external
+        returns (address deployed);
+}

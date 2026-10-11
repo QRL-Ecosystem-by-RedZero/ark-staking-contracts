@@ -1,0 +1,265 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * The premium swap, the QRL side (whitepaper §4.7, yellow paper §1.4 `quote`,
+ * `claim`, `refund`).
+ *
+ * Since 2026-09-28 (phase C2) a quote posts a commitment bond beside its lot
+ * (whitepaper §4.7, I33): returned with an unselected lot, returned to the
+ * solver of a lot claimed here before its QRL expiry, and otherwise forfeited
+ * to the delivered proceeds of the epoch whose premium was offered.
+ *
+ * A solver quotes a lot of an escrow's offered premium by locking native QRL
+ * under a sha256 hashlock, payable to the delivered-proceeds account and to
+ * nothing else. At the close of the quote window lots are selected in
+ * descending order of price, whole, down to the reserve and up to the quantity
+ * offered, and each selected lot is sealed on the origin chain as a premium
+ * lock. The escrow pays the lot against the preimage before `evmExpiry`; the
+ * claim there publishes the preimage, and anyone presents it here before
+ * `qrlExpiry`, which credits the lot's QRL to the epoch it was offered for.
+ */
+interface IPremiumSwap {
+    enum LotStatus {
+        None,
+        Quoted,
+        Selected,
+        Claimed,
+        Refunded,
+        /// Pushed out of a full book by a strictly better quote (audit 2026-09-29, QL-17): its QRL and bond refundable at once.
+        Evicted
+    }
+
+    /**
+     * One lot. `shares` is what the solver buys, in the shares the escrow
+     * holds; `value` the QRL locked for it, all of it proceeds once claimed;
+     * `bond` the commitment bond posted beside it (I33), zero once returned.
+     */
+    struct Lot {
+        address solver;
+        address recipient;
+        LotStatus status;
+        uint64 epoch;
+        uint64 qrlExpiry;
+        bytes32 key;
+        bytes32 hashlock;
+        uint256 shares;
+        uint256 value;
+        uint256 bond;
+    }
+
+    /**
+     * What a premium lock leaf binds beyond the chain and the asset (yellow
+     * paper §3.5): the offered epoch, the lot, the hashlock, the solver's
+     * recipient, the shares, the commitment bond and the origin-chain expiry.
+     */
+    struct LockTerms {
+        uint256 epoch;
+        bytes32 lotId;
+        bytes32 hashlock;
+        address recipient;
+        uint256 shares;
+        uint256 bond;
+        uint64 evmExpiry;
+    }
+
+    /**
+     * One escrow's offering for one epoch. `offered` and `units` are the
+     * escrow's snapshot; `available` what this offering may sell once the
+     * previous offering's selected lots and any retained quantity are taken
+     * out; `sold` what was selected; `claimed` what reached the ledger.
+     */
+    struct Offering {
+        uint256 offered;
+        uint256 units;
+        uint256 available;
+        uint256 sold;
+        uint256 claimed;
+        bool recorded;
+        bool judged;
+        bool selected;
+        /**
+         * The reserve ladder, the clearing floor, the retention period and the
+         * solver bond's two ends in force when the offering was recorded (G8):
+         * the quantity is fixed then, so the parameters that price and judge it
+         * are read then, and a vote staged during its quote window does not
+         * reach it.
+         */
+        uint16 maxEpochMoveBps;
+        uint16 reserveStepBps;
+        uint16 reserveFloorBps;
+        uint16 tailPremiumFloorBps;
+        uint16 clearingFloorBps;
+        uint16 unsoldEpochs;
+        uint16 solverBondCeilingBps;
+        uint16 solverBondFloorBps;
+        /// d_first, the first offering's rung of the ladder (EC-03, 2026-09-30), snapshotted with the rest.
+        uint16 firstReserveDiscountBps;
+        /// The origin-chain escrow whose offer this is (D10); every lock of the offering binds it.
+        address escrow;
+        /// The juror fraction's part of the quantity, from the premium share of the offered epoch (phase C3b; QL-15): what of each lot funds the court's fee pool.
+        uint16 jurorBps;
+        /**
+         * The reserve's numerator as the offering's first quote read it (audit
+         * 2026-09-29, QL-17; SWAPGOV-02; OC-SWAP-11): fixed for the window,
+         * never zero (OC-SWAP-07), and the selection compares every lot with
+         * it rather than reading the oracle again.
+         */
+        uint256 reserveNum;
+        /// One more than the epoch of the offering recorded before this one (zero: none): the offering this one judges (2026-09-30).
+        uint64 prevPlusOne;
+    }
+
+    /**
+     * The quantity an asset carries below the batching threshold (whitepaper
+     * §4.7, EC-03, PV-05, PV-13): `fromPlusOne` one more than the first epoch
+     * carried (zero: nothing carried), `last` the last epoch carried, and the
+     * units the escrow offered then; `weight` and `jurorWeight` the sum of the
+     * increments of units carried and of each weighted by its epoch's juror
+     * fraction in bps, from which the offering that opens takes the
+     * quantity-weighted fraction (the model's `offeringJurorBps`).
+     */
+    struct Carry {
+        uint64 fromPlusOne;
+        uint64 last;
+        uint256 units;
+        uint256 weight;
+        uint256 jurorWeight;
+    }
+
+    /**
+     * An offer below the batching threshold was carried into the next epoch's
+     * (whitepaper §4.7): nothing is offered, nothing fails, the reserve does
+     * not step. `carriedEpochs` the epochs its quantity holds beyond this one.
+     */
+    event OfferingCarried(bytes32 indexed key, uint256 indexed epoch, uint256 units, uint256 threshold, uint256 carriedEpochs);
+
+    /// The juror fraction of a claimed lot, sent to the court's fee pool (whitepaper §6.2).
+    event JurorFeeRouted(bytes32 indexed lotId, uint256 indexed epoch, uint256 amount);
+
+    event OfferRecorded(uint256 indexed chainId, address indexed asset, uint256 indexed epoch, uint256 shares, uint256 units);
+
+    event LotQuoted(
+        bytes32 indexed lotId,
+        bytes32 indexed key,
+        uint256 indexed epoch,
+        bytes32 hashlock,
+        address solver,
+        address recipient,
+        uint256 shares,
+        uint256 value,
+        uint256 bond
+    );
+
+    /**
+     * A lot selected at the close of its quote window. The relayer seals
+     * `premiumLockLeaf` into the next epoch root; the escrow pays the lot
+     * against it until `evmExpiry`.
+     */
+    event LotSelected(
+        bytes32 indexed lotId,
+        uint256 indexed chainId,
+        address indexed asset,
+        bytes32 hashlock,
+        address recipient,
+        uint256 shares,
+        uint64 evmExpiry,
+        bytes32 premiumLockLeaf,
+        uint256 epoch,
+        uint256 bond
+    );
+
+    /// An offering's selection ran. `failedOfferings` is the reserve ladder's count after it.
+    event OfferingSelected(bytes32 indexed key, uint256 indexed epoch, uint256 available, uint256 sold, uint256 failedOfferings, uint256 retained);
+
+    /// A full book took a strictly better quote and pushed this, its worst lot, out; its QRL and bond are refundable (QL-17).
+    event LotEvicted(bytes32 indexed lotId, bytes32 indexed byLotId);
+
+    /// The premium share of an epoch, noted in that epoch (QL-15): the juror fraction of its offering is proportioned against it.
+    event PremiumShareNoted(uint256 indexed epoch, uint256 premiumBps);
+
+    /// The QRL of a lot was credited to the delivered proceeds of its epoch.
+    event LotClaimed(bytes32 indexed lotId, bytes32 secret, address caller);
+
+    /// QRL returned to a lot's solver: the lot, its bond, or both. Whitepaper §4.7, I33.
+    event LotRefunded(bytes32 indexed lotId, uint256 value, uint256 bond);
+
+    /// The bonds of an offering's lots selected and not claimed before their QRL expiry went to its proceeds (I33).
+    event BondsForfeited(uint256 indexed epoch, uint256 amount);
+
+    /// A retirement of unsold premium recorded a shortfall carry, in QRL (I34).
+    event ShortfallCarried(bytes32 indexed key, uint256 indexed epoch, uint256 retiredShares, uint256 carry);
+
+    /// The yield of retained shares was added to an offering, to repay the carry (I34).
+    event RetainedYieldOffered(bytes32 indexed key, uint256 indexed epoch, uint256 shares);
+
+    /**
+     * A quote refused for suspended pricing, the series silent or the
+     * breaker active while no quote had fixed the offering's reserve, and the
+     * refusal recorded (yellow paper §4.6, OC-ORC-04): no lot stored, the
+     * QRL sent returned whole.
+     */
+    event QuoteRefused(bytes32 indexed key, uint256 indexed epoch, address solver);
+
+    /**
+     * An offering in whose window a quote was refused for suspended pricing,
+     * and which selected no lot, was carried whole to the next epoch: the
+     * failure count and the retention count did not advance (yellow paper
+     * §4.6). `shares` what it could have sold.
+     */
+    event OfferingSuspended(bytes32 indexed key, uint256 indexed epoch, uint256 shares);
+
+    error OfferExists(bytes32 key, uint256 epoch);
+    error BadOfferProof(uint256 epoch, bytes32 leaf);
+    error NoOffer(bytes32 key, uint256 epoch);
+    error OutsideQuoteWindow(uint256 opensAt, uint256 closesAt);
+    error OutsideSelectionWindow(uint256 opensAt, uint256 closesAt);
+    error AlreadySelected(bytes32 key, uint256 epoch);
+    error ExceedsOffer(uint256 shares, uint256 available);
+    error BelowReserve(uint256 required, uint256 supplied);
+    error BreakerActive();
+    error HashlockUsed(bytes32 hashlock);
+    error TooManyLots(uint256 max);
+    /// A solver holds at most `MAX_LOTS_PER_SOLVER` lots of one offering (QL-17).
+    error SolverLotsFull(uint256 max);
+    /// A lot below ceil(available / MAX_LOTS) that does not take the whole available quantity (D4).
+    error LotTooSmall(uint256 minimum, uint256 shares);
+    error LotExists(bytes32 lotId);
+    error NotSelected(bytes32 lotId);
+    error WrongPreimage(bytes32 hashlock);
+    error LotExpired(uint64 qrlExpiry);
+    error NotRefundable(bytes32 lotId);
+    /// The QRL sent is not the lot's value and the bond the protocol computes for it (I33).
+    error BondMismatch(uint256 required, uint256 supplied);
+    /// Forfeits of an offering are determined at its QRL expiry and not before.
+    error ForfeitsNotDue(uint256 epoch, uint256 dueAt);
+
+    function recordOffer(
+        uint256 chainId,
+        address escrow,
+        address asset,
+        uint256 epoch,
+        uint256 shares,
+        uint256 units,
+        bytes32[] calldata proof
+    ) external;
+
+    function quote(
+        uint256 chainId,
+        address asset,
+        uint256 epoch,
+        uint256 shares,
+        bytes32 hashlock,
+        address recipient,
+        uint256 lotValue
+    ) external payable returns (bytes32 lotId);
+
+    function select(uint256 chainId, address asset, uint256 epoch) external;
+
+    function claim(bytes32 lotId, bytes32 secret) external;
+
+    function refund(bytes32 lotId) external;
+
+    /// Send the ledger the bonds `epoch`'s offering forfeited. From its QRL expiry; any sender.
+    function releaseForfeits(uint256 epoch) external;
+}

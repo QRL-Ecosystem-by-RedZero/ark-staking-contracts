@@ -1,0 +1,29 @@
+{
+  "name": "hoodi",
+  "chainId": 560048,
+  "profile": "testnet",
+  "evmVersion": "shanghai",
+  "qrlOwnerLength": 20,
+  "finality": "finalized",
+  "confirmations": 64,
+  "deliveryMarginSeconds": 120,
+  "deployedFromBlock": 3659260,
+  "assets": [
+    {
+      "symbol": "stETH",
+      "address": "0x3508A952176b3c15387C97BE809eaffB1982176a",
+      "source": "lido",
+      "rebasing": true,
+      "correlationGroup": "group:lido-like",
+      "exitBoundBps": 2500,
+      "escrow": "0xA00ECC4d617763910E9fe75621086DEc2132078A",
+      "seedMinimum": "10000000000000000",
+      "admissionYieldBps": 300
+    }
+  ],
+  "addresses": {
+    "relay": "0x8bED76d83b1037139A384b7d7F99e5e2AEEa51cA",
+    "operationsDestination": "0x9306670E28165837dBA086F86c64920d2dd5cf7B"
+  },
+  "logChunkBlocks": 500
+}

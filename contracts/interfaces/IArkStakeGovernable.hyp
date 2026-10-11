@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * The shape Ark Staking's parameter set must expose to the timelock.
+ *
+ * A COPY of `contracts/core/contracts/interfaces/IArkStakeGovernable.hyp`: the
+ * two repositories do not import each other, and the timelock there decodes
+ * this exact payload. `test/ArkStakeGovernance.test.js` holds the declaration
+ * below identical to core's wherever the umbrella checkout has both.
+ *
+ * Declared here, implemented in `contracts/staking` (ArkStakeParams). The
+ * timelock decodes exactly this payload to compute a delay, so a divergence in
+ * the struct layout or the selector makes every parameter proposal unschedulable
+ * rather than silently mis-delayed.
+ *
+ * KEYS
+ * ----
+ * `key = keccak256(bytes("<ArkStakeParams.Params field name>"))`. The list the
+ * timelock knows, with its delay and step limit, is in core CLAUDE.md §7.5 and in
+ * `ArkGovTables`. A key the timelock does not know cannot be scheduled; a key the
+ * target does not know must revert there.
+ *
+ * COMPARE-AND-SWAP (design §6.2)
+ * ------------------------------
+ * Each change carries `expected`, the value the proposer saw. The target reverts
+ * unless `expected` equals the value in force, applies every change to a draft,
+ * and checks every range and relation on the draft. Two proposals queued in
+ * parallel therefore cannot silently undo each other: the second fails.
+ */
+interface IArkStakeGovernable {
+    struct ParamChange {
+        bytes32 key;
+        uint256 expected;
+        uint256 value;
+    }
+
+    /// Applies a keyed diff, compare-and-swap on each key, effective at the next epoch boundary.
+    function setParamsDiff(ParamChange[] calldata changes) external;
+
+    /// Moves the threat stage one step. Reverts unless the stage in force is `fromStage`.
+    function setThreatStage(uint8 fromStage, uint8 toStage) external;
+}

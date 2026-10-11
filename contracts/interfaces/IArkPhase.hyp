@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * The ecosystem phase, 0 to 4 (`QuantumArk-Phases.md` §2-3, adopted
+ * 2026-10-07): 0 Genesis Inventory, 1 Lattice Shift, 2 Classical Sunset,
+ * 3 Q-Day, 4 Restoration (the origin chain hardforked to post-quantum).
+ *
+ * A COPY of the interface `ArkPhase` implements in contracts/core: the two
+ * repositories do not import each other. This tree reads it only; the
+ * members below are kept code-identical to the declaration core's contract
+ * was written against (staking CLAUDE.md item 129), so an extra member core
+ * adds is never called from here. Phase 3 is read automatically while
+ * `ArkQDayOracle.declared()`; `setPhase`, `enterQDay` and `restore` are the
+ * timelock's (core).
+ */
+interface IArkPhase {
+    event PhaseScheduled(uint8 indexed fromPhase, uint8 indexed toPhase, uint256 effectiveEpoch);
+    event QDayEntered(uint8 indexed fromPhase, uint256 effectiveEpoch);
+    event Restored(bytes32 indexed evidenceHash, uint256 effectiveEpoch);
+    function phase() external view returns (uint8);
+    function phaseAt(uint256 epoch) external view returns (uint8);
+    function pendingPhase() external view returns (uint8 toPhase, uint256 effectiveEpoch); // (0,0) when none
+    function phaseEnteredEpoch() external view returns (uint256);
+    function epochLength() external view returns (uint256);
+    function qdayOracle() external view returns (address);
+    function governance() external view returns (address);
+    function setPhase(uint8 fromPhase, uint8 toPhase) external;
+    function enterQDay(uint8 fromPhase) external;
+    function restore(bytes32 evidenceHash) external;
+}

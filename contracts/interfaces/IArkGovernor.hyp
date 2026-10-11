@@ -1,0 +1,216 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * Governance: proposals, timelocks, and the bounds governance cannot cross.
+ *
+ * BOUNDS LIVE IN CODE, NOT IN A CHARTER
+ * -------------------------------------
+ * Every tunable parameter has a hard band compiled into the contract. A bound
+ * written in a charter is a promise; a bound written in code is a fact. This
+ * protocol exists to protect assets against an event whose premise is that
+ * everything else can be broken, so its own governance must be held to the same
+ * standard.
+ *
+ * Concretely: `payoutRatio` has a 1000 bps floor, so even total capture of
+ * governance cannot set indemnities to zero and sweep the reserve into the
+ * treasury. The challenge window has a 24-hour floor, so no instant-payout path
+ * can be opened.
+ *
+ * NINE THINGS NOBODY MAY DO, INCLUDING A UNANIMOUS DAO
+ * ----------------------------------------------------
+ *   1. Change `boundQrlOwner`, or the recovery set declared at bind time.
+ *   2. Void a policy that is Frozen.
+ *   3. Reduce the entitlement of a claim that has already been asserted.
+ *   4. Move reserve into the treasury while below the reserve target.
+ *   5. Shorten a challenge window retroactively.
+ *   6. Mint ARK beyond the fixed supply.
+ *   7. Accept a wallet link whose evidence postdates the pre-Q-Day snapshot.
+ *   8. Pay dividends while recovery debt is outstanding.
+ *   9. Change the wallet-recovery timelock or the circuit-breaker threshold.
+ *
+ * Each is guaranteed by the ABSENCE OF A FUNCTION, not by a modifier that a
+ * later upgrade could relax. During review, every item above must map to a
+ * function that does not exist.
+ *
+ * NO SIGNATURE VOTING
+ * -------------------
+ * Hyperion has no `ecrecover`, so `castVoteBySig` cannot exist. Every vote and
+ * every delegation is a transaction that Zond has already authenticated with
+ * ML-DSA-87. Gas costs more; in exchange there is no off-chain signature layer
+ * to phish today or to forge post-quantum tomorrow.
+ *
+ * PHASE OUT BY CONDITION, NOT BY CALENDAR
+ * ---------------------------------------
+ * Decentralisation milestones are gated on verifiable on-chain conditions —
+ * independent attester count, bonded stake per tier, disputes actually
+ * adjudicated. A calendar-driven handover would force the protocol to devolve
+ * power at a moment when nobody has yet shown up to receive it, and power would
+ * simply land in a smaller group than before.
+ */
+interface IArkGovernor {
+    /// Proposal categories, each with its own quorum, threshold and delay.
+    enum ProposalKind {
+        Parameter,
+        QipAssetListing,
+        TreasurySpend,
+        ArkReserveAuction,
+        QDayRatification,
+        AttesterSetChange,
+        /// Season configuration for the Qurrl mascot collection. Reuses the QIP
+        /// framework: only the audited question and the write target differ.
+        QurrlSeason,
+        RenounceAdmin
+    }
+
+    enum ProposalState {
+        None,
+        Pending,
+        Active,
+        Defeated,
+        Succeeded,
+        Queued,
+        Executed,
+        Cancelled,
+        Expired
+    }
+
+    /// Decentralisation phase, advanced only when its exit conditions hold.
+    enum Phase {
+        P0_SingleKey,
+        P1_MultisigTimelock,
+        P2_BondedQuorum,
+        P3_FullyDecentralised
+    }
+
+    struct Proposal {
+        bytes32 id;
+        ProposalKind kind;
+        ProposalState state;
+        address proposer;
+        uint256 snapshotBlock;
+        uint256 forVotes;
+        uint256 againstVotes;
+        uint64 voteEnd;
+        uint64 executableAt;
+        bytes32 payloadHash;
+    }
+
+    event ProposalCreated(bytes32 indexed id, ProposalKind indexed kind, address indexed proposer, uint64 voteEnd);
+    event VoteCast(bytes32 indexed id, address indexed voter, bool support, uint256 weight);
+    event ProposalQueued(bytes32 indexed id, uint64 executableAt);
+    event ProposalExecuted(bytes32 indexed id);
+    event ProposalCancelled(bytes32 indexed id, string reason);
+    event ParameterChanged(bytes32 indexed key, uint256 previousValue, uint256 newValue);
+    event PhaseAdvanced(Phase previousPhase, Phase newPhase);
+
+    /// The proposer holds less veARK than the proposal threshold requires.
+    error BelowProposalThreshold(uint256 weight, uint256 required);
+
+    /// Turnout fell short of the quorum for this proposal kind.
+    error QuorumNotMet(uint256 turnout, uint256 required);
+
+    /// The proposal did not reach its approval threshold.
+    error ThresholdNotMet(uint256 forVotes, uint256 againstVotes, uint16 requiredBps);
+
+    /// The proposal is not in a state that allows this action.
+    error InvalidProposalState(bytes32 id, uint8 state);
+
+    /// The timelock has not elapsed.
+    error TimelockActive(uint64 executableAt, uint64 currentTime);
+
+    /// This account has already voted on this proposal.
+    error AlreadyVoted(bytes32 id, address voter);
+
+    /// The requested value falls outside the hard band compiled into the contract.
+    error ParameterOutOfBounds(bytes32 key, uint256 requested, uint256 minimum, uint256 maximum);
+
+    /// A single change may not move this parameter by more than its step limit.
+    error ParameterStepTooLarge(bytes32 key, uint256 previous, uint256 requested);
+
+    /// This parameter is immutable and has no setter at all.
+    error ParameterImmutable(bytes32 key);
+
+    /// A phase advance was requested before its exit conditions were satisfied.
+    error PhaseConditionsUnmet(uint8 currentPhase, string unmetCondition);
+
+    /// Governance is not permitted to take this action under any vote.
+    error ForbiddenAction(string reason);
+
+    /**
+     * Creates a proposal.
+     *
+     * @param kind Category, which selects quorum, threshold and timelock.
+     * @param payloadHash Hash of the calldata to execute on success.
+     * @param descriptionUri Off-chain pointer to the rationale.
+     * @return id Proposal handle.
+     */
+    function propose(ProposalKind kind, bytes32 payloadHash, string calldata descriptionUri)
+        external
+        returns (bytes32 id);
+
+    /**
+     * Casts a vote.
+     *
+     * @dev Weight is read from veARK at the proposal's snapshot block. Unvested
+     *      allocations carry no weight, so contributors and backers cannot vote
+     *      with tokens they have not yet earned.
+     * @param id The proposal.
+     * @param support True for, false against.
+     */
+    function castVote(bytes32 id, bool support) external;
+
+    /// @notice Queues a succeeded proposal, starting its timelock.
+    function queue(bytes32 id) external;
+
+    /// @notice Executes a queued proposal whose timelock has elapsed.
+    function execute(bytes32 id, bytes calldata payload) external;
+
+    /// @notice Cancels a proposal that is invalid or superseded.
+    function cancel(bytes32 id, string calldata reason) external;
+
+    /**
+     * Sets a bounded parameter.
+     *
+     * @dev Reverts with `ParameterOutOfBounds` outside the compiled band,
+     *      `ParameterStepTooLarge` for a move larger than one step, and
+     *      `ParameterImmutable` for keys such as the recovery timelock or the
+     *      circuit-breaker threshold, which have no setter at all.
+     * @param key Parameter identifier.
+     * @param value Requested value.
+     */
+    function setParameter(bytes32 key, uint256 value) external;
+
+    /// @param key Parameter identifier.
+    /// @return minimum Hard lower bound compiled into the contract.
+    /// @return maximum Hard upper bound compiled into the contract.
+    /// @return stepBps Largest single-change move permitted, in bps.
+    function parameterBounds(bytes32 key)
+        external
+        view
+        returns (uint256 minimum, uint256 maximum, uint16 stepBps);
+
+    /// @param id The proposal being queried.
+    /// @return The stored proposal record.
+    function proposalOf(bytes32 id) external view returns (Proposal memory);
+
+    /// @param kind The proposal category.
+    /// @return quorumBps Turnout required, in bps of total veARK weight.
+    /// @return thresholdBps Approval required, in bps of votes cast.
+    /// @return timelock Delay between success and execution, in seconds.
+    function rulesFor(ProposalKind kind)
+        external
+        view
+        returns (uint16 quorumBps, uint16 thresholdBps, uint64 timelock);
+
+    /// @return The current decentralisation phase.
+    function phase() external view returns (Phase);
+
+    /**
+     * Advances to the next phase if its exit conditions hold.
+     *
+     * @dev Conditions are checked on-chain — independent attester count, bonded
+     *      stake per tier, disputes adjudicated — not asserted by a caller.
+     */
+    function advancePhase() external;
+}

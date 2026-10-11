@@ -1,0 +1,509 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./ArkCatBondStore.hyp";
+import "./ArkCatBondDeterminations.hyp";
+
+import "./utils/ArkStakeLeaves.hyp";
+
+/**
+ * The fourth body of `ArkCatBond` (phase C3b): the claimant record of trigger
+ * 2 and the subrogation recovery kept per escrow — executed in the bond's
+ * storage by a delegatecall from `ArkCatBondSettlement`'s `fallback`, which the
+ * bond's own `fallback` reaches. Deployed first, on the bond's five
+ * dependencies, and named in the settlement module's constructor, which checks
+ * them (`ModuleMismatch`); no setter, no admin, not a proxy.
+ *
+ * THE ONE RULE
+ * ------------
+ * **The bond recovers on each escrow at most what it paid that escrow's
+ * positions, across every admitted successor together, senior before junior,
+ * and a realisation applies only behind a finding on every earlier-admitted
+ * successor** (whitepaper §5.4, yellow paper §4.3, I23′, I36).
+ *
+ * THE CLAIMANT RECORD (whitepaper §5.2; R-5)
+ * ------------------------------------------
+ * Trigger 2 is owed to the positions recorded as of T — the ratification
+ * (`QDAY.declaredAt()`), or the court's censorship determination — each at
+ * its vesting factor at T, and on the censorship ground to the qualifying
+ * releases with them. The draw is taken on W, the sum of their vested
+ * weights, and a vested weight truncates per position, so no aggregate the
+ * registry could keep reproduces W: `recordClaimants` takes the positions in
+ * batches, anyone's, each once, and the settlement opens only on a complete
+ * record (`ArkCatBondSettlement.settleDeclaration`). A position recorded after
+ * T is counted, so the record can be seen complete, and owed nothing.
+ *
+ * THE SUBROGATION PER ESCROW (whitepaper §5.4, I36; R-3)
+ * -----------------------------------------------------
+ * Each escrow keeps its own P, residual `P_rem` and class residuals: a draw
+ * adds to an escrow the part of it paid to that escrow's positions, by vested
+ * weight (`ArkStakeMath.trigger2EscrowDraws`), and a realisation of one escrow
+ * is applied against that escrow's residual alone, so it never repays what the
+ * bond paid another escrow's positions (the model's `escrowRecoveryLedger`).
+ * Draws enter an escrow's ledger lazily, all of them before its next
+ * realisation is applied, which is the order they happened in.
+ *
+ * THE ORDER OF SUCCESSORS (whitepaper §5.4; R-2)
+ * ----------------------------------------------
+ * A finding on a later-admitted successor applies to an escrow only once every
+ * earlier-admitted successor has a finding on it — a realisation, or the
+ * court's finding that it does not realise (`realisedUnits` 0), which releases
+ * what waits behind it (the model's `applicableRealisations`). A finding that
+ * arrives early is kept at its successor's slot and applied when the slots
+ * before it fill, by the finding that fills them or by anyone
+ * (`applyRecoveries`).
+ *
+ * THE COURT'S TRIGGER-2 FINDINGS (2026-09-30, EC-04; OC-COURT-01)
+ * --------------------------------------------------------------
+ * The censorship ground, the m_loss of a held balance and their value slices
+ * run in `ArkCatBondDeterminations` since the audit of 2026-10-03, which this
+ * module's constructor creates and fixes in an immutable; the stubs below
+ * keep their selectors here. See that contract for the arithmetic.
+ */
+contract ArkCatBondRecovery is ArkCatBondStore {
+    /// The most successor slots an escrow keeps: the origin chain and `F_max` = 3 (whitepaper §6.3).
+    uint256 private constant SLOTS = 4;
+
+    uint256 private constant PRICE_SCALE = 1e18;
+
+    /// This module's own address: under a delegatecall `address(this)` is the bond's.
+    address private immutable SELF;
+
+    /// Where the court's findings run (`ArkCatBondDeterminations`), created here; the settlement module reads it.
+    address public immutable DETERMINATIONS_MODULE;
+
+    constructor(address registry_, address params_, address coupon_, address qday_, address attestation_)
+        ArkCatBondStore(registry_, params_, coupon_, qday_, attestation_)
+    {
+        SELF = address(this);
+        DETERMINATIONS_MODULE =
+            address(new ArkCatBondDeterminations(registry_, params_, coupon_, qday_, attestation_));
+    }
+
+    /// Only through the bond: called directly this contract's storage is an empty book.
+    modifier inBond() {
+        if (address(this) == SELF) revert ZeroAddress();
+        _;
+    }
+
+    function _book() private view returns (IArkStakeSettlementBook) {
+        return IArkStakeSettlementBook(address(REGISTRY));
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The court's trigger-2 findings, in `ArkCatBondDeterminations`       */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * The censorship ground (`determineCensorship`), the m_loss of a held
+     * balance (`fixSeverity`) and the value slices of both (`openSlices`,
+     * `closeSlice`) run in `ArkCatBondDeterminations`, which this module's
+     * constructor creates (audit OC 2026-10-03, OC-COURT-01: the bound on
+     * the V a finding was admitted at did not fit here beside them on the v3
+     * line). Each stub forwards its call data unchanged and returns or
+     * reverts what the module does, so every selector, event and refusal is
+     * where it was; the guards — `inBond`, `closedFirst`, `nonReentrant`,
+     * `onlyCourtHere` — are the module's, on the moved bodies.
+     */
+    function determineCensorship(bytes32, uint256, uint256) external {
+        _determinations();
+    }
+
+    function fixSeverity(uint256) external {
+        _determinations();
+    }
+
+    function openSlices(bytes32, uint8, uint8) external {
+        _determinations();
+    }
+
+    function closeSlice(bytes32, uint8, bool, bytes calldata, uint256) external returns (bool) {
+        _determinations();
+    }
+
+    /// Run this call in `DETERMINATIONS_MODULE`, in the bond's storage, and end with its result or revert.
+    function _determinations() private {
+        if (address(this) == SELF) revert ZeroAddress();
+        address m = DETERMINATIONS_MODULE;
+        /// @hyperion memory-safe-assembly
+        assembly {
+            let p := mload(0x40)
+            calldatacopy(p, 0, calldatasize())
+            let ok := delegatecall(gas(), m, p, calldatasize(), 0, 0)
+            returndatacopy(p, 0, returndatasize())
+            if iszero(ok) { revert(p, returndatasize()) }
+            return(p, returndatasize())
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The claimant record. Whitepaper §5.2                                */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Record positions for the trigger-2 settlement. Anyone, in batches, each
+     * position once, before the settlement opens; on a ratified declaration the
+     * first batch fixes T at `QDAY.declaredAt()`.
+     *
+     * A claimant is a position anchored at T — recorded by T, and either still
+     * anchored or released after T (only the censorship ground leaves the
+     * release path open) — or, on the censorship ground, a release past its
+     * unbonding by T and still unsettled (§3.6's qualifying transit; a release
+     * settled since cannot be told from one settled before T, and is not a
+     * claimant). Each adds its recorded principal and its vested weight
+     * `N_p * vesting_p(T)` to the record and to its escrow's ledger. Under a
+     * declaration a position recorded after T is counted toward the record's
+     * completeness and owed nothing. Any other position is refused — but a
+     * position a forward root through `epochOf(T) - 1` proved and that left
+     * before T, which is counted toward those roots' anchors and owed nothing
+     * (audit 2026-09-29, QL-06; re-audit 2026-09-30, BOND-02: every such
+     * position, not only the last root's; see `provePriorAnchors`).
+     */
+    function recordClaimants(bytes32[] calldata ids) external inBond nonReentrant {
+        if (_t2.stage != 0) revert DeclarationAlreadySettled();
+        _groundDeclaration();
+        Claimants storage c = _claim;
+        uint256 at = uint256(c.at);
+        bool censorship = c.ground == GROUND_CENSORSHIP;
+        IArkStakeSettlementBook book = _book();
+        // Every anchor a root of an epoch before T's proves is recorded at the
+        // close of that root's epoch (G6), so the anchors of every root
+        // through the one before T's are the positions anchored at or before
+        // the start of T's epoch: the ones the cumulative count of that root
+        // covers (re-audit 2026-09-30, BOND-02).
+        uint256 priorClose = ArkEpoch.startOf(ArkEpoch.epochOf(at));
+        for (uint256 i = 0; i < ids.length; i++) {
+            bytes32 id = ids[i];
+            if (_t2Kind[id] != 0) revert AlreadyRecorded(id);
+            IArkStakeRegistry.Anchor memory a = book.anchorOf(id);
+            uint256 n = a.anchoredNotional;
+            bool prior = !censorship && a.status != 0 && uint256(a.anchoredAt) <= priorClose;
+            if (prior) _priorRecorded += 1;
+            // A release is instructed `UNBONDING_PERIOD` before `releasableAt`.
+            bool anchoredAtT = a.status != 0 && uint256(a.anchoredAt) <= at
+                && (a.status == 1 || uint256(a.releasableAt) - uint256(ArkEpoch.UNBONDING_PERIOD) > at);
+            if (anchoredAtT) {
+                c.anchored += n;
+                if (a.status == 1) c.live += n;
+            } else if (prior) {
+                // Proved by that root and released before T: counted, owed nothing.
+                _t2Kind[id] = LATE;
+                continue;
+            } else if (censorship && a.status == 2 && uint256(a.releasableAt) <= at) {
+                c.transit += n;
+            } else if (!censorship && a.status == 1) {
+                // Recorded after T: in the book the record is completed against, owed nothing.
+                c.live += n;
+                _t2Kind[id] = LATE;
+                continue;
+            } else {
+                revert NotClaimant(id);
+            }
+            uint256 w = _weightAtT(n, a.anchoredAt);
+            c.weight += w;
+            EscrowLedger storage l = _ledgers[_escrowKey(a.chainId, a.escrow)];
+            l.notional += n;
+            l.weight += w;
+            _t2Kind[id] = CLAIMANT;
+        }
+        emit ClaimantsRecorded(c.anchored, c.transit, c.live, c.weight);
+    }
+
+    /**
+     * Prove how many anchors the forward roots through `epochOf(T) - 1` carry,
+     * against the count leaf the relayer seals into every forward root
+     * (`ArkStakeLeaves.anchorCountLeaf`; audit 2026-09-29, QL-05, QL-06): the
+     * CUMULATIVE count of stake leaves of every root through that epoch
+     * (re-audit 2026-09-30, BOND-02), unchanged by a quiet epoch. Anyone,
+     * under a declaration, before the settlement opens; once, or again with
+     * the same count (BOND-09). The settlement then opens only once the
+     * claimant record has passed that many of them: a deposit whose proof
+     * reaches QRL after the declaration — of the last epoch or of any earlier
+     * one sealed late — can no longer be left out of W by an early opening.
+     */
+    function provePriorAnchors(uint256 count, bytes32[] calldata proof) external inBond nonReentrant {
+        if (_t2.stage != 0) revert DeclarationAlreadySettled();
+        _groundDeclaration();
+        if (_claim.ground != GROUND_DECLARATION) revert DeclarationNotRatified();
+        // A count wider than the record holds is refused, never narrowed (BOND-09).
+        if (count > type(uint64).max) revert AmountTooLarge(count);
+        if (_priorProven && count != uint256(_priorCount)) revert PriorCountProven(_priorCount);
+        uint256 prior = ArkEpoch.epochOf(uint256(_claim.at)) - 1;
+        if (!ATTESTATION.verify(prior, ArkStakeLeaves.anchorCountLeaf(prior, count), proof)) revert RootUnadmitted(prior);
+        _priorCount = uint64(count);
+        _priorProven = true;
+        emit PriorAnchorsProven(prior, count);
+    }
+
+    /// The anchors of the root before T the record has passed, the count that root proves, and whether it is proven.
+    function priorAnchors() external view returns (uint256 recorded, uint256 count, bool proven) {
+        return (_priorRecorded, _priorCount, _priorProven);
+    }
+
+    /// The claimant record as it stands.
+    function claimants() external view returns (Claimants memory) {
+        return _claim;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The subrogation recovery. Whitepaper §5.4, yellow paper §4.3        */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * The court's finding on a recovery: the escrow `escrow` of origin chain
+     * `chainId` realised `realisedUnits` on the successor `successorId` — a
+     * root sealed after the settlement admitted there at a height finalised
+     * on it — or, with zero, that the successor does not realise it. Court
+     * only, once the trigger-2 settlement it subrogates has drawn and judged
+     * its balance (stage HELD or SETTLED). `anchoredBase` is the court's
+     * statement of the escrow's recorded principal, kept on the record; the
+     * positions' part is divided over the claimant record's own figure.
+     *
+     * Recorded at the successor's slot in the escrow's admission order — the
+     * origin chain itself (zero), only on the censorship ground, else the
+     * successor's place in `ArkStakeParams.successorIndex` — once per slot,
+     * and applied as soon as every earlier slot has a finding.
+     */
+    function openRecovery(
+        bytes32 recoveryId,
+        uint256 chainId,
+        bytes32 successorId,
+        address escrow,
+        uint256 realisedUnits,
+        uint256 anchoredBase
+    ) external inBond nonReentrant {
+        if (msg.sender != court) revert OnlyCourt(msg.sender);
+        // On the censorship ground only once it is settled (re-audit
+        // 2026-09-30, BOND-04), and not while a declaration ratified after it
+        // waits to open on its remainder: a realisation applied while a draw
+        // could still follow left that draw outside P_rem, with no slot to
+        // recover it.
+        if (_t2.stage < T2_HELD || (_t2.censorship && (_t2.stage != T2_SETTLED || _awaitingT2(T2_HELD)))) {
+            revert FindingRefused(NothingToSubrogate.selector);
+        }
+        Recovery storage r = _recoveries[recoveryId];
+        if (r.escrow != address(0)) revert FindingRefused(RecoveryExists.selector);
+        if (escrow == address(0)) revert FindingRefused(BadDetermination.selector);
+        uint256 slot = successorId == bytes32(0) ? 0 : PARAMS.successorIndex(chainId, successorId);
+        if (successorId == bytes32(0) ? !_t2.censorship : slot == 0) {
+            revert FindingRefused(SuccessorNotAdmitted.selector);
+        }
+        bytes32 key = _escrowKey(chainId, escrow);
+        EscrowLedger storage l = _ledgers[key];
+        // One finding per successor per escrow: a second is a different fact about the same fork.
+        if (l.found[slot] != bytes32(0)) revert FindingRefused(RecoveryExists.selector);
+
+        r.successorId = successorId;
+        r.escrow = escrow;
+        r.chainId = chainId;
+        r.base = anchoredBase;
+        r.realised = realisedUnits;
+        r.slot = uint8(slot);
+        l.found[slot] = recoveryId;
+        emit RecoveryFound(recoveryId, successorId, escrow, slot, realisedUnits);
+        _apply(l);
+    }
+
+    /**
+     * Apply every finding of one escrow that the admission order now admits.
+     * Anyone; idempotent. `openRecovery` does the same for the escrow it names,
+     * so this is needed only to observe the order being enforced, never to
+     * unblock it.
+     */
+    function applyRecoveries(uint256 chainId, address escrow) external inBond nonReentrant {
+        _apply(_ledgers[_escrowKey(chainId, escrow)]);
+    }
+
+    /**
+     * Walk the escrow's slots from its cursor, applying each finding while the
+     * run is unbroken (the model's `applicableRealisations`): the origin chain
+     * first on the censorship ground, the first admitted successor first after
+     * a declaration, where the origin chain has no slot.
+     */
+    function _apply(EscrowLedger storage l) private {
+        uint8 k = l.cursor;
+        if (k == 0 && !_t2.censorship) k = 1;
+        while (k < SLOTS) {
+            bytes32 id = l.found[k];
+            if (id == bytes32(0)) break;
+            _applyOne(l, id);
+            k++;
+        }
+        l.cursor = k;
+    }
+
+    /**
+     * One realisation against the escrow's own residual (whitepaper §5.4): the
+     * draws not yet in its P first, then `S_B = min(R, P_rem)` to the bond,
+     * senior to the whole of its remaining draw before junior (I23′), each
+     * class residual falling with it, and `R - S_B` to the positions of that
+     * escrow on the fork that realised.
+     */
+    function _applyOne(EscrowLedger storage l, bytes32 recoveryId) private {
+        _sync(l);
+        Recovery storage r = _recoveries[recoveryId];
+        (uint256 toBond, uint256 toPositions) = ArkStakeMath.recoveryAllocation(r.realised, l.residual);
+        l.residual -= toBond;
+        (uint256 toSenior, uint256 toJunior) =
+            ArkStakeMath.classRecovery(toBond, l.classResidual[JUNIOR], l.classResidual[SENIOR]);
+        l.classResidual[SENIOR] -= toSenior;
+        l.classResidual[JUNIOR] -= toJunior;
+        r.toPositions = toPositions;
+        r.toClass[JUNIOR] = toJunior;
+        r.toClass[SENIOR] = toSenior;
+        r.applied = true;
+        emit RecoveryOpened(recoveryId, r.successorId, r.escrow, r.realised, toSenior, toJunior, toPositions, l.residual);
+    }
+
+    /**
+     * Bring the trigger-2 draws the escrow's ledger has not taken into it: the
+     * part the bond paid this escrow's positions of the whole draw so far —
+     * the cumulative draw by class in origin units at the opening's price,
+     * `floor(drawnByClass_c * PRICE_SCALE / price)`, times the escrow's vested
+     * weight over W, truncated (`trigger2EscrowDraws`) — less what it took
+     * before, added to P, `P_rem` and the class residuals as one increment
+     * ranked like the first draw. Cumulative since the value slices of
+     * 2026-09-30: a settlement draws once at the opening, once per upheld
+     * slice and once on the measured path, no longer twice at most.
+     */
+    function _sync(EscrowLedger storage l) private {
+        (uint256 j, uint256 s) = _escrowDrawn(l.weight);
+        uint256 dj = j - l.applied[JUNIOR];
+        uint256 ds = s - l.applied[SENIOR];
+        l.applied[JUNIOR] = j;
+        l.applied[SENIOR] = s;
+        l.paid += dj + ds;
+        l.residual += dj + ds;
+        l.classResidual[JUNIOR] += dj;
+        l.classResidual[SENIOR] += ds;
+    }
+
+    /// An escrow's part of the whole trigger-2 draw by class, in origin units (truncating, toward the positions).
+    function _escrowDrawn(uint256 weight) private view returns (uint256, uint256) {
+        Declaration storage t = _t2;
+        if (t.price == 0) return (0, 0);
+        return ArkStakeMath.trigger2EscrowDraws(
+            (uint256(t.drawnByClass[JUNIOR]) * PRICE_SCALE) / t.price,
+            (uint256(t.drawnByClass[SENIOR]) * PRICE_SCALE) / t.price,
+            weight,
+            t.weight
+        );
+    }
+
+    /**
+     * A holding's share of its class's part of a recovery, pro rata by its
+     * shares at the trigger-2 draw — the principal each holding paid, since the
+     * draw was one per-share write — as the recovery leaf the escrow's
+     * `releaseShare` pays (yellow paper §4.3). Its owner names the destination
+     * under ML-DSA-87; the recipient word is the holding's id.
+     */
+    function claimRecovery(bytes32 recoveryId, uint256 holdingId, address destination)
+        external
+        inBond
+        nonReentrant
+        returns (bytes32 leaf)
+    {
+        Recovery storage r = _recovery(recoveryId);
+        Holding storage h = _holdings[holdingId];
+        if (h.owner != msg.sender) revert NotHolder(holdingId, msg.sender);
+        uint8 c = h.class_;
+        uint256 atDraw = uint256(_t2.sharesAt[c]);
+        uint256 base = h.declFixed ? uint256(h.declShares) : (h.gen == _t2.genAt[c] ? uint256(h.shares) : 0);
+        // Truncates, toward the class's other holdings.
+        uint256 q = atDraw == 0 ? 0 : (r.toClass[c] * base) / atDraw;
+        // The class's leaves never sum above its part of the recovery
+        // (OC-ECON-01, I23, I36): the escrow pays them first come.
+        uint256 left = r.toClass[c] - _classSealed[recoveryId][c];
+        if (q > left) q = left;
+        _classSealed[recoveryId][c] += q;
+        leaf = _sealShare(recoveryId, r, bytes32(holdingId), destination, q);
+    }
+
+    /**
+     * A position's share of the positions' part of a recovery, pro rata by
+     * recorded principal among the claimants of the escrow that realised
+     * (whitepaper §5.4) — the claimant record's figure for that escrow, which
+     * the chain computed, not the court's statement of it. The bound
+     * beneficiary; the recipient word is the position's identifier.
+     */
+    function claimPositionRecovery(bytes32 recoveryId, bytes32 stakeAssetId, address destination)
+        external
+        inBond
+        nonReentrant
+        returns (bytes32 leaf)
+    {
+        Recovery storage r = _recovery(recoveryId);
+        IArkStakeRegistry.Anchor memory a = _beneficiary(stakeAssetId);
+        if (a.escrow != r.escrow || a.chainId != r.chainId || _t2Kind[stakeAssetId] != CLAIMANT) {
+            revert NotClaimant(stakeAssetId);
+        }
+        uint256 base = _ledgers[_escrowKey(r.chainId, r.escrow)].notional;
+        uint256 n = a.anchoredNotional > base ? base : a.anchoredNotional;
+        // Truncates, toward the other positions of the fork.
+        leaf = _sealShare(recoveryId, r, stakeAssetId, destination, base == 0 ? 0 : (r.toPositions * n) / base);
+    }
+
+    /// A recovery applied against its escrow's residual; one still waiting on an earlier successor is refused.
+    function _recovery(bytes32 recoveryId) private view returns (Recovery storage r) {
+        r = _recoveries[recoveryId];
+        if (r.escrow == address(0)) revert NoSuchRecovery(recoveryId);
+        if (!r.applied) revert RecoveryWaiting(recoveryId);
+    }
+
+    /// One recipient's share leaf, once per recovery: the escrow spends a leaf once, so a second would be refused there anyway.
+    function _sealShare(bytes32 recoveryId, Recovery storage r, bytes32 recipient, address destination, uint256 q)
+        private
+        returns (bytes32 leaf)
+    {
+        _requireOriginAddress(destination);
+        // A second claim is refused as one before its quantity is read: since
+        // OC-ECON-01 the class's part may already be sealed whole, so it reads zero.
+        bytes32 k = keccak256(abi.encode(recoveryId, recipient));
+        if (_sealed[k]) revert AlreadyClaimed(recipient);
+        if (q == 0) revert NotClaimant(recipient);
+        _sealed[k] = true;
+        leaf = ArkStakeLeaves.shareLeaf(r.chainId, r.escrow, r.successorId, recoveryId, recipient, destination, q);
+        emit RecoveryLeafSealed(recoveryId, recipient, r.chainId, r.escrow, r.successorId, destination, q, leaf);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Views                                                               */
+    /* ------------------------------------------------------------------ */
+
+    function recoveryOf(bytes32 recoveryId) external view returns (Recovery memory) {
+        return _recoveries[recoveryId];
+    }
+
+    /**
+     * One escrow's subrogation ledger as it stands, the trigger-2 draws it has
+     * not yet taken counted in (a view does not write them): its claimants'
+     * principal and vested weight, P, `P_rem`, the class residuals, and the
+     * finding on each successor slot.
+     */
+    function escrowLedger(uint256 chainId, address escrow) external view returns (EscrowLedger memory) {
+        return _ledgerNow(chainId, escrow);
+    }
+
+    /// `P_rem` of one escrow and the class residuals it is ranked on (whitepaper §5.4, I36), as `escrowLedger` reads them.
+    function recoveryResidual(uint256 chainId, address escrow)
+        external
+        view
+        returns (uint256 residual, uint256 juniorRemaining, uint256 seniorRemaining)
+    {
+        EscrowLedger memory l = _ledgerNow(chainId, escrow);
+        return (l.residual, l.classResidual[JUNIOR], l.classResidual[SENIOR]);
+    }
+
+    function _ledgerNow(uint256 chainId, address escrow) private view returns (EscrowLedger memory l) {
+        l = _ledgers[_escrowKey(chainId, escrow)];
+        (uint256 j, uint256 s) = _escrowDrawn(l.weight);
+        uint256 dj = j - l.applied[JUNIOR];
+        uint256 ds = s - l.applied[SENIOR];
+        l.applied[JUNIOR] = j;
+        l.applied[SENIOR] = s;
+        l.paid += dj + ds;
+        l.residual += dj + ds;
+        l.classResidual[JUNIOR] += dj;
+        l.classResidual[SENIOR] += ds;
+    }
+}

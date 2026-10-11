@@ -1,0 +1,869 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/security/ReentrancyGuard.hyp";
+
+import "./interfaces/IArkBondDelegation.hyp";
+import "./interfaces/IArkStakeParams.hyp";
+import "./interfaces/IArkStakeExternal.hyp";
+import "./utils/ArkEpoch.hyp";
+import "./utils/QuantumErrors.hyp";
+
+/**
+ * Bond principal, deployed to QRL staking while it is not called upon.
+ *
+ * The one rule this contract exists to enforce: **principal staked through it
+ * comes back to it, and nothing it receives is paid out or counted as returned
+ * before the attester quorum's reconciliation of it has cleared the challenge
+ * window.** Whitepaper §3.4, yellow paper §1.4.
+ *
+ * WHAT HOLDS THAT, AND WHICH GAP EACH PIECE CLOSES
+ * ------------------------------------------------
+ *  1. **Withdrawal credentials are built from this contract's address and are
+ *     never an argument.** A caller who could name them could stake bond
+ *     principal to a validator that withdraws to itself. Deposit data naming
+ *     anyone else fails the deposit contract's own root check.
+ *  2. **One deposit per validator, fixed at admission.** Governance admits a
+ *     validator with the deposit data root of exactly 40,000 QRL to these
+ *     credentials under a signature the quorum has checked; `delegate` sends
+ *     that deposit and no other, once. The deposit contract checks no
+ *     signature — the beacon chain does, hours later, and drops a deposit that
+ *     fails it with the value already burned — so a permissionless caller
+ *     choosing the signature, the root or the amount could burn principal, or
+ *     stake above the maximum effective balance, where the excess is skimmed
+ *     back as if it were distribution. The root commits to all four fields,
+ *     so storing it fixes them.
+ *  3. **No deposit on a key that already has one.** The beacon chain takes a
+ *     key's credentials from its first deposit and treats every later one as a
+ *     top-up, so an operator depositing its own key first, to its own
+ *     credentials, would receive our 40,000 QRL on exit. `delegate` needs the
+ *     quorum's statement that at deposit-contract root R no deposit exists for
+ *     the key, and R must still be the root when it runs: any deposit since
+ *     changes it. Lido's deposit security module, in this product's terms.
+ *     The statement is sealed under a key of its own, the deposit contract's
+ *     count (`depositCheckKey`), never under an epoch's report key: one check
+ *     per deposit, as many validators per epoch as idle principal funds, and
+ *     no report slot spent on a check (OC-LEGB-02).
+ *  4. **No validator past the concentration bound** (1,000 bps of principal),
+ *     at delegation.
+ *  5. **Exit on request, under an operator bond.** The consensus layer of QRL
+ *     admits no exit requested from the execution layer, so a validator is
+ *     admitted with a voluntary exit its operator has signed and the attester
+ *     quorum holds, and behind an operator bond of `operatorBondBps` of its
+ *     stake. The bond is forfeited to the pool where a cleared report shows the
+ *     validator slashed, withdrawing elsewhere, or not exiting
+ *     `exitDeadlineEpochs` after the request — counted from the later of the
+ *     request and the first epoch the validator can exit in, `ELIGIBLE_EPOCHS`
+ *     after its funding (activation and the beacon chain's
+ *     SHARD_COMMITTEE_PERIOD), so no operator forfeits for a deadline that
+ *     fell before its validator could exit. The pool names no validator: the
+ *     oldest funded one not already exiting goes first (OC-LEGB-04). A
+ *     slashing forfeit is held here until the validator closes and paid then,
+ *     in the transaction that books the loss; while one is held
+ *     (`slashedOpen`) the pool settles no withdrawal, so nobody leaves with
+ *     the forfeit ahead of the loss it answers for (OC-LEGB-03). ZVM exposes no ML-DSA-87 verifier
+ *     and no beacon root, so the signature is the quorum's to check, and a QRL
+ *     voluntary exit names an index that exists only once the deposit is
+ *     processed — so the commitment may follow funding (`commitExit`).
+ *  6. **The reconciliation report.** Withdrawals and block fees credit this
+ *     contract without running code, so a received balance says nothing about
+ *     whether it is distribution or principal coming home. The quorum seals per
+ *     epoch every funded validator's line and the fees; a root is acted on only
+ *     once it has stood, unchanged, for the challenge window after this
+ *     contract first saw it (`noteRoot`), so a root sealed late for a past
+ *     epoch still gets its whole window. Withdrawals after exit return
+ *     principal, up to the stake; anything else is distribution. A validator
+ *     that closes short of its stake is a loss of bond principal.
+ *  7. **Provisional distribution, capped** (whitepaper §3.4, I32). Between
+ *     reports the contract cannot tell a reward from returning principal, so it
+ *     classifies receipts by magnitude: each epoch it forwards as distribution
+ *     what it has received and no report has covered, up to `rewardCap` —
+ *     `activeValidators * VALIDATOR_STAKE * r_max * EPOCH / YEAR` — and holds
+ *     the rest. The cap does not carry forward. Stake on its way home
+ *     (`exitsPending`: asked to exit, or reported exiting) is held ahead of
+ *     it. The report is final: what it shows to be distribution is paid by
+ *     `distribute` less what was already forwarded, and where it shows a
+ *     forward to have been principal, that principal has already left: it is
+ *     written off `principal` and `distributed` together (OC-LEGB-01), so the
+ *     balance still covers what ranks ahead of distribution and the pool does
+ *     not count the forward twice.
+ *  8. **Solvency on every payment.** Principal, operator bonds and refunds rank
+ *     ahead of distribution: nothing leaves unless the balance after it still
+ *     covers them, so a report of fees that never arrived is never paid out of
+ *     principal.
+ *
+ * Only immutables are set in the constructor: the configuration is all in the
+ * runtime code, which anyone can read, and it is what lets the suite move a
+ * deployed copy to the address a set of deposit data names.
+ */
+contract ArkBondDelegation is IArkBondDelegation, ReentrancyGuard {
+    /// An ML-DSA-87 public key.
+    uint256 public constant PUBKEY_LENGTH = 2592;
+
+    /// MAX_EFFECTIVE_BALANCE of the QRL beacon chain, and the whole of every deposit made here.
+    // Written as a power product rather than a denomination: the v2 compiler
+    // spells the unit `ether` and the QIP-55 one `quanta`, and neither parses
+    // the other, so the one spelling both accept is the arithmetic itself.
+    uint256 public constant VALIDATOR_STAKE = 40_000 * 10 ** 18;
+
+    /// The domain of the reconciliation report's leaves. V2 carries `slashed`, the exit epoch and the credentials.
+    bytes32 public constant REPORT_DOMAIN = keccak256("ARK_DELEGATION_REPORT_V2");
+
+    /// The domain of the quorum's statement that a key has no deposit at a deposit-contract root.
+    bytes32 public constant DEPOSIT_CHECK_DOMAIN = keccak256("ARK_DELEGATION_DEPOSIT_CHECK_V1");
+
+    /// The tag of the report leaf carrying the execution-layer fees.
+    bytes32 public constant FEES_TAG = keccak256("FEES");
+
+    /**
+     * The attestation keyspace this contract's roots are sealed under (D10,
+     * whitepaper §3.5): the quorum seals each epoch's reconciliation report
+     * and deposit checks at `reportKey(epoch)`, never at the plain epoch the
+     * forward path of the registry and the swap reads, so a root sealed for
+     * one purpose proves nothing for the other. The tag fills the upper 128
+     * bits and an epoch the lower, and an OR never clears the tag, so no key
+     * read here is a forward key.
+     */
+    uint256 public constant REPORT_KEYSPACE = uint256(keccak256("ARK_DELEGATION_REPORTS_V1")) << 128;
+
+    /**
+     * The keyspace of the quorum's deposit checks (OC-LEGB-02): the deposit
+     * contract's count fills the lower bits. Every deposit raises the count,
+     * so each check has a key no other check, and no report, can take — on a
+     * write-once verifier too.
+     */
+    uint256 public constant DEPOSIT_KEYSPACE = uint256(keccak256("ARK_DELEGATION_DEPOSIT_CHECKS_V1")) << 128;
+
+    uint8 private constant ACTIVE_EXITING = 3;
+    uint8 private constant ACTIVE_SLASHED = 4;
+    uint8 private constant EXITED_UNSLASHED = 5;
+    uint8 private constant EXITED_SLASHED = 6;
+    uint8 private constant WITHDRAWAL_DONE = 8;
+
+    uint8 private constant FORFEIT_SLASHED = 1;
+    uint8 private constant FORFEIT_DEADLINE = 2;
+    uint8 private constant FORFEIT_CREDENTIALS = 3;
+
+    uint256 private constant BPS = 10000;
+
+    /// The pool of whitepaper §3.4 (`ArkBondStaking`): the only source and destination of principal and distribution.
+    address public immutable BOND;
+    /// Storage, not immutable, since 2026-09-27: see `IGovernanceHandover` (whitepaper §6.3).
+    address public governance;
+    address public pendingGovernance;
+    IQrlDepositContract public immutable DEPOSIT_CONTRACT;
+    IArkStakeParams public immutable PARAMS;
+    /// Where the quorum's reconciliation roots and deposit checks are sealed.
+    IAttestationVerifier public immutable ATTESTATION;
+
+    /**
+     * The concentration bound this deployment applies, in bps of principal; zero
+     * reads `validatorConcentrationBps` from the parameters. Whitepaper §3.4 binds
+     * bond principal delegated directly at 1,000. A staking pool that pools many
+     * depositors (`ArkStakingPool`) is its own counterparty and measures
+     * concentration across its whole book, so it is deployed at 10,000: one
+     * validator of 40,000 QRL may be the whole of a small pool.
+     */
+    uint256 public immutable CONCENTRATION_BPS;
+
+    /**
+     * Epochs from funding until a validator can first exit (OC-LEGB-04): the
+     * activation queue and the beacon chain's SHARD_COMMITTEE_PERIOD, in this
+     * product's epochs, rounded up. A fact of the chain, fixed per deployment.
+     */
+    uint256 public immutable ELIGIBLE_EPOCHS;
+
+    /// Bond principal placed here, net of what was taken back and what was lost. Wei.
+    uint256 public principal;
+    /// Principal deposited to validators and not yet reconciled as returned or lost.
+    uint256 public delegated;
+    /// Stake of validators asked to exit, or reported exiting, not yet reconciled as returned or lost.
+    uint256 public exitsPending;
+    /// Operator bonds held, not principal and not distribution.
+    uint256 public bondsHeld;
+    /// Bonds owed back to operators, awaiting `claimRefund`.
+    uint256 public refundsOwed;
+    /// Distribution cleared by reports, and what of it has been paid to the bond.
+    uint256 public distributionReconciled;
+    uint256 public distributed;
+    /// Funded validators not yet closed: the base of the reward cap.
+    uint256 public activeValidators;
+    /// What was forwarded provisionally in `provisionalEpoch`, against that epoch's cap.
+    uint256 public provisionalEpoch;
+    uint256 public provisionalPaid;
+    /// Fees cleared by reports, cumulative, and the epoch of the last fees report.
+    uint256 public feesReconciled;
+    uint256 public lastFeesEpoch;
+
+    /// A report root as this contract first saw it, and when.
+    struct Noted {
+        bytes32 root;
+        uint64 at;
+    }
+
+    mapping(bytes32 => Validator) private _validators;
+    mapping(address => uint256) private _refundOf;
+    mapping(uint256 => Noted) private _noted;
+
+    // The two bytes32-keyed mappings below are private behind explicit views:
+    // hypc's QRVM auto-getter cleans a key as uint256 before hashing, and a
+    // left-aligned bytes32 becomes zero (OC-V3-02).
+    /**
+     * The epoch by which a validator must have begun to exit, fixed when its
+     * exit was requested (G8, whitepaper §6.5): the deadline in force in the
+     * epoch of the request, not when a report judges it. Read at judgement
+     * before 2026-09-28, a vote shortening the deadline reached requests
+     * already made and forfeited bonds on terms their operators never had.
+     */
+    mapping(bytes32 => uint64) private _exitDeadlineEpoch;
+
+    /// The epoch each validator was funded in (OC-LEGB-04).
+    mapping(bytes32 => uint64) private _fundedEpoch;
+
+    /// Funded validators in funding order, and the first `requestExit` may still pick.
+    bytes32[] private _funded;
+    uint256 private _exitCursor;
+
+    /// Slashed validators whose forfeited bond is held until they close: the pool's bunker (OC-LEGB-03).
+    uint256 public slashedOpen;
+    mapping(bytes32 => bool) private _forfeitHeld;
+
+    constructor(
+        address bond_,
+        address governance_,
+        address depositContract_,
+        address params_,
+        address attestation_,
+        uint256 concentrationBps_,
+        uint256 eligibleEpochs_
+    ) {
+        if (bond_ == address(0) || governance_ == address(0)) revert ZeroAddress();
+        if (concentrationBps_ > BPS) revert ConcentrationOutOfRange(concentrationBps_);
+        CONCENTRATION_BPS = concentrationBps_;
+        ELIGIBLE_EPOCHS = eligibleEpochs_;
+        if (depositContract_ == address(0) || params_ == address(0) || attestation_ == address(0)) {
+            revert ZeroAddress();
+        }
+        BOND = bond_;
+        governance = governance_;
+        DEPOSIT_CONTRACT = IQrlDepositContract(depositContract_);
+        PARAMS = IArkStakeParams(params_);
+        ATTESTATION = IAttestationVerifier(attestation_);
+    }
+
+    modifier onlyGovernance() {
+        if (msg.sender != governance) revert OnlyGovernance(msg.sender);
+        _;
+    }
+
+    /// @inheritdoc IGovernanceHandover
+    function proposeGovernance(address next) external onlyGovernance {
+        pendingGovernance = next;
+        emit GovernanceProposed(governance, next);
+    }
+
+    /// @inheritdoc IGovernanceHandover
+    function acceptGovernance() external {
+        address next = pendingGovernance;
+        if (msg.sender != next) revert NotPendingGovernance(msg.sender);
+        emit GovernanceTransferred(governance, next);
+        governance = next;
+        pendingGovernance = address(0);
+    }
+
+    modifier onlyBond() {
+        if (msg.sender != BOND) revert OnlyBond(msg.sender);
+        _;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Principal in and out                                                */
+    /* ------------------------------------------------------------------ */
+
+    /// @inheritdoc IArkBondDelegation
+    function fund() external payable onlyBond {
+        if (msg.value == 0) revert ZeroValue();
+        principal += msg.value;
+        emit Funded(msg.sender, msg.value, principal);
+    }
+
+    /**
+     * Reject a bare transfer. Principal arrives by `fund` and bonds by
+     * `admitValidator`; beacon withdrawals and block fees credit the balance
+     * without calling anything, so this refuses nothing they need.
+     */
+    receive() external payable {
+        revert ZeroValue();
+    }
+
+    /**
+     * Take idle principal back, for a settlement, a maturity or the run-off
+     * queue. Idle includes principal a cleared report shows returned; it never
+     * includes a withdrawal no report has covered yet.
+     */
+    function returnIdle(uint256 amount) external onlyBond nonReentrant {
+        uint256 free = idle();
+        if (amount == 0) revert ZeroValue();
+        if (amount > free) revert InsufficientIdle(amount, free);
+
+        principal -= amount;
+        (bool ok,) = BOND.call{value: amount}("");
+        if (!ok) revert TransferFailed(BOND, amount);
+        _requireSolvent();
+        emit Returned(BOND, amount, principal);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Validators                                                          */
+    /* ------------------------------------------------------------------ */
+
+    /// The operator bond a validator is admitted behind. Rounds up, toward the pool.
+    function requiredBond() public view returns (uint256) {
+        return (VALIDATOR_STAKE * PARAMS.params().operatorBondBps + BPS - 1) / BPS;
+    }
+
+    /**
+     * Admit a validator, behind its operator's bond, for exactly one deposit.
+     * Governance, because a slashed operator loses bond principal.
+     *
+     * `depositDataRoot` is the root of the operator's deposit data for 40,000
+     * QRL to `withdrawalCredentials()`; governance, with the quorum, checks its
+     * signature off chain before admitting — this contract cannot, ZVM having no
+     * ML-DSA-87 verifier. `operator` is where the bond goes back to; the bond is
+     * `msg.value`.
+     */
+    function admitValidator(bytes calldata pubkey, bytes32 depositDataRoot, bytes32 exitCommitment, address operator)
+        external
+        payable
+        onlyGovernance
+    {
+        if (pubkey.length != PUBKEY_LENGTH) revert BadPubkeyLength(pubkey.length);
+        if (operator == address(0)) revert ZeroAddress();
+        if (depositDataRoot == bytes32(0)) revert ZeroValue();
+        uint256 required = requiredBond();
+        if (msg.value < required) revert OperatorBondShort(msg.value, required);
+
+        bytes32 key = keccak256(pubkey);
+        Validator storage v = _validators[key];
+        if (v.admitted) revert ValidatorAlreadyAdmitted(key);
+
+        v.admitted = true;
+        v.operator = operator;
+        v.bond = uint128(msg.value);
+        v.depositDataRoot = depositDataRoot;
+        v.exitCommitment = exitCommitment;
+        bondsHeld += msg.value;
+        emit ValidatorAdmitted(key, operator, msg.value, depositDataRoot, exitCommitment);
+    }
+
+    /**
+     * Withdraw an admission nothing was ever deposited under, and owe the bond
+     * back. The operator or governance. Without it a validator that can never
+     * be funded — its key already deposited elsewhere, its data wrong — would
+     * hold its bond for good. The record is deleted, so the key may be admitted
+     * again with corrected data. Not in yellow paper §1.4: a recorded departure.
+     */
+    function withdrawAdmission(bytes32 pubkeyHash) external {
+        Validator storage v = _validators[pubkeyHash];
+        if (!v.admitted) revert ValidatorNotAdmitted(pubkeyHash);
+        address operator = v.operator;
+        if (msg.sender != operator && msg.sender != governance) revert NotOperator(msg.sender);
+        if (v.stake != 0) revert AlreadyFunded(pubkeyHash);
+
+        uint256 b = v.bond;
+        delete _validators[pubkeyHash];
+        bondsHeld -= b;
+        refundsOwed += b;
+        _refundOf[operator] += b;
+        emit AdmissionWithdrawn(pubkeyHash, operator, b);
+    }
+
+    /// Record the commitment to a validator's pre-signed exit, once its index exists.
+    function commitExit(bytes32 pubkeyHash, bytes32 exitCommitment) external onlyGovernance {
+        Validator storage v = _validators[pubkeyHash];
+        if (!v.admitted) revert ValidatorNotAdmitted(pubkeyHash);
+        if (v.closed) revert ValidatorClosed(pubkeyHash);
+        if (exitCommitment == bytes32(0)) revert ZeroValue();
+        v.exitCommitment = exitCommitment;
+        emit ExitCommitted(pubkeyHash, exitCommitment);
+    }
+
+    /// The quorum's statement that no deposit exists for a key at deposit-contract root `depositRoot`.
+    function depositCheckLeaf(bytes32 pubkeyHash, bytes32 depositRoot) public view returns (bytes32) {
+        return keccak256(abi.encode(DEPOSIT_CHECK_DOMAIN, address(this), pubkeyHash, depositRoot));
+    }
+
+    /**
+     * Fund an admitted validator with its one deposit, from idle principal.
+     * Permissionless: the deposit is the one governance admitted, the
+     * destination is fixed, and the caller gains nothing.
+     *
+     * `signature` is an argument only because storing 4,627 bytes would cost
+     * more than the deposit; the admitted root commits to it, so any other
+     * signature fails the deposit contract's root check. `depositRoot` and the
+     * proof are the quorum's no-prior-deposit check (header, item 3), sealed
+     * at `depositCheckKey()`, which needs no challenge window: it is only ever
+     * as old as the deposit root it names, and that root is compared with the
+     * live one here.
+     *
+     * The bound truncates, toward the pool: a stake exactly at it is admitted.
+     */
+    function delegate(
+        bytes calldata pubkey,
+        bytes calldata signature,
+        bytes32 depositRoot,
+        bytes32[] calldata checkProof
+    ) external nonReentrant {
+        bytes32 key = keccak256(pubkey);
+        Validator storage v = _validators[key];
+        if (!v.admitted) revert ValidatorNotAdmitted(key);
+        if (v.stake != 0) revert AlreadyFunded(key);
+        _requireRoom(key);
+        _requireNoPriorDeposit(key, depositRoot, checkProof);
+
+        v.stake = VALIDATOR_STAKE;
+        delegated += VALIDATOR_STAKE;
+        activeValidators += 1;
+        _fundedEpoch[key] = uint64(ArkEpoch.current());
+        _funded.push(key);
+
+        DEPOSIT_CONTRACT.deposit{value: VALIDATOR_STAKE}(
+            pubkey, withdrawalCredentials(), signature, v.depositDataRoot
+        );
+
+        emit Delegated(key, VALIDATOR_STAKE, depositRoot, delegated);
+    }
+
+    function _requireRoom(bytes32 key) private view {
+        uint256 free = idle();
+        if (VALIDATOR_STAKE > free) revert InsufficientIdle(VALIDATOR_STAKE, free);
+        uint256 bound = (principal * _concentrationBps()) / BPS;
+        if (VALIDATOR_STAKE > bound) revert ConcentrationExceeded(key, VALIDATOR_STAKE, bound);
+    }
+
+    function _requireNoPriorDeposit(bytes32 key, bytes32 depositRoot, bytes32[] calldata proof) private view {
+        bytes32 live = DEPOSIT_CONTRACT.get_deposit_root();
+        if (live != depositRoot) revert DepositRootChanged(depositRoot, live);
+        bytes32 leaf = depositCheckLeaf(key, depositRoot);
+        uint256 k = depositCheckKey();
+        if (!ATTESTATION.verify(k, leaf, proof)) revert BadProof(k, leaf);
+    }
+
+    /**
+     * The attestation key the quorum seals the next deposit's check under:
+     * `DEPOSIT_KEYSPACE` and the deposit contract's count, which
+     * `get_deposit_count` gives as eight little-endian bytes (OC-LEGB-02).
+     */
+    function depositCheckKey() public view returns (uint256) {
+        bytes memory c = DEPOSIT_CONTRACT.get_deposit_count();
+        uint256 n;
+        for (uint256 i = c.length; i != 0; i--) n = (n << 8) | uint8(c[i - 1]);
+        return DEPOSIT_KEYSPACE | n;
+    }
+
+    /**
+     * Ask for a validator's exit: where a settlement entitlement, a maturity or
+     * the run-off queue exceeds principal not deployed (yellow paper §1.4). The
+     * counterparty decides when; this contract decides which: the oldest
+     * funded validator neither closed nor already exiting, so no caller can
+     * name one funded this epoch (OC-LEGB-04). The quorum broadcasts the
+     * pre-signed exit on this record. The deadline for the validator to have
+     * begun exiting is `exitDeadlineEpochs` after the later of this epoch and
+     * the first it can exit in (`ELIGIBLE_EPOCHS` after funding). Its
+     * outstanding stake counts in `exitsPending` until it is back, so the pool
+     * does not ask for a second exit to cover what the first will return.
+     */
+    function requestExit() external onlyBond returns (bytes32 pubkeyHash) {
+        uint256 n = _funded.length;
+        uint256 i = _exitCursor;
+        while (i < n) {
+            Validator storage w = _validators[_funded[i]];
+            if (!w.closed && w.exitRequestedEpoch == 0) break;
+            i++;
+        }
+        if (i == n) revert NoValidatorToExit();
+        _exitCursor = i + 1;
+        pubkeyHash = _funded[i];
+        Validator storage v = _validators[pubkeyHash];
+
+        uint256 epoch = ArkEpoch.current();
+        uint256 from = uint256(_fundedEpoch[pubkeyHash]) + ELIGIBLE_EPOCHS;
+        v.exitRequestedEpoch = uint64(epoch);
+        _exitDeadlineEpoch[pubkeyHash] = uint64((from > epoch ? from : epoch) + PARAMS.params().exitDeadlineEpochs);
+        exitsPending += v.stake - v.principalReturned;
+        emit ExitRequested(pubkeyHash, epoch, v.exitCommitment);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The reconciliation report                                           */
+    /* ------------------------------------------------------------------ */
+
+    /// The report leaf for one validator in one epoch.
+    function validatorReportLeaf(Report calldata r) public view returns (bytes32) {
+        return keccak256(abi.encode(REPORT_DOMAIN, address(this), r));
+    }
+
+    /// The report leaf for the fees of blocks the funded validators proposed.
+    function feesReportLeaf(uint256 reportEpoch, uint256 cumulativeFees) public view returns (bytes32) {
+        return keccak256(abi.encode(REPORT_DOMAIN, FEES_TAG, address(this), reportEpoch, cumulativeFees));
+    }
+
+    /**
+     * Start the challenge window of the root sealed for `epoch`, from now.
+     * Permissionless. A root that changes — the quorum correcting a report —
+     * may be noted again and starts its window again; the same root cannot be
+     * re-noted, so noting cannot be used to push a window back.
+     *
+     * The window has to run from when a root became visible: measured from the
+     * report's epoch, a root sealed late for a past epoch would be acted on the
+     * moment it appeared, with no time for anyone to see it. The attestation
+     * verifier records no sealing time, so this contract records the first time
+     * it saw each root. Not in yellow paper §1.4: a recorded departure.
+     */
+    function noteRoot(uint256 epoch) external {
+        bytes32 root = ATTESTATION.rootOf(reportKey(epoch));
+        if (root == bytes32(0)) revert RootMissing(epoch);
+        Noted storage n = _noted[epoch];
+        if (n.root == root) revert RootAlreadyNoted(epoch);
+        n.root = root;
+        n.at = uint64(block.timestamp);
+        emit RootNoted(epoch, root);
+    }
+
+    /// When the root noted for `reportEpoch` clears: the window after the later of the epoch's end and its noting.
+    function reportClearsAt(uint256 reportEpoch) public view returns (uint256) {
+        Noted memory n = _noted[reportEpoch];
+        if (n.root == bytes32(0)) return type(uint256).max;
+        uint256 from = ArkEpoch.startOf(reportEpoch + 1);
+        if (n.at > from) from = n.at;
+        return from + ArkEpoch.CHALLENGE_WINDOW;
+    }
+
+    function _requireCleared(uint256 reportEpoch, bytes32 leaf, bytes32[] calldata proof) private view {
+        bytes32 noted = _noted[reportEpoch].root;
+        // A root replaced since it was noted has not stood for any window at all.
+        if (noted == bytes32(0) || noted != ATTESTATION.rootOf(reportKey(reportEpoch))) revert RootNotNoted(reportEpoch);
+        uint256 clears = reportClearsAt(reportEpoch);
+        if (block.timestamp < clears) revert ReportNotCleared(reportEpoch, clears);
+        if (!ATTESTATION.verify(reportKey(reportEpoch), leaf, proof)) revert BadProof(reportEpoch, leaf);
+    }
+
+    /// The attestation key the quorum seals the report and deposit checks of `epoch` under.
+    function reportKey(uint256 epoch) public pure returns (uint256) {
+        return REPORT_KEYSPACE | epoch;
+    }
+
+    /**
+     * Apply one validator's line of a cleared report. Permissionless: the
+     * report is the authority.
+     *
+     * Reports only move forward per validator, and cumulative withdrawals only
+     * grow, so an old line cannot be replayed to move value twice. A withdrawal
+     * counts as returning principal only once the validator has exited, and
+     * only up to its stake; before then a withdrawal is the balance above the
+     * maximum effective balance, which is distribution.
+     *
+     * Reports may be skipped, so every ground for forfeiting the operator bond
+     * is read from facts a later line still carries: `slashed` never clears,
+     * the credentials never change, and the exit's epoch is stated rather than
+     * inferred from whichever line happens to be reconciled first.
+     */
+    function reconcile(Report calldata r, bytes32[] calldata proof) external nonReentrant {
+        Validator storage v = _validators[r.pubkeyHash];
+        if (v.stake == 0) revert NotFunded(r.pubkeyHash);
+        if (v.closed) revert ValidatorClosed(r.pubkeyHash);
+        if (r.status > WITHDRAWAL_DONE) revert BadStatus(r.status);
+        // Every status from active_exiting on has an exit behind it, and none before.
+        if ((r.status >= ACTIVE_EXITING) != (r.exitInitiatedEpoch != 0)) revert BadStatus(r.status);
+        if (r.epoch <= v.lastReportEpoch) revert ReportNotForward(r.epoch, v.lastReportEpoch);
+        if (r.cumulativeWithdrawn < v.withdrawn) revert WithdrawalsWentBackwards(r.cumulativeWithdrawn, v.withdrawn);
+
+        _requireCleared(r.epoch, validatorReportLeaf(r), proof);
+
+        // An exit nobody asked for — a slashing, the operator's own — puts the
+        // stake on its way home all the same: counted in `exitsPending` from
+        // the first line that shows it, with the exit's own epoch as its
+        // deadline, which it has met (OC-LEGB-01).
+        if (r.status >= ACTIVE_EXITING && v.exitRequestedEpoch == 0) {
+            v.exitRequestedEpoch = r.exitInitiatedEpoch;
+            _exitDeadlineEpoch[r.pubkeyHash] = r.exitInitiatedEpoch;
+            exitsPending += v.stake - v.principalReturned;
+        }
+
+        uint256 delta = r.cumulativeWithdrawn - v.withdrawn;
+        uint256 principalPart;
+        if (r.status >= EXITED_UNSLASHED) {
+            uint256 outstanding = v.stake - v.principalReturned;
+            principalPart = delta < outstanding ? delta : outstanding;
+        }
+        uint256 distributionPart = delta - principalPart;
+
+        v.withdrawn = r.cumulativeWithdrawn;
+        v.principalReturned += principalPart;
+        v.status = r.status;
+        v.lastReportEpoch = uint64(r.epoch);
+        delegated -= principalPart;
+        if (v.exitRequestedEpoch != 0) exitsPending -= principalPart;
+        distributionReconciled += distributionPart;
+        // Principal forwarded provisionally as distribution before this report
+        // classified it has left already: written off `principal` and
+        // `distributed` together, so the balance still covers idle principal,
+        // bonds and refunds, and the pool, which holds the forward, stops
+        // counting it a second time at the delegation (OC-LEGB-01).
+        uint256 over = distributed > distributionReconciled ? distributed - distributionReconciled : 0;
+        uint256 cut = principalPart < over ? principalPart : over;
+        if (cut != 0) {
+            principal -= cut;
+            distributed -= cut;
+        }
+        emit Reconciled(r.pubkeyHash, r.epoch, r.status, distributionPart, principalPart);
+
+        if (!v.bondSettled) {
+            uint8 reason;
+            if (r.slashed || r.status == ACTIVE_SLASHED || r.status == EXITED_SLASHED) {
+                reason = FORFEIT_SLASHED;
+            } else if (r.credentialsHash != credentialsHash()) {
+                // The key was deposited first by someone else: our stake is a
+                // top-up to their credentials. The operator is the party able to
+                // have done that, and the loss is recorded at close.
+                reason = FORFEIT_CREDENTIALS;
+            } else if (v.exitRequestedEpoch != 0) {
+                uint256 deadline = uint256(_exitDeadlineEpoch[r.pubkeyHash]);
+                bool late = r.exitInitiatedEpoch == 0 ? r.epoch >= deadline : r.exitInitiatedEpoch > deadline;
+                if (late) reason = FORFEIT_DEADLINE;
+            }
+            if (reason == FORFEIT_SLASHED) {
+                // Held until the close, where the loss it answers for is
+                // known (OC-LEGB-03); still in `bondsHeld`, so still senior.
+                v.bondSettled = true;
+                _forfeitHeld[r.pubkeyHash] = true;
+                slashedOpen += 1;
+                emit BondForfeited(r.pubkeyHash, v.bond, reason);
+            } else if (reason != 0) {
+                _forfeit(r.pubkeyHash, v, reason);
+            }
+        }
+
+        if (r.status == WITHDRAWAL_DONE) _close(r.pubkeyHash, v);
+        else if (cut != 0) _syncLoss();
+    }
+
+    /// Apply the fees line of a cleared report: all of it is distribution.
+    function reconcileFees(uint256 reportEpoch, uint256 cumulativeFees, bytes32[] calldata proof) external {
+        if (reportEpoch <= lastFeesEpoch) revert ReportNotForward(reportEpoch, lastFeesEpoch);
+        if (cumulativeFees < feesReconciled) revert WithdrawalsWentBackwards(cumulativeFees, feesReconciled);
+        _requireCleared(reportEpoch, feesReportLeaf(reportEpoch, cumulativeFees), proof);
+
+        uint256 delta = cumulativeFees - feesReconciled;
+        feesReconciled = cumulativeFees;
+        lastFeesEpoch = reportEpoch;
+        distributionReconciled += delta;
+        emit FeesReconciled(reportEpoch, delta);
+    }
+
+    /**
+     * A validator whose withdrawals are done. Whatever of its stake did not come
+     * back is a loss of bond principal, borne pro rata by every holding through
+     * the pool; it leaves `delegated` and `principal` together, so the idle
+     * figure is untouched. A bond not forfeited goes back to its operator, by
+     * claim, so an operator that cannot receive value cannot stall a report.
+     * A slashing forfeit held since the slashing report is paid now, after
+     * the loss is booked, so the pool takes the two together (OC-LEGB-03).
+     */
+    function _close(bytes32 pubkeyHash, Validator storage v) private {
+        v.closed = true;
+        activeValidators -= 1;
+        uint256 loss = v.stake - v.principalReturned;
+        if (v.exitRequestedEpoch != 0) exitsPending -= loss;
+        uint256 b = v.bond;
+        if (!v.bondSettled) {
+            v.bondSettled = true;
+            bondsHeld -= b;
+            refundsOwed += b;
+            _refundOf[v.operator] += b;
+            emit BondReturned(pubkeyHash, v.operator, b);
+        }
+        if (loss != 0) {
+            delegated -= loss;
+            principal -= loss;
+            emit StakeLost(pubkeyHash, loss, principal);
+        }
+        if (_forfeitHeld[pubkeyHash]) {
+            _forfeitHeld[pubkeyHash] = false;
+            slashedOpen -= 1;
+            bondsHeld -= b;
+            (bool ok,) = BOND.call{value: b}("");
+            if (!ok) revert TransferFailed(BOND, b);
+        }
+        if (loss != 0) _syncLoss();
+    }
+
+    /**
+     * Tell the counterparty principal fell, so the loss reaches every holding
+     * in this transaction and nobody redeems at par against principal that is
+     * gone; behind the pool, the pool passes it on to the bond's staking
+     * contract (OC-LEGB-13). The result is ignored: a failure here must not
+     * stall a report, and `ArkBondStaking.syncLoss` stays callable by anyone.
+     */
+    function _syncLoss() private {
+        (bool ok,) = BOND.call(abi.encodeWithSignature("syncLoss()"));
+        ok;
+    }
+
+    /// The bond goes to the pool. It is neither principal nor distribution.
+    function _forfeit(bytes32 pubkeyHash, Validator storage v, uint8 reason) private {
+        v.bondSettled = true;
+        uint256 b = v.bond;
+        bondsHeld -= b;
+        (bool ok,) = BOND.call{value: b}("");
+        if (!ok) revert TransferFailed(BOND, b);
+        emit BondForfeited(pubkeyHash, b, reason);
+    }
+
+    /// An operator takes back bonds returned to it.
+    function claimRefund() external nonReentrant {
+        uint256 owed = _refundOf[msg.sender];
+        if (owed == 0) revert ZeroValue();
+        _refundOf[msg.sender] = 0;
+        refundsOwed -= owed;
+        (bool ok,) = msg.sender.call{value: owed}("");
+        if (!ok) revert TransferFailed(msg.sender, owed);
+        _requireSolvent();
+    }
+
+    /**
+     * Forward to the bond the distribution cleared reports have shown, as far
+     * as the balance above principal, bonds and refunds covers it. Permissionless:
+     * the destination is immutable and the caller receives nothing. A balance no
+     * report has covered stays here; a report no balance has covered is paid
+     * when the value arrives, never out of principal.
+     */
+    function distribute() external nonReentrant returns (uint256 amount) {
+        // `distributed` includes what was forwarded provisionally; where that
+        // was more than reports have since shown, nothing is due until they do.
+        amount = distributionReconciled > distributed ? distributionReconciled - distributed : 0;
+        uint256 senior = _senior();
+        uint256 room = address(this).balance > senior ? address(this).balance - senior : 0;
+        if (amount > room) amount = room;
+        if (amount == 0) revert NothingToDistribute();
+        distributed += amount;
+        (bool ok,) = BOND.call{value: amount}("");
+        if (!ok) revert TransferFailed(BOND, amount);
+        _requireSolvent();
+        emit Distributed(BOND, amount);
+    }
+
+    /**
+     * The most this contract forwards as distribution in one epoch before a
+     * report: `activeValidators * VALIDATOR_STAKE * r_max * EPOCH / YEAR`.
+     * Truncates, toward holding: the bond is never credited a fraction of a
+     * unit the rule did not allow. Whitepaper §3.4, I32.
+     */
+    function rewardCap() public view returns (uint256) {
+        return
+            (activeValidators * VALIDATOR_STAKE * uint256(PARAMS.params().rewardRateCapBps) * ArkEpoch.EPOCH_LENGTH) /
+            (BPS * 365 days);
+    }
+
+    /**
+     * Forward receipts no report has covered, up to what remains of this
+     * epoch's reward cap. Permissionless: the destination is immutable and the
+     * caller receives nothing. Receipts are the balance above what ranks ahead
+     * of distribution, above the stake of exits pending, and above
+     * distribution reports have cleared and not yet paid, so this never
+     * reaches principal, a bond, a refund, stake on its way home or a payment
+     * `distribute` already owes.
+     */
+    function distributeProvisional() external nonReentrant returns (uint256 amount) {
+        uint256 epoch = ArkEpoch.current();
+        if (epoch != provisionalEpoch) {
+            provisionalEpoch = epoch;
+            provisionalPaid = 0;
+        }
+        uint256 cap = rewardCap();
+        uint256 left = cap > provisionalPaid ? cap - provisionalPaid : 0;
+        // Stake on its way home is principal, whatever it looks like (OC-LEGB-01).
+        uint256 reserved = _senior() + exitsPending;
+        if (distributionReconciled > distributed) reserved += distributionReconciled - distributed;
+        uint256 received = address(this).balance > reserved ? address(this).balance - reserved : 0;
+        amount = received < left ? received : left;
+        if (amount == 0) revert NothingToDistribute();
+        provisionalPaid += amount;
+        distributed += amount;
+        (bool ok,) = BOND.call{value: amount}("");
+        if (!ok) revert TransferFailed(BOND, amount);
+        _requireSolvent();
+        emit ProvisionallyDistributed(BOND, epoch, amount, cap);
+    }
+
+    /// Principal held here, bonds held and refunds owed: what ranks ahead of distribution.
+    function _senior() private view returns (uint256) {
+        return idle() + bondsHeld + refundsOwed;
+    }
+
+    /// The balance after a payment still covers what ranks ahead of distribution.
+    function _requireSolvent() private view {
+        uint256 owed = _senior();
+        if (address(this).balance < owed) revert Insolvent(address(this).balance, owed);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Views                                                               */
+    /* ------------------------------------------------------------------ */
+
+    /// Principal held here and not deposited, including principal a cleared report showed returned.
+    function idle() public view returns (uint256) {
+        return principal - delegated;
+    }
+
+    /**
+     * The only credentials a funded validator can carry.
+     *
+     * Since QIP-55 the credential is this contract's raw 64-byte address and
+     * nothing else — qrysm dev's `WithdrawalCredentialsAddress(addr)` is
+     * `addr.Bytes()`, with no prefix byte and no padding. On the v2 line it
+     * stays the legacy 32 bytes of twelve zeros and the 20-byte address. The
+     * width of `abi.encodePacked(address)` is what tells the two lines apart,
+     * so one source serves both compilers.
+     */
+    function withdrawalCredentials() public view returns (bytes memory) {
+        bytes memory self = abi.encodePacked(address(this));
+        if (self.length == 20) return bytes.concat(new bytes(12), self);
+        return self;
+    }
+
+    /// keccak256 of `withdrawalCredentials()`: the form a Report carries, since the raw credential no longer fits a word.
+    function credentialsHash() public view returns (bytes32) {
+        return keccak256(withdrawalCredentials());
+    }
+
+    function validatorOf(bytes32 pubkeyHash) external view returns (Validator memory) {
+        return _validators[pubkeyHash];
+    }
+
+    function refundOf(address operator) external view returns (uint256) {
+        return _refundOf[operator];
+    }
+
+    function exitDeadlineEpoch(bytes32 pubkeyHash) external view returns (uint64) {
+        return _exitDeadlineEpoch[pubkeyHash];
+    }
+
+    function fundedEpoch(bytes32 pubkeyHash) external view returns (uint64) {
+        return _fundedEpoch[pubkeyHash];
+    }
+
+    function notedRoot(uint256 epoch) external view returns (bytes32 root, uint256 at) {
+        Noted memory n = _noted[epoch];
+        return (n.root, n.at);
+    }
+
+    /// The most one validator may hold at the principal now placed here.
+    function concentrationBound() external view returns (uint256) {
+        return (principal * _concentrationBps()) / BPS;
+    }
+
+    function _concentrationBps() private view returns (uint256) {
+        return CONCENTRATION_BPS != 0 ? CONCENTRATION_BPS : uint256(PARAMS.params().validatorConcentrationBps);
+    }
+}

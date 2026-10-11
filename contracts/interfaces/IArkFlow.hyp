@@ -1,0 +1,124 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * The deposit port shared by every Quantum Ark contract that can receive value
+ * from another: Ark Staking (the catastrophe bond's cushion), the Quantum Ark
+ * Treasury, Qurrl (its Acorn budget) and, later, NFT Insurance.
+ *
+ * A contract that holds a lane inherits ArkFlowReceiver (utils/) and answers
+ * `laneInfo`; a contract that sends uses ArkFlowSend. Neither needs the other
+ * to know it in advance, which is why wiring a flow takes no governance: the
+ * sender is given the receiver's address at deployment and checks the lane
+ * before every transfer.
+ *
+ * FIVE RULES THE INTERFACE FIXES
+ * ------------------------------
+ * 1. A deposit grants no right. The depositor gets no claim, no share, no
+ *    vote and no refund. A lane that issues a right (a bond subscription, a
+ *    stake) is not a flow lane and has its own function.
+ * 2. `deposit` makes no external call. A sender can therefore call it while
+ *    holding a reentrancy lock, and a receiver cannot be made to call back.
+ * 3. Anyone may deposit. Provenance is the pair (`from`, `lane`) in the event,
+ *    never an access list, because a gift needs no permission and an access
+ *    list would need a governance step for every new sender.
+ * 4. The receiver, not the sender, decides what a lane accepts right now:
+ *    `open` (Q-Day, ceilings) and `room` (how much more it will take).
+ * 5. A `oneWay` lane has no path out except the one its receiver documents as
+ *    the lane's purpose (a cushion pays losses). Nothing the depositor or any
+ *    governance operation does returns the money to a general account.
+ *
+ * Q-DAY. A `defensive` lane stays open while the receiver is frozen, because
+ * money entering a reserve is the one flow an alarm never needs to stop.
+ * Every other lane closes.
+ */
+interface IArkFlowReceiver {
+    struct LaneInfo {
+        /// The receiver knows this lane at all.
+        bool declared;
+        /// It accepts deposits now (not frozen, not at its ceiling).
+        bool open;
+        /// Money in has no way back to a general account (rule 5).
+        bool oneWay;
+        /// Stays open during a Q-Day freeze.
+        bool defensive;
+        /// The most one deposit may carry now; type(uint256).max where unbounded.
+        uint256 room;
+    }
+
+    event Deposited(bytes32 indexed lane, address indexed from, uint256 amount, bytes32 ref);
+
+    error ZeroDeposit();
+    error LaneUnknown(bytes32 lane);
+    error LaneClosed(bytes32 lane);
+    error LaneRoomExceeded(bytes32 lane, uint256 amount, uint256 room);
+
+    /// `ref` is an opaque correlation id the sender chooses: an epoch, a sale, a phase.
+    function deposit(bytes32 lane, bytes32 ref) external payable;
+
+    /// True when `deposit` of at least one unit on `lane` would succeed now.
+    function acceptsLane(bytes32 lane) external view returns (bool);
+
+    function laneInfo(bytes32 lane) external view returns (LaneInfo memory);
+
+    /// Lifetime value received on `lane`, kept even if the lane later closes.
+    function laneTotal(bytes32 lane) external view returns (uint256);
+}
+
+/**
+ * The lane identifiers. A lane is named by its RECEIVER's purpose, not by its
+ * sender, so a second sender needs no new constant.
+ *
+ * Adding a lane means adding a constant here in every copy of this file; the
+ * copies are held byte-identical by test/ArkFlow.test.js.
+ */
+library ArkLanes {
+    /// Ark Staking: QRL beneath the junior class of the catastrophe bond. One-way, defensive.
+    bytes32 internal constant CUSHION = keccak256("quantumark.lane.cushion.v1");
+
+    /// Treasury: Qurrl mint and fusion share.
+    bytes32 internal constant TREASURY_QURRL_PRIMARY = keccak256("quantumark.lane.treasury.qurrl-primary.v1");
+
+    /// Treasury: Qurrl secondary-sale fee share.
+    bytes32 internal constant TREASURY_QURRL_SECONDARY = keccak256("quantumark.lane.treasury.qurrl-secondary.v1");
+
+    /// Treasury: whatever Ark Staking routes to it (its rules, its paper).
+    bytes32 internal constant TREASURY_STAKING = keccak256("quantumark.lane.treasury.staking.v1");
+
+    /// Treasury: reserved for NFT Insurance. Closed until a governance operation opens it.
+    bytes32 internal constant TREASURY_INSURANCE = keccak256("quantumark.lane.treasury.insurance.v1");
+
+    /// Qurrl: secondary-sale fees paid to the collection's royalty receiver. Inflow only; never oneWay.
+    bytes32 internal constant QURRL_FEES = keccak256("quantumark.lane.qurrl.fees.v1");
+
+    /// Qurrl: Acorn reward budget and season costs, from the Treasury.
+    bytes32 internal constant QURRL_BUDGET = keccak256("quantumark.lane.qurrl.budget.v1");
+
+    /// NFT Insurance: reserve top-up from the Treasury. Reserved; no receiver exists yet.
+    bytes32 internal constant INSURANCE_RESERVE = keccak256("quantumark.lane.insurance.reserve.v1");
+}
+
+/**
+ * The sending half. Never reverts for a receiver's reasons: a closed lane, a
+ * ceiling, a receiver that does not implement the interface and a receiver
+ * that reverts all return 0 and leave the value with the caller, who keeps it
+ * for the next epoch. A flow that can fail a sweep is a flow that can block
+ * the sweep's other recipients.
+ */
+library ArkFlowSend {
+    /// Sends `amount` clamped to the lane's room. Returns what was actually sent.
+    function push(address receiver, bytes32 lane, bytes32 ref, uint256 amount) internal returns (uint256 sent) {
+        if (amount == 0 || receiver.code.length == 0) return 0;
+
+        try IArkFlowReceiver(receiver).laneInfo(lane) returns (IArkFlowReceiver.LaneInfo memory info) {
+            if (!info.declared || !info.open || info.room == 0) return 0;
+            sent = amount > info.room ? info.room : amount;
+        } catch {
+            return 0;
+        }
+
+        try IArkFlowReceiver(receiver).deposit{value: sent}(lane, ref) {} catch {
+            return 0;
+        }
+    }
+}
