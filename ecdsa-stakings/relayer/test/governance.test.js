@@ -44,7 +44,8 @@ describe('the governance stack is configured from the environment on a shared ne
     assert.deepEqual([c.proposerOwners, c.guardianOwners, c.attesters.length], [[OWNER], [GUARD], 5]);
     assert.equal(c.advisoryCooldown, 7 * 600);
     assert.equal(c.attesterBond, 10_000n * ONE);
-    assert.deepEqual(c.buckets, Array(6).fill(ME));
+    // Five buckets since core ArkAllocation-Design A1 (2026-10-09); unset ones are filled at deploy (defaultBuckets).
+    assert.deepEqual(c.buckets, Array(5).fill(null));
   });
 
   test('the Q-Day quorum Q_min is GOV_QDAY_QUORUM_BPS, 500 by default, refused outside 100..5,000 (core OC-GOV-11)', () => {

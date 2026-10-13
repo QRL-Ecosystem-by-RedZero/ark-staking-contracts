@@ -75,8 +75,11 @@ const PIECE_BYTES = 12000;
  * `ArkReferenceOracle` (2026-10-05) takes its governance, parameter contract
  * and Q-Day oracle as constructor arguments and reads no `msg.sender` there;
  * 18,013 bytes of init code on the harness build.
+ * `ArkTimelock` (core) takes its proposer and guardian as its two constructor
+ * arguments and reads no `msg.sender` there; the treasury transfer row of
+ * 2026-10-13 put it over the ceiling (about 19,600 bytes on the harness build).
  */
-const CHUNK_SAFE = new Set(['ArkCatBond', 'ArkCatBondSettlement', 'ArkCatBondRecovery', 'ArkStakeRegistry', 'ArkBondDelegation', 'ArkStakeParams', 'PremiumSwap', 'ArkStakeCourt', 'ArkJurorPool', 'ArkGovernor', 'ArkReferenceOracle']);
+const CHUNK_SAFE = new Set(['ArkCatBond', 'ArkCatBondSettlement', 'ArkCatBondRecovery', 'ArkStakeRegistry', 'ArkBondDelegation', 'ArkStakeParams', 'PremiumSwap', 'ArkStakeCourt', 'ArkJurorPool', 'ArkGovernor', 'ArkReferenceOracle', 'ArkTimelock']);
 
 const sizeOf = (bytecode) => (bytecode.length - 2) / 2;
 

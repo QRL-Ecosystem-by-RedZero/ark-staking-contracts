@@ -161,7 +161,7 @@ module.exports = {
     for (const name of ['epochDays', 'unbondingDays', 'censorshipWindowEpochs']) {
       await ctx.refuses(`the §6.4 constant ${name} has no key: no delay exists for it (G12)`, 'UnknownKey', () => call(G.ArkTimelock, 'ArkTimelock', 'delayFor', [diff(name, 0n, 1n)]));
     }
-    await ctx.refuses('the timelock has no default row: a selector outside its table has no delay (G12)', 'UnknownSelector', () => call(G.ArkTimelock, 'ArkTimelock', 'delayFor', [h.encode('ArkToken', 'transfer', [stranger, 1n])]));
+    await ctx.refuses('the timelock has no default row: a selector outside its table has no delay (G12)', 'UnknownSelector', () => call(G.ArkTimelock, 'ArkTimelock', 'delayFor', [h.encode('ArkToken', 'approve', [stranger, 1n])]));
 
     // The deployer's lock: the vote source for G and B.
     const ark = G.ArkToken;

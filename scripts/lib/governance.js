@@ -70,7 +70,14 @@ const ONE = 10n ** 18n;
 const INITCODE_LIMIT = 49152;
 
 /** The artifacts vendored, in core's names; all of them are deployed (ArkPhase since 2026-10-07). */
-const GOVERNANCE_CONTRACTS = ['ChunkedDeployer', 'ArkMultisig', 'ArkTimelock', 'ArkToken', 'VeArk', 'ArkGovernorRules', 'ArkQDayOracle', 'ArkGovernor', 'ArkPhase'];
+const GOVERNANCE_CONTRACTS = ['ChunkedDeployer', 'ArkMultisig', 'ArkTimelock', 'ArkToken', 'VeArk', 'ArkGovernorRules', 'ArkQDayOracle', 'ArkGovernor', 'ArkPhase', 'ArkEmissionVault', 'ArkTreasuryRouter'];
+/**
+ * ARK the deployer keeps from the incentives bucket on a devnet, for the
+ * scenarios it funds; the rest goes to the emission vault (core
+ * ArkAllocation-Design §5, 2026-10-13). The vault's first year (132.5M plus
+ * the 25M campaign) stays covered.
+ */
+const SCENARIO_FLOAT = 25_000_000n * ONE;
 /**
  * The addresses every record names — core's `deploy-governance.js` record
  * keys. `ArkPhase` is not among them: a record written before 2026-10-07 has
@@ -326,16 +333,38 @@ async function deployGovernance({ client, chain, manifest: m, config: c, build, 
   const vestStart = Number(genesis.timestamp) || Number((await client.head()).timestamp);
   const buckets = defaultBuckets(c.buckets, client.address, a.ArkTimelock, onQrl);
   a.ArkToken = await d('ArkToken', [...buckets, vestStart]);
-  const protocolOwned = [...c.protocolOwned, a.ArkTimelock];
-  a.VeArk = await d('VeArk', [a.ArkToken, protocolOwned]);
-  a.ArkGovernorRules = await d('ArkGovernorRules');
   const zero = onQrl ? '0x' + '00'.repeat(64) : '0x' + '00'.repeat(20);
   a.ArkQDayOracle = await d('ArkQDayOracle', [a.ArkTimelock, c.court ? toHex(c.court) : zero, c.attesterBond, c.advisoryCooldown, c.attesters]);
-  a.ArkGovernor = await d('ArkGovernor', [a.VeArk, a.ArkTimelock, a.ArkGovernorRules, a.ArkToken, a.ArkQDayOracle, c.proposalThresholdBps, c.qdayQuorumBps, c.objectionThresholdBps, c.admissionDeposit]);
   // The ecosystem phase (core §3.6), governed by the timelock from construction.
   a.ArkPhase = await d('ArkPhase', [a.ArkQDayOracle, a.ArkTimelock, c.epochLength]);
+  // The emission vault and the treasury router (core ArkAllocation-Design §5-§6,
+  // QuantumArk-Treasury-Flows §7, 2026-10-13). On a devnet the schedule starts
+  // at the epoch of deployment, so the campaign window is open at once; the
+  // relayer account publishes the roots.
+  const emissionStartEpoch = Math.floor(Number((await client.head()).timestamp) / c.epochLength);
+  a.ArkEmissionVault = await d('ArkEmissionVault', [a.ArkToken, a.ArkPhase, c.epochLength, emissionStartEpoch, client.address]);
+  a.ArkTreasuryRouter = await d('ArkTreasuryRouter', [a.ArkQDayOracle, a.ProposerMultisig]);
+  // AL2: the vault, the timelock and the other protocol buckets never vote.
+  const protocolOwned = [...c.protocolOwned, a.ArkTimelock, a.ArkEmissionVault];
+  for (const b of buckets.slice(1)) if (!protocolOwned.some((x) => same(x, b))) protocolOwned.push(b);
+  a.VeArk = await d('VeArk', [a.ArkToken, protocolOwned]);
+  a.ArkGovernorRules = await d('ArkGovernorRules');
+  a.ArkGovernor = await d('ArkGovernor', [a.VeArk, a.ArkTimelock, a.ArkGovernorRules, a.ArkToken, a.ArkQDayOracle, c.proposalThresholdBps, c.qdayQuorumBps, c.objectionThresholdBps, c.admissionDeposit]);
   await client.send(a.VeArk, abi('VeArk'), 'setGovernor', [a.ArkGovernor]);
   await client.send(a.ArkQDayOracle, abi('ArkQDayOracle'), 'setGovernor', [a.ArkGovernor]);
+  await client.send(a.VeArk, abi('VeArk'), 'addDistributor', [a.ArkEmissionVault]);
+  await client.send(a.VeArk, abi('VeArk'), 'setDistributorAdmin', [a.ArkTimelock]);
+  await client.send(a.ArkEmissionVault, abi('ArkEmissionVault'), 'setVeArk', [a.VeArk]);
+  let vaultFunding = 0n;
+  if (same(buckets[0], client.address)) {
+    const held = BigInt((await client.call(a.ArkToken, abi('ArkToken'), 'balanceOf', [client.address]))[0]);
+    vaultFunding = held > SCENARIO_FLOAT ? held - SCENARIO_FLOAT : 0n;
+    if (vaultFunding > 0n) await client.send(a.ArkToken, abi('ArkToken'), 'transfer', [a.ArkEmissionVault, vaultFunding]);
+  }
+  for (const n of ['ArkEmissionVault', 'ArkTreasuryRouter']) {
+    await client.send(a[n], abi(n), 'proposeGovernance', [a.ArkTimelock]);
+    await client.send(a.ArkTimelock, abi('ArkTimelock'), 'acceptGovernanceOf', [a[n]]);
+  }
   for (const [n, v] of Object.entries(a)) log(`   ${n.padEnd(18)} ${rec(v)}`);
 
   const addresses = Object.fromEntries(Object.entries(a).map(([n, v]) => [n, rec(v)]));
@@ -373,6 +402,10 @@ async function deployGovernance({ client, chain, manifest: m, config: c, build, 
       objectionThresholdBps: c.objectionThresholdBps,
       admissionDeposit: String(c.admissionDeposit),
       epochLength: c.epochLength,
+      emissionStartEpoch,
+      emissionRootPublisher: rec(client.address),
+      vaultFunding: String(vaultFunding),
+      treasuryOperations: rec(a.ProposerMultisig),
       uncalibrated: ['proposalThresholdBps', 'qdayQuorumBps', 'objectionThresholdBps', 'attesterBond', 'advisoryCooldown'],
       phase1TestAttesters: manifestLib.isShared(m)
         ? 'the attesters are operator-held test keys (phase 1): the private devnet has no independent Q-Day attesters'
@@ -382,6 +415,8 @@ async function deployGovernance({ client, chain, manifest: m, config: c, build, 
       'the QRL leg is deployed under ArkTimelock (deployQrlLeg, OC-GOV-03): ArkStakeParams and ArkBondDelegation from construction, ArkStakeRegistry accepted in the same run',
       'proposer multisig: governance:accept --schedule (then --approve by each further owner) wires the timelock objection source and governor and schedules ArkGovernor.setObjectionSource and setCourt (30 profile-days); --execute once they are due',
       'attesters: ArkQDayOracle.postBond() with at least attesterBond',
+      'proposer multisig: ArkTimelock.setArkToken(ArkToken), which opens the treasury transfer row (core ArkAllocation-Design §7.1)',
+      'ArkEmissionVault: the relayer account publishes channel and campaign roots; ArkTreasuryRouter: the deployer wires the Cushion (a leg\'s ArkCatBond) and Qurrl\'s budget once',
       'ArkPhase: governed by ArkTimelock from construction, phase 0; a move is a timelock operation (setPhase 30 days, enterQDay 48 hours, restore 30 days; core §4.6)',
       'every product on this network reads this record: Ark Staking legs (deployQrlLeg wires ArkStakeParams to ArkPhase), Qurrl (ARK_PHASE_ADDRESS, and its Cushion lane to a leg\'s ArkCatBond)',
     ],

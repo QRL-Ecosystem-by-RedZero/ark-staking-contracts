@@ -1007,6 +1007,27 @@ async function deployQrlLeg({ client, chain, manifest: m, log = console.log, cou
   if (courtAddrs.ArkJurorPool) await client.send(courtAddrs.ArkJurorPool, abi('ArkJurorPool'), 'setCourt', [court]);
   await client.send(bond, abi('ArkCatBond'), 'setCourt', [court]);
   await client.send(bond, abi('ArkCatBond'), 'setStaking', [staking]);
+  // The Treasury tops the Cushion up through the ecosystem's router (core
+  // QuantumArk-Treasury-Flows §6-§7, 2026-10-13): wired once, by the account
+  // that deployed the router, which on a devnet is this relayer.
+  if (ext.ArkTreasuryRouter) {
+    const ROUTER = [
+      { type: 'function', name: 'cushion', inputs: [], outputs: [{ type: 'address' }], stateMutability: 'view' },
+      { type: 'function', name: 'wireCushion', inputs: [{ name: 'cushion_', type: 'address' }], outputs: [], stateMutability: 'nonpayable' },
+    ];
+    const router = toHex(ext.ArkTreasuryRouter);
+    const [wired] = await client.call(router, ROUTER, 'cushion');
+    if (/^0x0+$/.test(String(wired))) {
+      try {
+        await client.send(router, ROUTER, 'wireCushion', [bond]);
+        log(`   ArkTreasuryRouter  Cushion -> ${rec(bond)}`);
+      } catch (e) {
+        log(`   ArkTreasuryRouter  Cushion not wired (${e.message}); its deployer must call wireCushion once`);
+      }
+    } else {
+      log(`   ArkTreasuryRouter  Cushion already wired to ${rec(wired)}; this leg's bond is not the Treasury's top-up target`);
+    }
+  }
   {
     const { pool, delegation } = await deployPool({ client, build: QRL_BUILD, staking, params, attestation, governance: timelock, profile: m.profile, chunked, log });
     addrs.ArkStakingPool = pool;
