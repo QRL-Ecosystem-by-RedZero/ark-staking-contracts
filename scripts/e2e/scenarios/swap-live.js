@@ -271,7 +271,10 @@ module.exports = {
       'S2, I33.4: a selected lot unclaimed at its QRL expiry pays back its QRL and not its bond, once, and lotOf keeps the bond it posted',
       lapsed,
     );
-    ctx.knownIssue('OC-SWAP-05', !(lapsed.R.spent && lapsed.R.refunds.some((x) => x.value > 0n)), 'I31.4: no lot whose leaf the escrow spent is refunded its QRL', { lot: 'R', induced: 'the relayer carry withheld past the claim margin, as a finality delay beyond it would', ...lapsed.R });
+    // R may already be Refunded at the QRL expiry (a keeper refunded it first,
+    // live 2026-10-12), so it is read directly rather than from `lapsed`.
+    const rInfo = lapsed.R || { refunds: refundsOf(lots.R.lotId), spent: await spent(locks.R.item.leaf), status: atExpiry.R };
+    ctx.knownIssue('OC-SWAP-05', !(rInfo.spent && rInfo.refunds.some((x) => x.value > 0n)), 'I31.4: no lot whose leaf the escrow spent is refunded its QRL', { lot: 'R', induced: 'the relayer carry withheld past the claim margin, as a finality delay beyond it would', ...rInfo });
     const refundsB = refundsOf(lots.B.lotId);
     ctx.check(!((await spent(locks.B.item.leaf)) && refundsB.some((x) => x.value > 0n)), 'OC-SWAP-04, I31.4: no lot whose leaf the escrow spent is refunded its QRL', { lot: 'B', refunds: refundsB, status: atExpiry.B });
     await S.waitFine(ctx, 'solver B finished its lot', async () => Boolean(procs.B.done(lots.B.lotId)), { timeoutEpochs: 1, throws: false });

@@ -1280,7 +1280,13 @@ class Relayer {
       } else if (ev.name === 'LotClaimed') {
         this.lotRecord(ev.args.lotId).status = 'claimed';
       } else if (ev.name === 'LotRefunded') {
-        this.lotRecord(ev.args.lotId).status = 'refunded';
+        // A claimed lot's bond comes back as LotRefunded(0, bond) (I33.3):
+        // the lot stays claimed. Only an unclaimed lot's refund is a refund;
+        // reading the bond return as one raised false double-pay alarms
+        // (live swap-live, 2026-10-12, OC-SWAP-12).
+        const rec = this.lotRecord(ev.args.lotId);
+        if (rec.status === 'claimed') rec.bondReturned = true;
+        else rec.status = 'refunded';
       }
     }
   }
@@ -2291,7 +2297,17 @@ class Relayer {
     const now = big(qrlNow);
     await this.selectOfferings(now);
     for (const [lotId, w] of Object.entries(s.lots || {})) {
-      if (w.status === 'refunded') continue;
+      if (w.status === 'refunded') {
+        // A preimage seen on the origin chain for a lot whose QRL already went
+        // back: the lot was paid twice. Before 2026-10-11 only a LotExpired
+        // refusal raised the alarm, so a lot refunded before its late preimage
+        // arrived passed in silence (live S3b, OC-SWAP-12).
+        if (w.secret && !w.paidTwiceAlarm) {
+          w.paidTwiceAlarm = true;
+          this.log(`premium  ALARM: lot ${lotId.slice(0, 14)}… was paid on the origin chain and its QRL went back (refunded before the preimage reached QRL)`);
+        }
+        continue;
+      }
       if (w.status === 'claimed') {
         // The commitment bond of a lot claimed here before its QRL expiry goes
         // back to its solver (I33), by a call anyone may make, once.
@@ -2304,7 +2320,16 @@ class Relayer {
       if (w.secret) {
         const r = await this.tryTx(this.qrl, this.q.PremiumSwap, this.abi.swap, 'claim', [lotId, w.secret]);
         if (r.ok) w.status = 'claimed';
-        else if (r.error === 'LotExpired') this.log(`premium  ALARM: lot ${lotId.slice(0, 14)}… was paid on the origin chain and its QRL lock expired first`);
+        else if (r.error === 'LotExpired' && !w.paidTwiceAlarm) {
+          w.paidTwiceAlarm = true;
+          this.log(`premium  ALARM: lot ${lotId.slice(0, 14)}… was paid on the origin chain and its QRL lock expired first`);
+        }
+        else if (r.error && !w.paidTwiceAlarm) {
+          // Any other refusal of a preimage the origin chain already paid on
+          // (the lot refunded or no longer Selected on QRL) is the same loss.
+          w.paidTwiceAlarm = true;
+          this.log(`premium  ALARM: lot ${lotId.slice(0, 14)}… was paid on the origin chain and QRL refuses its claim (${r.error})`);
+        }
         if (r.ok) this.log(`premium  lot ${lotId.slice(0, 14)}… QRL credited to the ledger`);
         continue;
       }
